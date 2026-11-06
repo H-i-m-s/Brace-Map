@@ -12,8 +12,10 @@
  *   按文件顺序读就是真实的执行顺序。
  *
  * ⚠ 这一层默认关闭（DEBUG_LP = false），保留结构备查。关着的时候 dbg() /
- *   dbgNull() / flush() 都在入口早退，几乎零开销；要再取证时把它改回 true
- *   （或者调用 dbgSetEnabled(true)）。不做成设置项：这是临时取证，不是产品功能。
+ *   dbgNull() / flush() 都在入口早退，几乎零开销；要取证时在 Obsidian 里
+ *   跑命令「Brace Map: 切换实时预览布局诊断日志」就能开，查完再点一下关（
+ *   也可以改回 true 并显式调 dbgSetEnabled(true)）。
+ *   不做成设置项：这是临时取证，不是产品功能。
  *
  * 纪律：本文件导出的每个函数都自己 try/catch，绝不外抛；调用方用
  *   dbg('点名', () => ({...})) 的惰性写法，连字段计算也在 try/catch 里面，
@@ -407,6 +409,11 @@ function dbgFlush() {
   }
 }
 
+/** 诊断层当前是否在工作。调用方用它决定「要不要为一条日志多排一帧」。 */
+function dbgEnabled() {
+  return !!enabled;
+}
+
 /**
  * 打开 / 关闭诊断层。只给自测用：正式运行永远是 DEBUG_LP 的默认值（false）。
  * 关掉时顺手把没落盘的定时器清掉，避免关完又写一次盘。
@@ -423,6 +430,7 @@ function dbgSetEnabled(on) {
 module.exports = {
   DEBUG_LP,
   dbgSetEnabled,
+  dbgEnabled,
   DEBUG_FILE,
   LINE_MAX,
   TRIM_TO,

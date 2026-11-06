@@ -11,6 +11,17 @@
 
 const { Plugin, Notice, MarkdownView } = require('obsidian');
 
+/*
+ * 设置页的两个基类只在 Obsidian 里存在。自测的 require('obsidian') stub 只给了
+ * Plugin，直接继承 undefined 会在定义时抛错，所以给一个空壳兜底。
+ */
+const ObsidianNS = require('obsidian') || {};
+const PluginSettingTabBase = ObsidianNS.PluginSettingTab || class {
+  constructor(app, plugin) { this.app = app; this.plugin = plugin; }
+  display() {}
+  hide() {}
+};
+
 /* 模块符号：由 loadModules() 填充，不在顶层 require。
  *
  * 踩过的坑：Obsidian 是用 eval 方式执行 main.js 的（错误栈里 Require stack 指向
@@ -45,9 +56,13 @@ let LP_DEBOUNCE, LP_POLL, LP_RETRY, LP_RESET_DELAY, classHas, climbTo, livePrevi
   padReaderOf, applyLivePreviewFloat, findEditorView, attachLivePreviewFloat, flushLivePreviewFloats,
   livePreviewManagerCount;
 let CSS_FLOAT_BOTTOM_GAP, cssFloatMargin, setImportantStyle, applyLivePreviewCssFloat, createCssFloatControl;
+/* 施加浮动后让 CM6 重测（编辑模式光标错位）；以及编辑模式浮动总开关 */
+let LP_FLOAT, isLpFloatEnabled, setLpFloatEnabled, refreshLivePreviewFloats,
+  measureSchedulerCount, createMeasureScheduler, RMEASURE_GAP, RMEASURE_SCROLL_IDLE,
+  resetFloatLayout, clearLivePreviewFloatLayout;
 /* 临时诊断（Live Preview 图文混排）：见 src/debug.js。DEBUG_LP 关掉后全为空转。 */
 let DEBUG_LP, DEBUG_FILE, DEBUG_LINE_MAX, DEBUG_FIELD_MAX, dbg, dbgNull, dbgConfigure, dbgSetEnabled,
-  dbgEl, dbgRect, dbgCss,
+  dbgEnabled, dbgEl, dbgRect, dbgCss,
   dbgInline, dbgInlineAll, dbgChildCount, dbgFirstChild, dbgChain, dbgText, dbgCount, dbgReset, dbgFlush;
 let setResourceResolver = null;
 
@@ -898,8 +913,10 @@ __mods["src/debug.js"] = function (module, exports, require) {
  *   按文件顺序读就是真实的执行顺序。
  *
  * ⚠ 这一层默认关闭（DEBUG_LP = false），保留结构备查。关着的时候 dbg() /
- *   dbgNull() / flush() 都在入口早退，几乎零开销；要再取证时把它改回 true
- *   （或者调用 dbgSetEnabled(true)）。不做成设置项：这是临时取证，不是产品功能。
+ *   dbgNull() / flush() 都在入口早退，几乎零开销；要取证时在 Obsidian 里
+ *   跑命令「Brace Map: 切换实时预览布局诊断日志」就能开，查完再点一下关（
+ *   也可以改回 true 并显式调 dbgSetEnabled(true)）。
+ *   不做成设置项：这是临时取证，不是产品功能。
  *
  * 纪律：本文件导出的每个函数都自己 try/catch，绝不外抛；调用方用
  *   dbg('点名', () => ({...})) 的惰性写法，连字段计算也在 try/catch 里面，
@@ -1293,6 +1310,11 @@ function dbgFlush() {
   }
 }
 
+/** 诊断层当前是否在工作。调用方用它决定「要不要为一条日志多排一帧」。 */
+function dbgEnabled() {
+  return !!enabled;
+}
+
 /**
  * 打开 / 关闭诊断层。只给自测用：正式运行永远是 DEBUG_LP 的默认值（false）。
  * 关掉时顺手把没落盘的定时器清掉，避免关完又写一次盘。
@@ -1309,6 +1331,7 @@ function dbgSetEnabled(on) {
 module.exports = {
   DEBUG_LP,
   dbgSetEnabled,
+  dbgEnabled,
   DEBUG_FILE,
   LINE_MAX,
   TRIM_TO,
@@ -1719,6 +1742,30 @@ const {
   dbg, dbgNull, dbgEl, dbgRect, dbgCss, dbgInline, dbgInlineAll,
   dbgChildCount, dbgFirstChild, dbgChain,
 } = require('./debug.js');
+const { createMeasureScheduler, RMEASURE_GAP, RMEASURE_SCROLL_IDLE } = require('./remeasure.js');
+
+/* ============================================================
+ * ★★★ 编辑模式（Live Preview）浮动总开关 ★★★
+ *
+ * 关闭后 Live Preview 里一条布局样式都不写：不浮动、不留白、不写宽度，
+ * 图按 Obsidian 原生的块级 widget 排，光标跟没装插件时一样。
+ * 阅读视图的图文混排不受它影响。
+ *
+ * 两个关法：
+ *   1. 插件设置 → Brace Map → 「编辑模式浮动」关掉（立刻生效，不用重载）
+ *   2. 把下面这行的 true 改成 false，再 node build.js（默认值跟着变）
+ *
+ * 设置页里的值用插件自己的 loadData / saveData 存，这里只是它的默认值。
+ * ============================================================ */
+const LP_FLOAT = true;
+
+/** 运行时的真值：插件加载设置页之后会用 setLpFloatEnabled() 覆盖它 */
+let lpFloatEnabled = LP_FLOAT;
+
+/** 编辑模式浮动现在是开着的吗 */
+function isLpFloatEnabled() {
+  return !!lpFloatEnabled;
+}
 
 /* ============================================================
  * 浮动：图文混排
@@ -2962,6 +3009,7 @@ function setImportantStyle(el, prop, value) {
  */
 function applyLivePreviewCssFloat(host, cfg, opts) {
   const o = opts || {};
+  if (!lpFloatEnabled) { dbgNull('apply.css.null', 'css.disabled'); return null; }   // 开关关掉：一条样式都不写
   const mode = cfg && cfg.float;
   const side = mode === 'left' ? 'left' : (mode === 'right' ? 'right' : '');
   if (!side) return null;                                   // center / inline 维持现状
@@ -2986,6 +3034,7 @@ function applyLivePreviewCssFloat(host, cfg, opts) {
   width = round2(Math.max(1, width));
 
   const margin = cssFloatMargin(side, o.gap);
+  const before = cssFloatHeights(embed, content);     // 读 rect 会强制布局，先取一轮基线
   const styles = [];
   const put = (el, prop, value, important) => {
     if (!el || !el.style) return;
@@ -3000,7 +3049,31 @@ function applyLivePreviewCssFloat(host, cfg, opts) {
   put(host, 'margin', '0');
   put(host, 'display', 'flow-root');
 
-  return { mode: parts.mode, side, width, margin, host, embed, content, styles };
+  /* 写完再读一次：读 rect 本身会强制一次同步布局，所以这里拿到的是「浮动之后」的真值 */
+  const after = cssFloatHeights(embed, content);
+
+  return { mode: parts.mode, side, width, margin, host, embed, content, styles, diag: { before, after } };
+}
+
+/**
+ * 诊断：一个盒子的四种高度口径 + 行内样式全文。
+ * 光标错位追的是「CM6 账上的高度」与「DOM 真实高度」的差，所以四个都要：
+ *   rect      布局盒（浮动后仍然保留自己的高度，只是不再贡献给父容器）
+ *   offsetH   元素自身布局高
+ *   clientH   扣除边框滚动条
+ *   cssText   我们写进去的 float / width / margin 原文
+ */
+function cssFloatHeights(embed, content) {
+  const e = rectOf(embed);
+  const c = rectOf(content);
+  return {
+    embedRectH: e ? round2(e.height) : null,
+    embedOffsetH: embed ? num(embed.offsetHeight) : null,
+    embedClientH: embed ? num(embed.clientHeight) : null,
+    embedCss: dbgInlineAll(embed),
+    contentRectH: c ? round2(c.height) : null,
+    contentScrollH: content ? num(content.scrollHeight) : null,
+  };
 }
 
 /** 诊断：新路径的点位记录（结构分支 / 写了哪些样式 / 图 rect / content 高度） */
@@ -3025,6 +3098,12 @@ function cssFloatInfo(rec, applies) {
     },
     embed: dbgEl(rec.embed),
     embedRect: dbgRect(rec.embed),
+    embedOffsetH: rec.embed ? num(rec.embed.offsetHeight) : null,
+    embedClientH: rec.embed ? num(rec.embed.clientHeight) : null,
+    embedCss: dbgInlineAll(rec.embed),
+    /* 施加前后的对照：这两组数差多少，就是 CM6 需要重新记账的量 */
+    before: rec.diag ? rec.diag.before : null,
+    after: rec.diag ? rec.diag.after : null,
     embedBottom: eBottom,
     content: dbgEl(rec.content),
     contentRect: dbgRect(rec.content),
@@ -3045,12 +3124,97 @@ function cssFloatInfo(rec, applies) {
  */
 const lpCssLive = new Set();          // 活着的控制器（卸载时要一起还原）
 
+/* --------------------------- 重测调度器（按 .cm-content 共用） --------------------------- */
+
+/**
+ * 一个编辑器一套调度器：同一篇笔记里多张浮动图共用一份节流、一个 observer、一个 scroll 监听。
+ * 每张图只加一次引用计数，最后一张走了才拆。
+ */
+const lpMeasureSlots = new WeakMap();   // .cm-content → { sched, users }
+const lpMeasureLive = new Set();        // 活着的 slot（WeakMap 不能遍历，开关关掉时要能一次拆完）
+
+/** 取（或建）这个编辑器的重测调度器，引用计数 +1 */
+function acquireMeasure(content, opts) {
+  const o = opts || {};
+  if (!content) return null;
+  let slot = lpMeasureSlots.get(content);
+  if (slot) {
+    const st = typeof slot.sched.state === 'function' ? slot.sched.state() : null;
+    if (!st || st.attached === false) {        // 已经拆过的旧调度器不能复用
+      try { lpMeasureLive.delete(slot); } catch (e) { /* ignore */ }
+      lpMeasureSlots.delete(content);
+      slot = null;
+    }
+  }
+  if (!slot) {
+    const t = o.timers || null;              // 自测注入的假时钟（raf / setTimeout / now）
+    const sched = createMeasureScheduler(content, {
+      cm: o.cm,
+      getCM: o.getCM,
+      win: o.win,
+      MutationObserver: o.MutationObserver,
+      scroller: o.scroller,
+      raf: (t && t.raf) || o.raf,
+      caf: (t && t.caf) || o.caf,
+      setTimeout: (t && t.setTimeout) || o.setTimeout,
+      clearTimeout: (t && t.clearTimeout) || o.clearTimeout,
+      now: (t && t.now) || o.now,
+      gap: o.measureGap,
+      scrollIdle: o.scrollIdle,
+    });
+    slot = { sched, users: 0 };
+    lpMeasureSlots.set(content, slot);
+    lpMeasureLive.add(slot);
+  }
+  slot.users++;
+  return slot.sched;
+}
+
+/** 引用计数 -1，最后一张图走了就拆掉监听与观察者 */
+function releaseMeasure(content) {
+  const slot = content ? lpMeasureSlots.get(content) : null;
+  if (!slot) return false;
+  slot.users--;
+  if (slot.users > 0) return true;
+  try { slot.sched.dispose(); } catch (e) { /* ignore */ }
+  lpMeasureLive.delete(slot);
+  lpMeasureSlots.delete(content);
+  return true;
+}
+
+/** 当前活着的调度器数（诊断 / 自测用） */
+function measureSchedulerCount() {
+  return lpMeasureLive.size;
+}
+
+/**
+ * direct-embed 的浮动控制器，形状与其他路径一致（host / update / dispose / state）。
+ *
+ * 没有定时器、没有账本、没有延迟复位 —— CSS 是声明式的，
+ * 这里只剩两件真事：谁在什么时候把样式还回去；以及什么时候让 CM6 重新量一次。
+ * update 先还原再写，重复调用不会把上一轮的值当成「原值」。
+ *
+ * 为什么需要重测：浮动把 block widget 从流里摘出去了，它自己的 rect 高度还在，
+ * 但父容器已经不为它留位置。CM6 给 block widget 单独记一条高度，不重新量就
+ * 停在旧值上，光标映射跟着错（点第 18 行落到第 14 行）。
+ */
 function createCssFloatControl(host, cfg, opts) {
   const o = opts || {};
   let record = null;
   let disposed = false;
   let applies = 0;
   let api = null;
+  let measure = null;               // 当前挂着的重测调度器（按 content 共享）
+  let measureFor = null;            // 它属于哪个 .cm-content（释放时要用）
+
+  const dropMeasure = () => {
+    if (!measure) return false;
+    const c = measureFor;
+    measure = null;
+    measureFor = null;
+    releaseMeasure(c);
+    return true;
+  };
 
   const clear = () => {
     if (!record) return 0;
@@ -3066,8 +3230,27 @@ function createCssFloatControl(host, cfg, opts) {
     try { next = applyLivePreviewCssFloat(host, cfg, o); } catch (e) { next = null; }
     record = next;
     applies++;
-    if (next) dbg('lpf.css', () => cssFloatInfo(next, applies));
-    else dbgNull('lpf.css.null', 'css.no-record');
+    if (next) {
+      dbg('lpf.css', () => cssFloatInfo(next, applies));
+      /*
+       * 样式写完 → 下一帧让 CM6 重测一次。同步调没用：浏览器还没布局。
+       * 调度器按 .cm-content 共享，所以连着 update 不会重建它 —— 重建就意味着
+       * 节流窗口清空，一连串 update 会连着一串 requestMeasure，正好是卡顿源。
+       */
+      try {
+        if (measure && measureFor !== next.content) dropMeasure();
+        if (!measure) {
+          measureFor = next.content;
+          measure = acquireMeasure(measureFor, o);
+        }
+        if (measure) measure.schedule('apply');
+      } catch (e) {                      // 拿不到 cm / 没有 rAF：静默跳过
+        dropMeasure();
+      }
+    } else {
+      dropMeasure();
+      dbgNull('lpf.css.null', 'css.no-record');
+    }
     return next;
   };
 
@@ -3075,10 +3258,16 @@ function createCssFloatControl(host, cfg, opts) {
     host,
     kind: 'css-float',
     update() { if (!disposed) apply(); return !!record; },
+    /** 立即重测一次（不经过 rAF 队列，节流仍然生效） */
+    measureNow(reason) {
+      if (disposed || !measure) return false;
+      return measure.run(reason || 'manual');
+    },
     dispose() {
       if (disposed) return false;
       disposed = true;
       const restored = clear();
+      dropMeasure();
       lpCssLive.delete(api);
       dbg('lpf.css.dispose', () => ({ host: dbgEl(host), restored, applies }));
       return true;
@@ -3092,6 +3281,7 @@ function createCssFloatControl(host, cfg, opts) {
         width: record ? record.width : 0,
         styles: record ? record.styles.length : 0,
         applies,
+        measure: measure ? measure.state() : null,
       };
     },
   };
@@ -3116,6 +3306,7 @@ function applyLivePreviewFloat(host, cfg, opts) {
   const side = mode === 'left' ? 'left' : (mode === 'right' ? 'right' : '');
   dbg('apply.enter', () => ({ mode: mode || null, host: dbgEl(host), hasSvg: !!o.svg }));
   if (!side) { dbgNull('apply.null', 'apply.side'); return null; }         // center / inline 保持原表现
+  if (!lpFloatEnabled) { dbgNull('apply.null', 'apply.disabled'); return null; }   // 开关关掉
   const ledger = (o.ledger && typeof o.ledger.set === 'function' && typeof o.ledger.reset === 'function')
     ? o.ledger
     : createStyleLedger();
@@ -3602,12 +3793,53 @@ function flushLivePreviewFloats() {
   for (const c of Array.from(lpCssLive)) {
     try { if (c && typeof c.dispose === 'function' && c.dispose()) n++; } catch (e) { /* ignore */ }
   }
+  /* 重测调度器（observer / resize / scroll）不能留到卸载之后 */
+  for (const slot of Array.from(lpMeasureLive)) {
+    try { slot.sched.dispose(); } catch (e) { /* ignore */ }
+  }
+  lpMeasureLive.clear();
   return n;
 }
 
 /** 当前活着的 manager 数（诊断 / 自测用） */
 function livePreviewManagerCount() {
   return lpLive.size;
+}
+
+/**
+ * 让所有活着的浮动控件按当前开关重算一遍：关了就撤样式，开了就重新施加。
+ * 开关改完立刻生效，不用重载插件、也不用重开笔记。
+ */
+function refreshLivePreviewFloats() {
+  let n = 0;
+  for (const c of Array.from(lpCssLive)) {
+    try { if (c && typeof c.update === 'function') { c.update(); n++; } } catch (e) { /* ignore */ }
+  }
+  for (const m of Array.from(lpLive)) {
+    try { if (m && typeof m.refresh === 'function') { m.refresh(); n++; } } catch (e) { /* ignore */ }
+  }
+  return n;
+}
+
+/**
+ * 编辑模式浮动总开关。默认值见文件顶部的 LP_FLOAT；设置页通过插件自己的
+ * loadData / saveData 存，加载时用这里改运行时真值。
+ *
+ * 关掉时连带把重测调度器拆了：没了浮动就没有重新测量的理由，不该留着监听。
+ */
+function setLpFloatEnabled(on) {
+  const next = on !== false;
+  if (next === lpFloatEnabled) return lpFloatEnabled;
+  lpFloatEnabled = next;
+  dbg('lp.float.toggle', () => ({ on: lpFloatEnabled }));
+  if (!lpFloatEnabled) {
+    for (const slot of Array.from(lpMeasureLive)) {
+      try { slot.sched.dispose(); } catch (e) { /* ignore */ }
+    }
+    lpMeasureLive.clear();
+  }
+  try { refreshLivePreviewFloats(); } catch (e) { /* ignore */ }
+  return lpFloatEnabled;
 }
 
 /**
@@ -3619,6 +3851,7 @@ function attachLivePreviewFloat(host, cfg, opts) {
   const side = cfg && cfg.float;
   dbg('lpf.enter', () => ({ side: side || null, host: dbgEl(host), chain: dbgChain(host, 5), inDoc: !!(host && host.isConnected) }));
   if (side !== 'left' && side !== 'right') { dbgNull('lpf.null', 'lpf.side'); return null; }
+  if (!lpFloatEnabled) { dbgNull('lpf.null', 'lpf.disabled'); return null; }   // 开关关掉：一条样式都不写
   if (!host || typeof host.getBoundingClientRect !== 'function') { dbgNull('lpf.null', 'lpf.host'); return null; }
 
   const widget = { host, cfg, svg: o.svg, gap: o.gap, opts: o };
@@ -3732,36 +3965,82 @@ function applyFloatLayout(host, cfg) {
   const w = Number.isFinite(cfg.width) && cfg.width > 0 ? cfg.width + 'px' : '';
   if (!mode) return;
 
-  const s = host.style;
+  /* 上一轮写下的先还回去，再把这一轮记下来：重复调用不会把我们的值当成「原值」，
+   * 也不会因为换了模式而留下一堆前一轮的残留（比如 inline 的 vertical-align）。 */
+  if (Array.isArray(host.__bmFloatLayout)) restoreStyles(host.__bmFloatLayout);
+  const recs = [];
+  const put = (prop, value) => {
+    const r = setInlineStyle(host, prop, value);
+    if (r) recs.push(r);
+  };
+
   if (w) {
-    s.width = w;
-    s.maxWidth = '100%';
+    put('width', w);
+    put('maxWidth', '100%');
   }
 
   if (mode === 'left') {
-    s.float = 'left';
-    s.margin = '0.5rem 1rem 0.5rem 0';
-    s.clear = 'both';
+    put('float', 'left');
+    put('margin', '0.5rem 1rem 0.5rem 0');
+    put('clear', 'both');
   } else if (mode === 'right') {
-    s.float = 'right';
-    s.margin = '0.5rem 0 0.5rem 1rem';
-    s.clear = 'both';
+    put('float', 'right');
+    put('margin', '0.5rem 0 0.5rem 1rem');
+    put('clear', 'both');
   } else if (mode === 'center') {
     // 居中不是 float：强制换行后自己居中，文字不环绕
-    s.float = 'none';
-    s.margin = w ? '0.5rem auto' : '0.5rem auto';
-    s.display = 'block';
+    put('float', 'none');
+    put('margin', '0.5rem auto');
+    put('display', 'block');
   }
   // inline：让图当成行内元素跟着文字走。SVG 本身是块级，靠宿主 display 改
   else if (mode === 'inline') {
-    s.float = 'none';
-    s.display = 'inline-block';
-    s.verticalAlign = 'middle';
-    s.margin = '0 0.1em';
+    put('float', 'none');
+    put('display', 'inline-block');
+    put('verticalAlign', 'middle');
+    put('margin', '0 0.1em');
   }
 
+  host.__bmFloatLayout = recs;
   host.classList.add('bm-floated');
   host.classList.add('bm-float-' + mode);
+}
+
+/**
+ * 把 applyFloatLayout 写下的样式原样还回去（含类名）。
+ * 关掉编辑模式浮动时要用：那层的 float / margin 也是布局样式，不能留着。
+ */
+function resetFloatLayout(host) {
+  if (!host) return 0;
+  const recs = host.__bmFloatLayout;
+  let n = 0;
+  if (Array.isArray(recs)) {
+    n = restoreStyles(recs);
+    host.__bmFloatLayout = null;
+  }
+  try {
+    const cl = host.classList;
+    if (cl && typeof cl.remove === 'function') {
+      cl.remove('bm-floated', 'bm-float-left', 'bm-float-right', 'bm-float-center', 'bm-float-inline');
+    }
+  } catch (e) { /* ignore */ }
+  return n;
+}
+
+/**
+ * 把当前页所有受照顾的宿主（.cm-editor 里的）全部复位。
+ * 没有 document（自测 / 非浏览器环境）时返回 0，不报错。
+ */
+function clearLivePreviewFloatLayout(doc) {
+  const d = doc || (typeof document !== 'undefined' ? document : null);
+  if (!d || typeof d.querySelectorAll !== 'function') return 0;
+  let nodes = [];
+  try { nodes = d.querySelectorAll('.cm-editor .bm-floated') || []; } catch (e) { return 0; }
+  let n = 0;
+  for (let i = 0; i < nodes.length; i++) {
+    try { resetFloatLayout(nodes[i]); n++; } catch (e) { /* ignore */ }
+  }
+  return n;
 }
 
 module.exports = {
@@ -3790,6 +4069,11 @@ module.exports = {
   attachLivePreviewFloat,
   flushLivePreviewFloats,
   livePreviewManagerCount,
+  refreshLivePreviewFloats,
+  /* 编辑模式浮动总开关（默认值 LP_FLOAT，设置页通过 set 改运行时真值） */
+  LP_FLOAT,
+  isLpFloatEnabled,
+  setLpFloatEnabled,
   planWrappedLines,
   // 实时预览（CM6）：direct-embed 走纯 CSS float
   CSS_FLOAT_BOTTOM_GAP,
@@ -3797,6 +4081,13 @@ module.exports = {
   setImportantStyle,
   applyLivePreviewCssFloat,
   createCssFloatControl,
+  /* 施加浮动后让 CM6 重测（direct-embed 路径） */
+  measureSchedulerCount,
+  createMeasureScheduler,
+  RMEASURE_GAP,
+  RMEASURE_SCROLL_IDLE,
+  resetFloatLayout,
+  clearLivePreviewFloatLayout,
   pxValue,
   setInlineStyle,
   restoreStyles,
@@ -5335,6 +5626,378 @@ module.exports = { parseBox, parseSource, DIRS, STYLES };
 
 };
 
+__mods["src/remeasure.js"] = function (module, exports, require) {
+'use strict';
+
+/* ============================================================
+ * 实时预览：浮动施加完之后，让 CM6 重新量一次
+ *
+ * 症状：编辑模式（Live Preview）里给 .cm-embed-block 加 float 之后，图能贴边、
+ * 文字能被挤窄、重叠 0 行 —— 排版全对，只有光标坏了：点第 18 行落到第 14 行，
+ * 光标还会飘到行间空隙里。
+ *
+ * 假设：CM6 给 block widget 单独记一条高度（实测约 190px）。浮动之后这个块在
+ * DOM 里不再贡献流内高度，而 CM6 账上还挂着 190，差的这 190px 就是光标错位的量。
+ * 对图片没有这个问题：图片是行内元素，CM6 只记「这一行多高」，主题浮动它，
+ * 行高不变，账没乱。
+ *
+ * 所以要做的只有一件事：样式写完之后，让 CM6 重新测量一次。
+ * 至于重测之后 CM6 会不会把那条高度更新成 0 —— 这是本假设的判决性数据，
+ * 由 dbg('lp.measure.post') 那条日志给（content 高度在重测前后有没有变）。
+ *
+ * 时机（同一个调度器，100ms 节流）：
+ *   apply     样式写完后 schedule('apply')，下一帧（rAF）真的去 requestMeasure
+ *   mutation  MutationObserver（childList + subtree）合并后
+ *   resize    窗口尺寸变化
+ *   scroll    滚动停止后（idle 判定，不是每帧）
+ *
+ * 纪律：
+ *   - editor.cm 是内部 API，全程 try/catch，拿不到就静默跳过，绝不外抛
+ *   - 每 100ms 最多一次；落在窗口里的请求不丢，攒到窗口末尾补一次
+ *     （丢了就可能滚动之后一直错位，正是要防的事）
+ * ============================================================ */
+
+const { dbg, dbgEnabled, dbgEl } = require('./debug.js');
+
+/** 两次 requestMeasure 之间的最小间隔（ms）。低于它就攒到窗口末尾。 */
+const RMEASURE_GAP = 100;
+/** 滚动停止的判定窗口（ms）：滚动本身每帧都在触发，不 debounce 会把编辑器拖死 */
+const RMEASURE_SCROLL_IDLE = 150;
+
+/** 元素高度（只读 rect，读不到返回 null 而不是 0，免得和「真的 0 高」混淆） */
+function rectHeightOf(el) {
+  try {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+    const r = el.getBoundingClientRect();
+    if (!r) return null;
+    const h = Number(r.height);
+    return Number.isFinite(h) ? Math.round(h * 100) / 100 : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function round2(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
+}
+
+/**
+ * 时钟：默认取浏览器那套，自测可以整体替换（raf / setTimeout / now 全注进去）。
+ * 没有 rAF 时退到 setTimeout(fn, 16) —— Node 自测、离屏环境都走这条。
+ */
+function clockOf(o) {
+  const t = o.timers || null;                  // 整套假时钟（自测用）
+  const win = o.win || (typeof window !== 'undefined' ? window : null);
+  const pick = (a, b, c) => (typeof a === 'function' ? a : (typeof b === 'function' ? b : (typeof c === 'function' ? c : null)));
+
+  const setTimer = pick(t && t.setTimeout, o.setTimeout, typeof setTimeout === 'function' ? setTimeout : null);
+  const clearTimer = pick(t && t.clearTimeout, o.clearTimeout, typeof clearTimeout === 'function' ? clearTimeout : null);
+  const rafOwner = win && typeof win.requestAnimationFrame === 'function' ? win : null;
+  const raf = pick(t && t.raf, o.raf,
+    rafOwner ? ((fn) => rafOwner.requestAnimationFrame(fn)) : null)
+    || (setTimer ? ((fn) => setTimer(fn, 16)) : null);
+  const caf = pick(t && t.caf, o.caf,
+    rafOwner && typeof win.cancelAnimationFrame === 'function'
+      ? ((id) => rafOwner.cancelAnimationFrame(id))
+      : clearTimer)
+    || clearTimer;
+
+  return {
+    raf,
+    caf,
+    setTimer: setTimer ? (fn, ms) => setTimer(fn, ms) : null,
+    clearTimer: clearTimer ? (id) => clearTimer(id) : null,
+    now: pick(t && t.now, o.now, () => Date.now()),
+  };
+}
+
+/**
+ * 一个 .cm-content 一个调度器：多张浮动图共用同一份节流与同一组监听。
+ *
+ * @param {Element} content  这个编辑器（或任一祖先）的 .cm-content
+ * @param {object}  opts     cm / getCM(host) / win / MutationObserver / scroller /
+ *                           raf / caf / setTimeout / clearTimeout / now /
+ *                           gap / scrollIdle / observe(false 关掉观察者)
+ * @returns {{schedule, run, dispose, state, content}}
+ */
+function createMeasureScheduler(content, opts) {
+  const o = opts || {};
+  const clock = clockOf(o);
+  const gap = Number(o.gap) > 0 ? Number(o.gap) : RMEASURE_GAP;
+  const idle = Number(o.scrollIdle) > 0 ? Number(o.scrollIdle) : RMEASURE_SCROLL_IDLE;
+
+  let disposed = false;
+  let rafId = null;              // 排着的「下一帧执行」
+  let timerId = null;            // 排着的「节流窗口末尾补一次」
+  let pendingReason = '';
+  let lastCallAt = -Infinity;
+  let observer = null;
+  let observedNode = null;
+  let scrollTimer = null;
+  let scrollEl = null;
+
+  /* 计数：state() 与诊断都用它，自测直接断言 */
+  const stat = { schedules: 0, runs: 0, calls: 0, deferred: 0, skipped: 0, errors: 0 };
+
+  const resolveView = () => {
+    if (o.cm && o.cm.dom) return o.cm;
+    try {
+      if (typeof o.getCM === 'function' && content) {
+        const v = o.getCM(content);
+        if (v && v.dom) return v;
+      }
+    } catch (e) { /* 内部 API，拿不到就算了 */ }
+    return null;
+  };
+
+  /**
+   * 真的调一次。返回是否调用成功。
+   * 日志里带上「调用前后 content 高度」：这两个数不变就说明 CM6 没有把 widget
+   * 高度更新成 0，假设被推翻。
+   */
+  const callNow = (reason) => {
+    stat.runs++;
+    const view = resolveView();
+    const cmFound = !!(view && view.dom);
+    const hasApi = !!(view && typeof view.requestMeasure === 'function');
+    const hBefore = rectHeightOf(content);
+
+    if (!cmFound || !hasApi) {
+      stat.skipped++;
+      dbg('lp.measure.skip', () => ({
+        reason: reason || null,
+        cmFound,
+        hasApi,
+        content: dbgEl(content),
+        contentH: hBefore,
+        runs: stat.runs,
+        skipped: stat.skipped,
+      }));
+      return false;
+    }
+
+    let ok = false;
+    let err = '';
+    try {
+      view.requestMeasure();
+      ok = true;
+    } catch (e) {
+      ok = false;
+      err = String(e && e.message ? e.message : e);
+    }
+    if (ok) {
+      stat.calls++;
+      lastCallAt = clock.now();
+    } else {
+      stat.errors++;
+    }
+
+    dbg('lp.measure.call', () => ({
+      reason: reason || null,
+      cmFound,
+      ok,
+      error: err || null,
+      contentBefore: hBefore,
+      contentAfterCall: rectHeightOf(content),
+      calls: stat.calls,
+      runs: stat.runs,
+      deferred: stat.deferred,
+      skipped: stat.skipped,
+      errors: stat.errors,
+    }));
+
+    /* 重测是异步的（CM6 在下一帧的 measure cycle 里做），所以还要再等一帧看结果。
+     * 只在诊断开着时才排这一拍，正式运行不多一次 rAF。 */
+    if (ok && dbgEnabled() && typeof clock.raf === 'function') {
+      try {
+        clock.raf(() => {
+          const hAfter = rectHeightOf(content);
+          dbg('lp.measure.post', () => ({
+            reason: reason || null,
+            content: dbgEl(content),
+            contentBefore: hBefore,
+            contentAfter: hAfter,
+            delta: (hBefore != null && hAfter != null) ? round2(hAfter - hBefore) : null,
+            changed: (hBefore != null && hAfter != null) ? hAfter !== hBefore : null,
+          }));
+        });
+      } catch (e) { /* 排不上就算了，少一条日志 */ }
+    }
+    return ok;
+  };
+
+  const later = (ms, reason) => {
+    if (disposed || timerId || typeof clock.setTimer !== 'function') return false;
+    try {
+      timerId = clock.setTimer(() => {
+        timerId = null;
+        if (!disposed) run(reason);
+      }, ms);
+    } catch (e) {
+      timerId = null;
+      return false;
+    }
+    return true;
+  };
+
+  /** 立刻（节流允许时）执行；落在窗口内就排到窗口末尾，不丢。 */
+  function run(reason) {
+    if (disposed) return false;
+    const dt = clock.now() - lastCallAt;
+    if (dt < gap) {
+      stat.deferred++;
+      dbg('lp.measure.defer', () => ({
+        reason: reason || null,
+        wait: Math.round(gap - dt),
+        deferred: stat.deferred,
+      }));
+      later(gap - dt, reason);
+      return false;
+    }
+    return callNow(reason);
+  }
+
+  /**
+   * 排一次重测：合并到下一帧（rAF）。
+   * 样式刚写完浏览器还没布局，同步调用量到的还是旧值，所以必须等一帧。
+   */
+  function schedule(reason) {
+    if (disposed) return false;
+    stat.schedules++;
+    pendingReason = reason || 'apply';
+    if (rafId != null || timerId != null) return false;      // 已经排着，合并
+    if (typeof clock.raf !== 'function') return later(16, pendingReason);
+    try {
+      rafId = clock.raf(() => {
+        rafId = null;
+        if (!disposed) run(pendingReason);
+      });
+    } catch (e) {
+      rafId = null;
+      return later(16, pendingReason);                       // rAF 排不上就退到定时器
+    }
+    return true;
+  }
+
+  /* --------------------------- 观察者与监听 --------------------------- */
+
+  const observe = () => {
+    if (disposed || observer || o.observe === false) return false;
+    const MO = o.MutationObserver || (typeof MutationObserver !== 'undefined' ? MutationObserver : null);
+    if (!MO || typeof MO !== 'function') return false;
+    const view = resolveView();
+    const node = (view && view.dom) || content;
+    if (!node || typeof node.nodeType === 'undefined') return false;
+    try {
+      observer = new MO(() => { if (!disposed) schedule('mutation'); });
+      observer.observe(node, { childList: true, subtree: true });
+      observedNode = node;
+      dbg('lp.measure.observe', () => ({
+        node: dbgEl(node),
+        isEditorRoot: !!(view && view.dom === node),
+        cmFound: !!view,
+      }));
+      return true;
+    } catch (e) {
+      observer = null;
+      observedNode = null;
+      dbg('lp.measure.observe', () => ({ ok: false, error: String(e && e.message ? e.message : e) }));
+      return false;
+    }
+  };
+
+  const win = o.win
+    || (content && content.ownerDocument && content.ownerDocument.defaultView)
+    || (typeof window !== 'undefined' ? window : null);
+
+  const onResize = () => { schedule('resize'); };
+  if (win && typeof win.addEventListener === 'function') {
+    try { win.addEventListener('resize', onResize); } catch (e) { /* ignore */ }
+  }
+
+  const scrollerOf = () => {
+    if (o.scroller) return o.scroller;
+    if (scrollEl) return scrollEl;
+    try {
+      if (content && typeof content.closest === 'function') {
+        const s = content.closest('.cm-scroller');
+        if (s) { scrollEl = s; return s; }
+      }
+    } catch (e) { /* 假 DOM 没有 closest */ }
+    return null;
+  };
+
+  /* 滚动不是每帧都测：滚动途中 CM6 自己会重排版，停下来才需要一次校正 */
+  const onScroll = () => {
+    if (disposed || typeof clock.setTimer !== 'function') return;
+    if (scrollTimer != null && typeof clock.clearTimer === 'function') {
+      try { clock.clearTimer(scrollTimer); } catch (e) { /* ignore */ }
+    }
+    try {
+      scrollTimer = clock.setTimer(() => {
+        scrollTimer = null;
+        schedule('scroll');
+      }, idle);
+    } catch (e) {
+      scrollTimer = null;
+    }
+  };
+  const scroller = scrollerOf();
+  if (scroller && typeof scroller.addEventListener === 'function') {
+    try { scroller.addEventListener('scroll', onScroll, { passive: true }); } catch (e) { /* ignore */ }
+  }
+
+  const dispose = () => {
+    if (disposed) return false;
+    disposed = true;
+    if (rafId != null && typeof clock.caf === 'function') { try { clock.caf(rafId); } catch (e) { /* ignore */ } }
+    rafId = null;
+    if (timerId != null && typeof clock.clearTimer === 'function') { try { clock.clearTimer(timerId); } catch (e) { /* ignore */ } }
+    timerId = null;
+    if (scrollTimer != null && typeof clock.clearTimer === 'function') { try { clock.clearTimer(scrollTimer); } catch (e) { /* ignore */ } }
+    scrollTimer = null;
+    if (observer) { try { observer.disconnect(); } catch (e) { /* ignore */ } }
+    observer = null;
+    observedNode = null;
+    if (win && typeof win.removeEventListener === 'function') {
+      try { win.removeEventListener('resize', onResize); } catch (e) { /* ignore */ }
+    }
+    if (scroller && typeof scroller.removeEventListener === 'function') {
+      try { scroller.removeEventListener('scroll', onScroll, { passive: true }); } catch (e) { /* ignore */ }
+    }
+    dbg('lp.measure.dispose', () => ({ content: dbgEl(content), ...stat }));
+    return true;
+  };
+
+  observe();
+
+  return {
+    content,
+    schedule,
+    run,
+    dispose,
+    state: () => ({
+      attached: !disposed,
+      content: dbgEl(content),
+      observed: !!observer,
+      observedNode: dbgEl(observedNode),
+      scroller: dbgEl(scroller),
+      gap,
+      ...stat,
+    }),
+  };
+}
+
+module.exports = {
+  RMEASURE_GAP,
+  RMEASURE_SCROLL_IDLE,
+  rectHeightOf,
+  createMeasureScheduler,
+};
+
+};
+
 __mods["src/svg.js"] = function (module, exports, require) {
 'use strict';
 
@@ -6378,11 +7041,14 @@ function loadModules() {
      attachLivePreviewFloat, flushLivePreviewFloats,
      livePreviewManagerCount,
      CSS_FLOAT_BOTTOM_GAP, cssFloatMargin, setImportantStyle, applyLivePreviewCssFloat,
-     createCssFloatControl } = req('src/float.js'));
+     createCssFloatControl,
+     LP_FLOAT, isLpFloatEnabled, setLpFloatEnabled, refreshLivePreviewFloats,
+     measureSchedulerCount, createMeasureScheduler, RMEASURE_GAP, RMEASURE_SCROLL_IDLE,
+     resetFloatLayout, clearLivePreviewFloatLayout } = req('src/float.js'));
 
   // 临时诊断（Live Preview 图文混排）：开关与日志器都在 src/debug.js
   ({ DEBUG_LP, DEBUG_FILE, LINE_MAX: DEBUG_LINE_MAX, FIELD_MAX: DEBUG_FIELD_MAX, dbg, dbgNull,
-     dbgConfigure, dbgSetEnabled, dbgEl, dbgRect, dbgCss, dbgInline, dbgInlineAll, dbgChildCount,
+     dbgConfigure, dbgSetEnabled, dbgEnabled, dbgEl, dbgRect, dbgCss, dbgInline, dbgInlineAll, dbgChildCount,
      dbgFirstChild, dbgChain, dbgText, dbgCount, dbgReset, dbgFlush } = req('src/debug.js'));
 
   loadDirOk();
@@ -6539,7 +7205,13 @@ async function renderBraceMap(source, host, opts) {
     return null;
   }
 
-  applyFloatLayout(host, cfg);
+  /*
+   * 编辑模式浮动开关关着时，实时预览里一条布局样式都不写：宿主保持 Obsidian
+   * 原生的块级 widget 排版（图占整行，光标跟没装插件时一样）。阅读视图不受影响。
+   */
+  const lpOn = typeof isLpFloatEnabled === 'function' ? isLpFloatEnabled() : true;
+  const lpFloatOff = isLivePreview(host) && !lpOn;
+  if (!lpFloatOff) applyFloatLayout(host, cfg);
 
   const wrap = host.createDiv({ cls: 'brace-map-block' });
   const scroller = wrap.createDiv({ cls: 'brace-map-scroll' });
@@ -6650,6 +7322,11 @@ function mathLineFor(meta) {
  * 插件
  * ============================================================ */
 
+/** 设置默认值。存哪不管：走 Obsidian 的 loadData / saveData，不自己造存储。 */
+const DEFAULT_SETTINGS = {
+  livePreviewFloat: true,     // 编辑模式（实时预览）里允许括号图浮动
+};
+
 class BraceMapPlugin extends Plugin {
   async onload() {
     // 先把 src/ 装配起来（内联表，不读文件系统）
@@ -6659,6 +7336,9 @@ class BraceMapPlugin extends Plugin {
       console.error('[brace-map] 模块装配失败', err);
       throw err;
     }
+
+    // 设置要在装配之后读：它要调 setLpFloatEnabled 改运行时真值
+    await this.loadSettings();
 
     // 临时诊断：插件一加载就把 app 交给 src/debug.js，日志里才会先有一条 session.start。
     // 拿不到可写 adapter 时它自己返回 false（移动端无写权限 → 静默不记）。
@@ -6714,6 +7394,9 @@ class BraceMapPlugin extends Plugin {
       callback: () => this.diagnose(),
     });
 
+    // 设置页：目前只有一项——编辑模式浮动（光标错位时的应急开关）
+    this.addSettingTab(new BraceMapSettingTab(this.app, this));
+
     // 折行诊断：逐个 text 列出 data-seq / 文字 / 行数 / 每行实测宽 / 框宽 / 估算值。
     // 折行类问题（撑破方框、左边缘裁字）在现场只能靠这份数据定位。
     this.addCommand({
@@ -6721,6 +7404,71 @@ class BraceMapPlugin extends Plugin {
       name: 'Brace Map: 输出折行诊断',
       callback: () => this.diagnoseWrap(),
     });
+
+    // 布局诊断开关：光标错位这类问题只能在真实 Obsidian 里复现，需要现场的数。
+    // 默认关（DEBUG_LP = false），点一下开、再点一下关，不用改源码重编。
+    this.addCommand({
+      id: 'brace-map-lp-debug',
+      name: 'Brace Map: 切换实时预览布局诊断日志',
+      callback: () => this.toggleLpDebug(),
+    });
+  }
+
+  /**
+   * 读设置。loadData 拿不到（首次安装 / 移动端读写失败）就用默认值，不报错。
+   * 读完立刻把开关交给浮动模块：这是设置项真正生效的那一步。
+   */
+  async loadSettings() {
+    let saved = null;
+    try { saved = await this.loadData(); } catch (e) { saved = null; }
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved || {});
+    try { setLpFloatEnabled(this.settings.livePreviewFloat); } catch (e) { /* 装配失败就算了 */ }
+  }
+
+  async saveSettings() {
+    try { await this.saveData(this.settings); } catch (e) {
+      console.warn('[brace-map] 设置保存失败', e);
+    }
+  }
+
+  /**
+   * 改「编辑模式浮动」并立即生效：
+   *   关：浮动模块把所有浮动样式还回去（含 applyFloatLayout 写的那层 float / margin），
+   *       图回到 Obsidian 原生的块级排法，光标立刻不再错位
+   *   开：重新施加，不用重开笔记
+   */
+  async setLivePreviewFloat(on) {
+    const next = on !== false;
+    this.settings.livePreviewFloat = next;
+    await this.saveSettings();
+    try { setLpFloatEnabled(next); } catch (e) { /* 装配失败就算了 */ }
+    if (!next) {
+      try { clearLivePreviewFloatLayout(); } catch (e) { /* 拿不到 document 就算了 */ }
+    }
+    try {
+      new Notice(next
+        ? 'Brace Map：编辑模式浮动已开启'
+        : 'Brace Map：编辑模式浮动已关闭，图占整行，编辑体验与原生一致');
+    } catch (e) { /* Notice 失败不影响功能 */ }
+  }
+
+  /**
+   * 诊断日志开关。开的时候顺手把 app 交给诊断层（它默认关着，不会自己绑）。
+   * 日志写到 vault 根目录的 brace-map-debug.log。
+   */
+  toggleLpDebug() {
+    let on = false;
+    try { on = dbgSetEnabled(!dbgEnabled()); } catch (e) { on = false; }
+    if (on) {
+      try { dbgConfigure(this.app); } catch (e) { /* ignore */ }
+    }
+    try { dbgFlush(); } catch (e) { /* ignore */ }
+    try {
+      new Notice(on
+        ? 'Brace Map 布局诊断已开启，日志：' + DEBUG_FILE
+        : 'Brace Map 布局诊断已关闭');
+    } catch (e) { /* ignore */ }
+    return on;
   }
 
   /**
@@ -6850,6 +7598,40 @@ class BraceMapPlugin extends Plugin {
 
 module.exports = BraceMapPlugin;
 
+/* ============================================================
+ * 设置页
+ *
+ * 只有一项：编辑模式浮动。它的唯一职责是「出事了能立刻关掉」——
+ * 光标错位会把笔记搞成没法编辑，开关必须在设置里能点，而不是改源码重编译。
+ * 值的读写全走插件自带的 loadData / saveData。
+ * ============================================================ */
+
+class BraceMapSettingTab extends PluginSettingTabBase {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display() {
+    const { containerEl } = this;
+    if (!containerEl) return;
+    containerEl.empty();
+    containerEl.createEl('h2', { text: 'Brace Map' });
+
+    const Setting = ObsidianNS.Setting;
+    if (typeof Setting !== 'function') return;      // 非 Obsidian 环境（自测）直接不画
+
+    new Setting(containerEl)
+      .setName('编辑模式浮动')
+      .setDesc('在编辑模式（实时预览）里让括号图与正文并排。'
+        + '关掉后图占整行、不写任何布局样式，编辑体验与 Obsidian 原生一致；'
+        + '阅读视图的图文混排不受影响。')
+      .addToggle((t) => t
+        .setValue(this.plugin.settings.livePreviewFloat !== false)
+        .onChange(async (v) => { await this.plugin.setLivePreviewFloat(v); }));
+  }
+}
+
 // 开发期自测钩子（Obsidian 加载时不读这些属性）。
 // 拆分后符号是运行时才装配的，所以包成函数，每次装配完重建一次。
 function buildInternals() {
@@ -6910,6 +7692,18 @@ function buildInternals() {
   applyLivePreviewCssFloat,
   createCssFloatControl,
   findEditorViewOf,
+  // 施加浮动后让 CM6 重测（光标错位的假设验证）
+  LP_FLOAT,
+  isLpFloatEnabled,
+  setLpFloatEnabled,
+  refreshLivePreviewFloats,
+  measureSchedulerCount,
+  createMeasureScheduler,
+  RMEASURE_GAP,
+  RMEASURE_SCROLL_IDLE,
+  resetFloatLayout,
+  clearLivePreviewFloatLayout,
+  DEFAULT_SETTINGS,
   // 临时诊断（Live Preview 图文混排）：默认关闭；自测用 dbgSetEnabled(true) 打开
   DEBUG_LP,
   DEBUG_FILE,
@@ -6919,6 +7713,7 @@ function buildInternals() {
   dbgNull,
   dbgConfigure,
   dbgSetEnabled,
+  dbgEnabled,
   dbgEl,
   dbgRect,
   dbgCss,
