@@ -79,4 +79,4 @@ async function runAll() {
   }
 }
 
-module.exports = { I, ok, eq, finite, clean, suite, runAll };
+module.exports = { I, Plugin, ok, eq, finite, clean, suite, runAll };

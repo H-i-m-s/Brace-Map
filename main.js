@@ -40,9 +40,10 @@ let applyFloatLayout, attachFloatWrap, resetFloat, floatify, pickContext,
   collectWrapTargets, applyWrapMargins, restoreWrapMargins, restoreStyles,
   setInlineStyle, elHeight, isLivePreview, FLOAT_GAP, CLIMB_LIMIT, WRAP_LIMIT, pxValue,
   readMargins;
-let LP_DEBOUNCE, LP_POLL, LP_RETRY, classHas, climbTo, livePreviewParts, collectLineSiblings,
-  planLivePreviewLines, planLinePads, applyLinePads, createStyleLedger,
-  applyLivePreviewFloat, findEditorView, attachLivePreviewFloat;
+let LP_DEBOUNCE, LP_POLL, LP_RETRY, LP_RESET_DELAY, classHas, climbTo, livePreviewParts, collectLineSiblings,
+  planLivePreviewLines, planWrappedLines, planLinePads, applyLinePads, createStyleLedger, padBaseOf,
+  padReaderOf, applyLivePreviewFloat, findEditorView, attachLivePreviewFloat, flushLivePreviewFloats,
+  livePreviewManagerCount;
 /* 临时诊断（Live Preview 图文混排）：见 src/debug.js。DEBUG_LP 关掉后全为空转。 */
 let DEBUG_LP, DEBUG_FILE, DEBUG_LINE_MAX, DEBUG_FIELD_MAX, dbg, dbgNull, dbgConfigure, dbgEl, dbgRect, dbgCss,
   dbgInline, dbgInlineAll, dbgChildCount, dbgFirstChild, dbgChain, dbgText, dbgCount, dbgReset, dbgFlush;
@@ -2556,6 +2557,10 @@ function planLivePreviewLines(lines, height, opts) {
  * 最终写入仍由调用方的账本负责。
  *
  * 拿不到 style / 量不出高度时退回只读的 planLivePreviewLines。
+ *
+ * opts.basePad(el, prop) 给「这一行没有我们参与时」的 padding：账本里记着的基准。
+ * 不给就按行内值算（老行为）。脱离账本算基准会把上一轮写的留白当成行自己的，
+ * 一轮轮叠上去。
  */
 function planWrappedLines(lines, height, opts) {
   const o = opts || {};
@@ -2565,6 +2570,12 @@ function planWrappedLines(lines, height, opts) {
   const prop = side === 'left' ? 'paddingLeft' : 'paddingRight';
   if (!Array.isArray(lines) || !(h > 0) || !(span > 0)) return planLivePreviewLines(lines, height, opts);
   const limit = Number(o.limit) > 0 ? Number(o.limit) : WRAP_LIMIT;
+  const basePad = typeof o.basePad === 'function'
+    ? o.basePad
+    : (node, key) => {
+      const v = parseFloat(node && node.style ? node.style[key] : '');
+      return Number.isFinite(v) ? v : 0;
+    };
   const out = [];
   let acc = 0;
   for (let i = 0; i < lines.length && out.length < limit; i++) {
@@ -2574,9 +2585,13 @@ function planWrappedLines(lines, height, opts) {
     let measured = -1;
     if (el.style && typeof el.style === 'object') {
       const prev = el.style[prop] == null ? '' : String(el.style[prop]);
-      const base = Number(parseFloat(prev));
+      let base = 0;
       try {
-        el.style[prop] = round2((Number.isFinite(base) ? base : 0) + span) + 'px';
+        const got = Number(basePad(el, prop));
+        base = Number.isFinite(got) ? got : 0;
+      } catch (e) { base = 0; }
+      try {
+        el.style[prop] = round2(base + span) + 'px';
         if (typeof el.getBoundingClientRect === 'function') measured = elHeight(el);
       } catch (e) { measured = -1; }
       try {
@@ -2642,45 +2657,150 @@ function planLinePads(blocks, opts) {
  * 行内样式账本：记下「写之前的值」，复位时按倒序放回去。
  *
  * 为什么不用 WeakSet：复位要还原成原值（可能是主题给的行内值），只记「改过谁」
- * 会把它抹成空。Map 存 el → {prop: prev}，复位完清空，重复施加不会叠加。
+ * 会把它抹成空。Map 存 el → prop → 条目，复位完清空，重复施加不会叠加。
+ *
+ * 三种「放手」的姿势分开：
+ *   sweep()          一轮结束时，把本轮没再被认领的记账原地还原（只还原该还原的）
+ *   pruneDetached()  节点已脱离文档：先把样式还回去，再丢记账
+ *   reset()          全部还原（真正的销毁 / 插件卸载）
+ * 关键点：一轮重算里不再「先全清再重写」。那样每次重算都有一段所有留白归零的
+ * 瞬间，CM6 又正好在这时候测量行高、重建 widget，很容易被画出来（文字压到图上）。
+ *
+ * set() 还是差异写入：同一个属性值没变就一个字节都不碰。样式写入会触发样式重算，
+ * 无谓的写入本身就是 CM6 重新测量的诱因。
  */
 function createStyleLedger() {
-  const touched = new Map();     // el -> Map(prop -> 写之前的值)
+  const touched = new Map();     // el -> Map(prop -> {prev, written, base, gen})
   const order = [];              // [el, prop]，复位倒着走
+  let gen = 0;                   // 轮次：本轮没再被认领的记账，sweep 时还原
+  let writes = 0;
+
+  const isPad = (prop) => prop === 'paddingLeft' || prop === 'paddingRight';
+
+  const restore = (el, prop, entry) => {
+    if (!el || !el.style) return false;
+    const prev = entry ? entry.prev : '';
+    try {
+      if (prev) {
+        el.style[prop] = prev;
+      } else if (typeof el.style.removeProperty === 'function') {
+        el.style.removeProperty(cssName(prop));
+      } else {
+        el.style[prop] = '';
+      }
+    } catch (e) { return false; }
+    return true;
+  };
+
+  const drop = (el, prop) => {
+    const rec = touched.get(el);
+    if (!rec) return;
+    rec.delete(prop);
+    if (!rec.size) touched.delete(el);
+  };
+
   return {
     set(el, prop, value) {
       if (!el || !el.style) return false;
+      const v = String(value);
       let rec = touched.get(el);
       if (!rec) { rec = new Map(); touched.set(el, rec); }
-      if (!rec.has(prop)) {
-        const prev = el.style[prop] == null ? '' : String(el.style[prop]);
-        rec.set(prop, prev);
-        order.push([el, prop]);
+      const entry = rec.get(prop);
+      if (entry) {
+        entry.gen = gen;                    // 本轮还要它，sweep 别动
+        if (entry.written === v) return false;
+        entry.written = v;
+        el.style[prop] = v;
+        writes++;
+        return true;
       }
-      el.style[prop] = value;
+      const prev = el.style[prop] == null ? '' : String(el.style[prop]);
+      const fresh = { prev, written: v, base: null, gen };
+      // padding 的基准必须在动它之前抓：写进去之后 computed 里就是我们的值，
+      // 再也读不回主题给的那点留白，下一轮会把我们的值当成基准再叠一次。
+      if (isPad(prop)) {
+        const pad = paddingOf(el);
+        fresh.base = prop === 'paddingLeft' ? num(pad.left) : num(pad.right);
+      }
+      rec.set(prop, fresh);
+      order.push([el, prop]);
+      el.style[prop] = v;
+      writes++;
       return true;
+    },
+    /** 本轮仍需要这个属性，但不必再写（computed 已经是目标值了）：只续期 */
+    claim(el, prop) {
+      if (!el || !el.style) return false;
+      const rec = touched.get(el);
+      const entry = rec && rec.get(prop);
+      if (!entry) return false;
+      entry.gen = gen;
+      return true;
+    },
+    /** 开一轮：之后 set / claim 过的都算「本轮仍需要」 */
+    begin() { gen++; return gen; },
+    /** 一轮结束后，把本轮没认领的记账原地还原。先写后撒，没有空档。 */
+    sweep() {
+      let n = 0;
+      const keep = [];
+      for (let i = 0; i < order.length; i++) {
+        const el = order[i][0];
+        const prop = order[i][1];
+        const rec = touched.get(el);
+        const entry = rec && rec.get(prop);
+        if (entry && entry.gen === gen) { keep.push(order[i]); continue; }
+        if (restore(el, prop, entry)) n++;
+        drop(el, prop);
+      }
+      order.length = 0;
+      for (const pair of keep) order.push(pair);
+      return n;
+    },
+    /** 节点已脱离文档：先把样式还回去再丢记账。还回去不会触发布局（节点不在树上），
+     *  但只要 CM6 把同一批行 / widget 回收复用，就不会带着我们的行内值回来。 */
+    pruneDetached() {
+      let n = 0;
+      const keep = [];
+      for (let i = 0; i < order.length; i++) {
+        const el = order[i][0];
+        const prop = order[i][1];
+        if (!el || el.isConnected === false) {
+          const rec = el ? touched.get(el) : null;
+          restore(el, prop, rec ? rec.get(prop) : null);
+          drop(el, prop);
+          n++;
+          continue;
+        }
+        keep.push(order[i]);
+      }
+      order.length = 0;
+      for (const pair of keep) order.push(pair);
+      return n;
     },
     reset() {
       let n = 0;
       for (let i = order.length - 1; i >= 0; i--) {
-        const pair = order[i];
-        const el = pair[0];
-        const prop = pair[1];
-        if (!el || !el.style) continue;
+        const el = order[i][0];
+        const prop = order[i][1];
         const rec = touched.get(el);
-        const prev = rec && rec.has(prop) ? rec.get(prop) : '';
-        if (prev) {
-          el.style[prop] = prev;
-        } else if (typeof el.style.removeProperty === 'function') {
-          el.style.removeProperty(cssName(prop));
-        } else {
-          el.style[prop] = '';
-        }
-        n++;
+        const entry = rec && rec.get(prop);
+        if (restore(el, prop, entry)) n++;
       }
       order.length = 0;
       touched.clear();
       return n;
+    },
+    /** 我们接管这个属性之前，它「本该是」的 padding（px）；没接管过就是 null */
+    padBase(el, prop) {
+      const rec = touched.get(el);
+      const entry = rec && rec.get(prop);
+      return entry && typeof entry.base === 'number' ? entry.base : null;
+    },
+    /** 接管之前的行内值；没接管过就是 undefined */
+    orig(el, prop) {
+      const rec = touched.get(el);
+      const entry = rec && rec.get(prop);
+      return entry ? entry.prev : undefined;
     },
     has: (el) => touched.has(el),
     props: (el) => {
@@ -2688,10 +2808,44 @@ function createStyleLedger() {
       return rec ? Array.from(rec.keys()) : [];
     },
     size: () => touched.size,
+    writes: () => writes,
+    gen: () => gen,
   };
 }
 
-/** 把 planLinePads 的结果写进 DOM（经账本，可复位），返回写的条数 */
+/**
+ * 这一行「没有我们参与时」的 padding：账本接管过的用接管前的基准，否则读 computed。
+ * planWrappedLines 的试写和 planLinePads 的叠加都要用它 —— 拿行内值当基准，
+ * 上一轮写的留白会被当成行自己的 padding，一轮轮叠宽。
+ */
+function padBaseOf(el, ledger, prop) {
+  const own = ledger && typeof ledger.padBase === 'function' ? ledger.padBase(el, prop) : null;
+  if (own != null) return own;
+  const got = paddingOf(el);
+  return prop === 'paddingLeft' ? num(got.left) : num(got.right);
+}
+
+/** 续期一条记账：本轮还需要，但不必再写。账本没这个 api（外部传进来的）就当没事 */
+function claimStyle(ledger, el, prop) {
+  if (!ledger || typeof ledger.claim !== 'function') return false;
+  return ledger.claim(el, prop);
+}
+
+/** 账本友好的 padding 读取器，形状跟 paddingOf 一样，给 planLinePads 用 */
+function padReaderOf(ledger) {
+  return (el) => {
+    const got = paddingOf(el);
+    const out = { left: num(got.left), right: num(got.right) };
+    const l = ledger && typeof ledger.padBase === 'function' ? ledger.padBase(el, 'paddingLeft') : null;
+    if (l != null) out.left = l;
+    const r = ledger && typeof ledger.padBase === 'function' ? ledger.padBase(el, 'paddingRight') : null;
+    if (r != null) out.right = r;
+    return out;
+  };
+}
+
+/** 把 planLinePads 的结果写进 DOM（经账本，可复位），返回写的条数。
+ *  值是差异写入：跟上一轮相同的属性不会重复写（账本自己判断）。 */
 function applyLinePads(pads, ledger) {
   let n = 0;
   if (!Array.isArray(pads) || !ledger || typeof ledger.set !== 'function') return n;
@@ -2771,10 +2925,17 @@ function applyLivePreviewFloat(host, cfg, opts) {
   }
 
   /* 2) 定位上下文：.cm-line 原本是 relative，会把绝对定位的包含块抢到自己身上，
-   *    那样 widget 只能相对这一行定位，后面的行永远绕不上来。 */
-  if (computedPosition(line) !== 'static') ledger.set(line, 'position', 'static');
+   *    那样 widget 只能相对这一行定位，后面的行永远绕不上来。
+   *    direct-embed 分支里 line 就是 embed，它自己随后被绝对定位接管，不必先写 static。
+   *    位置属性也走差异写入：computed 已经是目标值的就不再写，但要 claim 一下，
+   *    让账本知道「本轮还需要它」，否则收尾的 sweep 会把它还原掉。 */
+  if (line !== embed) {
+    if (computedPosition(line) !== 'static') ledger.set(line, 'position', 'static');
+    else claimStyle(ledger, line, 'position');
+  }
   const contentPos = computedPosition(content);
   if (!contentPos || contentPos === 'static') ledger.set(content, 'position', 'relative');
+  else claimStyle(ledger, content, 'position');
 
   /* 3) 图宽：配置优先，没写就用 SVG 实际渲染宽；图高一律按 getBoundingClientRect，
    *    不读 SVG 的 height 属性（CSS 会缩放它）。 */
@@ -2818,7 +2979,14 @@ function applyLivePreviewFloat(host, cfg, opts) {
   /* 6) 从 widget 那行的下一个正文行起逐行留白，累积够图高就停。
    *    高度按「加了留白、真的折行之后」量：留白会把长行挤窄，不改量法会把
    *    图下方本来不重叠的行也算进去。 */
-  const lines = planWrappedLines(candidates, height, { limit: o.maxLines, span: width + gap, side });
+  const lines = planWrappedLines(candidates, height, {
+    limit: o.maxLines,
+    span: width + gap,
+    side,
+    basePad: typeof o.basePad === 'function'
+      ? o.basePad
+      : (el, prop) => padBaseOf(el, ledger, prop),
+  });
 
   dbg('apply.after', () => ({
     height: round2(height),
@@ -2904,8 +3072,18 @@ function findEditorView(host, opts) {
 /**
  * 一个 .cm-content 对应一个 manager：一套账本、一个 observer、一次 requestMeasure。
  * 同一文档里多张浮动图共用它，留白才能按行合并（取最大）而不是互相覆盖。
+ *
+ * 生命周期挂 .cm-content，不挂单个 widget：CM6 滚动 / 重排时会把 block widget
+ * 整个换掉（旧 widget dispose、新 widget create）。manager 要是跟着 widget 走，
+ * 每换一次就得「销毁 → 复位全部样式 → 重建 → 重测 → 再写回去」，中间那段留白是 0，
+ * 文字退回整宽就压在图上。现在最后一个 widget 走了只进入「待复位」，样式原地不动，
+ * 等新 widget 挂上来接管；真没人来才在 LP_RESET_DELAY 之后复位。
  */
-const lpManagers = new WeakMap();
+const lpManagers = new WeakMap();     // .cm-content → manager
+const lpLive = new Set();             // 活着的 manager（WeakMap 不能遍历，卸载时要能一起收）
+
+/** 最后一个 widget 走掉后，等多久才真的复位（ms）。CM6 重建 widget 通常在几十毫秒内完成。 */
+const LP_RESET_DELAY = 500;
 
 function createLivePreviewManager(content, seed) {
   const o = Object.assign({}, seed || {});
@@ -2916,9 +3094,11 @@ function createLivePreviewManager(content, seed) {
   let observedNode = null;
   let timer = 0;
   let poll = 0;
+  let resetTimer = 0;
   let disposed = false;
   let applies = 0;
-  let stats = { widgets: 0, lines: 0, styles: 0, applies: 0 };
+  let api = null;
+  let stats = { widgets: 0, lines: 0, styles: 0, applies: 0, swept: 0, resetState: 'live' };
 
   dbg('manager.create', () => ({ content: dbgEl(content), chain: dbgChain(content, 4) }));
 
@@ -2934,36 +3114,48 @@ function createLivePreviewManager(content, seed) {
     try { view.requestMeasure(); return true; } catch (e) { return false; }
   };
 
-  /** 一轮完整施加：先整体复位上一轮，再按当前 DOM 重算 */
+  /** 一轮完整施加：按当前 DOM 先算后写，不再「先整体复位」 */
   const pass = () => {
     if (disposed) return stats;
-    if (content.isConnected === false) { dispose(); return stats; }
+    if (content.isConnected === false) { flush('detached'); return stats; }
     // 掉出文档的图（笔记关了、切到阅读视图重建了代码块）直接摘掉
     for (const w of Array.from(widgets)) {
       if (!w || !w.host || w.host.isConnected === false) widgets.delete(w);
     }
-    if (!widgets.size) { dispose(); return stats; }
+    if (!widgets.size) { scheduleReset(); return stats; }
+    cancelReset();                        // 又有活干了，待复位作废
     applies++;
-    ledger.reset();                       // 复位在重算之前，改动绝不叠加
+    ledger.pruneDetached();               // 已脱离文档的记账：先还样式再丢记录
+    ledger.begin();                       // 开一轮：本轮没再认领的记账，收尾时还原
     const blocks = [];
     const records = [];
     for (const w of Array.from(widgets)) {
       let geo = null;
-      try { geo = applyLivePreviewFloat(w.host, w.cfg, { svg: w.svg, gap: w.gap, ledger }); }
-      catch (err) { geo = null; }
+      try {
+        geo = applyLivePreviewFloat(w.host, w.cfg, {
+          svg: w.svg,
+          gap: w.gap,
+          ledger,
+          basePad: (el, prop) => padBaseOf(el, ledger, prop),
+        });
+      } catch (err) { geo = null; }
       if (!geo) continue;
       records.push(geo);
       blocks.push({ lines: geo.lines, side: geo.side, span: geo.span });
     }
-    const pads = planLinePads(blocks, { reader: paddingOf });
+    const pads = planLinePads(blocks, { reader: padReaderOf(ledger) });
     const styles = applyLinePads(pads, ledger);
-    stats = { widgets: records.length, lines: pads.length, styles, applies };
+    // 先写后撒：这一轮该留白的行已经全部写好了，再收拾上一轮留下、这一轮不再需要的
+    const swept = ledger.sweep();
+    ledger.pruneDetached();
+    stats = { widgets: records.length, lines: pads.length, styles, applies, swept, resetState: 'live' };
     dbg('manager.pass', () => ({
       applies: stats.applies,
       registered: widgets.size,
       records: records.length,
       pads: pads.length,
       styles: stats.styles,
+      swept: stats.swept,
       padSamples: pads.slice(0, 3).map((p) => ({ el: dbgEl(p.el), left: p.left, right: p.right })),
     }));
     requestMeasure();
@@ -2990,7 +3182,7 @@ function createLivePreviewManager(content, seed) {
     try {
       observer = new MO(() => {
         if (disposed) return;
-        if (content.isConnected === false) { dispose(); return; }
+        if (content.isConnected === false) { flush('detached'); return; }
         schedule();
       });
       observer.observe(node, { childList: true, subtree: true });
@@ -3015,11 +3207,11 @@ function createLivePreviewManager(content, seed) {
     try {
       poll = setInterval(() => {
         if (disposed) return;
-        if (content.isConnected === false) { dispose(); return; }
+        if (content.isConnected === false) { flush('detached'); return; }
         for (const w of Array.from(widgets)) {
           if (!w || !w.host || w.host.isConnected === false) widgets.delete(w);
         }
-        if (!widgets.size) { dispose(); return; }
+        if (!widgets.size) { scheduleReset(); return; }
         const view = resolveCm();
         const want = (view && view.dom) ? view.dom : content;
         if (observer && observedNode !== want) {
@@ -3034,21 +3226,74 @@ function createLivePreviewManager(content, seed) {
     } catch (e) { poll = 0; }
   };
 
-  const dispose = () => {
+  /**
+   * 最后一个 widget 走掉：不立即复位，而是排一个延迟复位。
+   * 这段时间内同一个 content 上来了新 widget，就 cancelReset() 让新的那一轮接管 ——
+   * 样式从头到尾没被清空过，也就不存在「文字暂时退回整宽」的窗口。
+   */
+  const scheduleReset = () => {
+    if (disposed || resetTimer) return false;
+    const delay = Number(o.resetDelay) > 0 ? Number(o.resetDelay) : LP_RESET_DELAY;
+    try {
+      resetTimer = setTimeout(() => {
+        resetTimer = 0;
+        flush('deferred');
+      }, delay);
+      // Node（自测）里不给进程续命；浏览器没有 unref，忽略
+      if (resetTimer && typeof resetTimer.unref === 'function') resetTimer.unref();
+      stats.resetState = 'pending';
+      dbg('lpf.reset.deferred', () => ({
+        content: dbgEl(content),
+        delay,
+        widgets: widgets.size,
+        applies,
+        inDoc: content.isConnected !== false,
+      }));
+      return true;
+    } catch (e) {
+      resetTimer = 0;
+      flush('deferred');                // 定时器都排不上，只能当场复位
+      return false;
+    }
+  };
+
+  const cancelReset = () => {
+    if (!resetTimer) return false;
+    try { clearTimeout(resetTimer); } catch (e) { /* ignore */ }
+    resetTimer = 0;
+    stats.resetState = 'live';
+    dbg('lpf.reset.canceled', () => ({ content: dbgEl(content), widgets: widgets.size, applies }));
+    return true;
+  };
+
+  /**
+   * 终局：同步复位 + 拆掉计时器与观察者，不留任何延迟动作。
+   * 节点已经脱离文档时照样把样式还回去（不去碰它的布局，只是改行内值），
+   * 这样「切走笔记 / 关掉文档」跟「插件卸载」走同一条路。
+   */
+  const flush = (why) => {
     if (disposed) return;
     disposed = true;
-    dbg('manager.dispose', () => ({ content: dbgEl(content), applies, widgets: widgets.size }));
+    if (resetTimer) { try { clearTimeout(resetTimer); } catch (e) { /* ignore */ } resetTimer = 0; }
     if (timer) { try { clearTimeout(timer); } catch (e) { /* ignore */ } timer = 0; }
     if (poll) { try { clearInterval(poll); } catch (e) { /* ignore */ } poll = 0; }
     if (observer) { try { observer.disconnect(); } catch (e) { /* ignore */ } }
+    const inDoc = content.isConnected !== false;
+    let restored = 0;
+    try { restored = ledger.reset(); } catch (e) { restored = 0; }
     observer = null;
     observedNode = null;
-    try { ledger.reset(); } catch (e) { /* ignore */ }
+    const left = widgets.size;
     widgets.clear();
+    stats.resetState = 'flushed';
     try { lpManagers.delete(content); } catch (e) { /* ignore */ }
+    if (api) lpLive.delete(api);
+    dbg('lpf.reset.flushed', () => ({
+      content: dbgEl(content), why: why || 'sync', inDoc, restored, applies, droppedWidgets: left,
+    }));
   };
 
-  return {
+  api = {
     content,
     attach(w) {
       if (disposed || !w) return false;
@@ -3058,6 +3303,7 @@ function createLivePreviewManager(content, seed) {
         if (w.opts.getCM && !o.getCM) o.getCM = w.opts.getCM;
       }
       widgets.add(w);
+      cancelReset();                    // 接管待复位的旧账，样式保持不动
       dbg('manager.attach', () => ({ host: dbgEl(w && w.host), registered: widgets.size, hasCmHook: !!(o.cm || o.getCM) }));
       ensureObserved();
       startPoll();
@@ -3067,13 +3313,50 @@ function createLivePreviewManager(content, seed) {
     detach(w) {
       widgets.delete(w);
       if (disposed) return;
-      if (!widgets.size) { dispose(); return; }
-      pass();
+      if (!widgets.size) { scheduleReset(); return; }
+      pass();                           // 还有别的图在：重算一行，把走掉的那张的留白收回去
     },
     refresh() { if (!disposed) pass(); },
-    state() { return { attached: !disposed, widgets: widgets.size, lines: stats.lines, styles: stats.styles, applies: stats.applies }; },
-    dispose,
+    /** 立即同步复位（插件卸载 / 需要确定性收尾的场合） */
+    flush() { flush('sync'); },
+    /** 兼容旧调用：只负责「交出 widget」，真正的复位交给延迟 */
+    dispose() {
+      widgets.clear();
+      scheduleReset();
+    },
+    state() {
+      return {
+        attached: !disposed,
+        widgets: widgets.size,
+        lines: stats.lines,
+        styles: stats.styles,
+        applies: stats.applies,
+        swept: stats.swept,
+        resetState: stats.resetState,
+      };
+    },
   };
+  lpLive.add(api);
+  return api;
+}
+
+/**
+ * 插件卸载 / 页面关掉：把所有待复位的 manager 当场同步复位。
+ * 不走延迟 —— 卸载后没人会来接管，留着定时器就是脏样式 + 泄漏。
+ */
+function flushLivePreviewFloats() {
+  const list = Array.from(lpLive);
+  let n = 0;
+  for (const m of list) {
+    if (!m || typeof m.flush !== 'function') continue;
+    try { m.flush(); n++; } catch (e) { /* ignore */ }
+  }
+  return n;
+}
+
+/** 当前活着的 manager 数（诊断 / 自测用） */
+function livePreviewManagerCount() {
+  return lpLive.size;
 }
 
 /**
@@ -3129,12 +3412,19 @@ function attachLivePreviewFloat(host, cfg, opts) {
     }
     dbg('lpf.parts', () => lpPartsInfo(host, parts));
     let m = lpManagers.get(parts.content);
+    if (m) {
+      // 已经收尾的旧 manager 不能复用（它连账本都清空了）
+      const st = typeof m.state === 'function' ? m.state() : null;
+      if (st && st.attached === false) m = null;
+    }
     if (!m) {
-      m = createLivePreviewManager(parts.content, { cm: o.cm, app: o.app, getCM: o.getCM });
+      m = createLivePreviewManager(parts.content, {
+        cm: o.cm, app: o.app, getCM: o.getCM, resetDelay: o.resetDelay,
+      });
       lpManagers.set(parts.content, m);
     }
     manager = m;
-    m.attach(widget);
+    if (!m.attach(widget)) { manager = null; nextRetry(); return; }
     dbg('lpf.attach.done', () => ({ attempt, state: typeof m.state === 'function' ? m.state() : null }));
   }
 
@@ -3145,6 +3435,7 @@ function attachLivePreviewFloat(host, cfg, opts) {
     update: () => {
       dbg('lpf.update', () => ({ hasManager: !!manager, disposed }));
       if (disposed) return;
+      if (manager && manager.state().attached === false) manager = null;   // 已收尾的旧 manager
       if (manager) manager.refresh();
       else attach();
     },
@@ -3215,6 +3506,7 @@ module.exports = {
   LP_DEBOUNCE,
   LP_POLL,
   LP_RETRY,
+  LP_RESET_DELAY,
   elHeight,
   collectWrapTargets,
   // 实时预览（CM6）
@@ -3226,9 +3518,14 @@ module.exports = {
   planLinePads,
   applyLinePads,
   createStyleLedger,
+  padBaseOf,
+  padReaderOf,
   applyLivePreviewFloat,
   findEditorView,
   attachLivePreviewFloat,
+  flushLivePreviewFloats,
+  livePreviewManagerCount,
+  planWrappedLines,
   pxValue,
   setInlineStyle,
   restoreStyles,
@@ -5804,10 +6101,11 @@ function loadModules() {
   ({ FLOAT_GAP, CLIMB_LIMIT, WRAP_LIMIT, pxValue, elHeight, collectWrapTargets,
      setInlineStyle, restoreStyles, applyWrapMargins, restoreWrapMargins, readMargins,
      isLivePreview, pickContext, floatify, resetFloat, attachFloatWrap,
-     applyFloatLayout, LP_DEBOUNCE, LP_POLL, LP_RETRY, classHas, climbTo, livePreviewParts,
-     collectLineSiblings, planLivePreviewLines, planLinePads, applyLinePads,
-     createStyleLedger, applyLivePreviewFloat, findEditorView,
-     attachLivePreviewFloat } = req('src/float.js'));
+     applyFloatLayout, LP_DEBOUNCE, LP_POLL, LP_RETRY, LP_RESET_DELAY, classHas, climbTo, livePreviewParts,
+     collectLineSiblings, planLivePreviewLines, planWrappedLines, planLinePads, applyLinePads,
+     createStyleLedger, padBaseOf, padReaderOf, applyLivePreviewFloat, findEditorView,
+     attachLivePreviewFloat, flushLivePreviewFloats,
+     livePreviewManagerCount } = req('src/float.js'));
 
   // 临时诊断（Live Preview 图文混排）：开关与日志器都在 src/debug.js
   ({ DEBUG_LP, DEBUG_FILE, LINE_MAX: DEBUG_LINE_MAX, FIELD_MAX: DEBUG_FIELD_MAX, dbg, dbgNull,
@@ -6271,6 +6569,9 @@ class BraceMapPlugin extends Plugin {
 
   onunload() {
     disposeFloats();
+    // 浮动控制器销毁只是「交接」给延迟复位；卸载时没人会来接管，
+    // 必须当场同步复位，否则会留下脏样式和一个没人清理的定时器。
+    try { if (typeof flushLivePreviewFloats === 'function') flushLivePreviewFloats(); } catch (e) { /* ignore */ }
   }
 }
 
@@ -6312,6 +6613,7 @@ function buildInternals() {
   LP_DEBOUNCE,
   LP_POLL,
   LP_RETRY,
+  LP_RESET_DELAY,
   classHas,
   climbTo,
   livePreviewParts,
@@ -6323,6 +6625,11 @@ function buildInternals() {
   applyLivePreviewFloat,
   findEditorView,
   attachLivePreviewFloat,
+  flushLivePreviewFloats,
+  livePreviewManagerCount,
+  padBaseOf,
+  padReaderOf,
+  planWrappedLines,
   findEditorViewOf,
   // 临时诊断（Live Preview 图文混排）：排查完成后整组删掉
   DEBUG_LP,
