@@ -9,7 +9,7 @@
  * brace → layout → svg → export → calibrate），无循环依赖。
  * ============================================================ */
 
-const { Plugin, Notice } = require('obsidian');
+const { Plugin, Notice, MarkdownView } = require('obsidian');
 
 /* 模块符号：由 loadModules() 填充，不在顶层 require。
  *
@@ -40,6 +40,9 @@ let applyFloatLayout, attachFloatWrap, resetFloat, floatify, pickContext,
   collectWrapTargets, applyWrapMargins, restoreWrapMargins, restoreStyles,
   setInlineStyle, elHeight, isLivePreview, FLOAT_GAP, CLIMB_LIMIT, WRAP_LIMIT, pxValue,
   readMargins;
+let LP_DEBOUNCE, LP_POLL, LP_RETRY, classHas, climbTo, livePreviewParts, collectLineSiblings,
+  planLivePreviewLines, planLinePads, applyLinePads, createStyleLedger,
+  applyLivePreviewFloat, findEditorView, attachLivePreviewFloat;
 let setResourceResolver = null;
 
 /* ============================================================
@@ -1699,7 +1702,8 @@ function attachFloatWrap(host, cfg, opts) {
   if (side !== 'left' && side !== 'right') return null;
   if (!host || typeof host.getBoundingClientRect !== 'function') return null;
   if (typeof host.style === 'undefined') return null;
-  if (isLivePreview(host)) return null;               // 实时预览不动，保持原样
+  // 实时预览走另一条路：CM6 每行独立，阅读视图的「给兄弟加外边距」对它无效
+  if (isLivePreview(host)) return attachLivePreviewFloat(host, cfg, o);
   const doc = host.ownerDocument || (typeof document !== 'undefined' ? document : null);
   if (!doc) return null;
 
@@ -1839,6 +1843,576 @@ function attachFloatWrap(host, cfg, opts) {
 }
 
 /* ============================================================
+ * 实时预览（CM6）：每行独立，float 跨不了行
+ *
+ * 阅读视图那套「脱离流 + 给后续兄弟加外边距」在这里不成立：CM6 把正文切成
+ * 一个个 .cm-line，widget 浮在自己那一行里，后面的行跟它没有兄弟关系，
+ * float 再正确也不会有文字绕上来。真正的做法是让 widget 相对整个 .cm-content 定位：
+ *
+ *   1. widget 所在的 .cm-line 设 position: static（它原本是 relative，
+ *      会抢走绝对定位的包含块）
+ *   2. .cm-content 设 position: relative，成为包含块
+ *   3. .cm-embed-block 设 position: absolute，top 沿用它在流里的原位置，
+ *      右浮动贴 right: 0、左浮动贴 left: 0
+ *   4. 从 widget 那行的下一行起逐行加 paddingRight / paddingLeft，
+ *      累积高度超过图高就停 —— 图下面那行不留白
+ *
+ * CM6 是虚拟滚动的，滚动、输入、折叠都会增删 .cm-line，加上的样式随时会丢。
+ * 所以每次施加都先整体复位上一轮、再重算一遍，由挂在编辑器根节点上的
+ * MutationObserver 驱动（150ms 合并），施加完调一次 requestMeasure 让 CM6 重新量行高。
+ * ============================================================ */
+
+/** MutationObserver 到重算之间的合并窗口（ms）。滚动时每帧都变，不合并会卡。 */
+const LP_DEBOUNCE = 150;
+/** 兜底巡检间隔（ms）：发现图或编辑器掉出文档就自己收摊，切笔记时断开旧观察者 */
+const LP_POLL = 1500;
+/** 挂载时的重试节奏（ms）：CM6 有时先给元素、后才把它插进文档 */
+const LP_RETRY = [0, 60, 200, 600, 1500];
+
+/* --------------------------- 实时预览：DOM 结构 --------------------------- */
+
+function classHas(el, name) {
+  if (!el) return false;
+  const cls = el.classList;
+  if (!cls || typeof cls.contains !== 'function') return false;
+  try { return cls.contains(name); } catch (e) { return false; }
+}
+
+/** 从 el 自己往上找最近的 `.cls`（含自己）。CM6 的结构只认 class，不走选择器引擎。 */
+function climbTo(el, name, limit) {
+  const max = Number(limit) > 0 ? Number(limit) : CLIMB_LIMIT;
+  let cur = el;
+  for (let i = 0; cur && i <= max; i++) {
+    if (classHas(cur, name)) return cur;
+    cur = cur.parentElement;
+  }
+  return null;
+}
+
+/**
+ * 从代码块渲染出的元素往上找 CM6 的三件东西：
+ *   embed   .cm-embed-block  —— 要脱离流的那个盒子
+ *   line    它的父 .cm-line  —— 原本 position: relative，会抢走包含块
+ *   content .cm-content      —— 变成包含块的那个
+ */
+function livePreviewParts(el) {
+  if (!el) return null;
+  const embed = climbTo(el, 'cm-embed-block', CLIMB_LIMIT + 8);
+  if (!embed) return null;
+  const content = climbTo(embed, 'cm-content', CLIMB_LIMIT + 12);
+  if (!content) return null;
+  let line = embed.parentElement;
+  if (!classHas(line, 'cm-line')) line = climbTo(embed, 'cm-line', CLIMB_LIMIT);
+  if (!line || line === content) return null;
+  return { embed, line, content };
+}
+
+/** 从 widget 那行的下一个兄弟起收集同级 .cm-line（不是行的兄弟跳过但继续走） */
+function collectLineSiblings(startEl, limit) {
+  const out = [];
+  const max = Number(limit) > 0 ? Number(limit) : WRAP_LIMIT;
+  const steps = max * 4 + 8;
+  let el = startEl;
+  let n = 0;
+  while (el && out.length < max && n < steps) {
+    n++;
+    if (classHas(el, 'cm-line')) {
+      if (out.indexOf(el) < 0) out.push(el);
+    }
+    el = el.nextElementSibling;
+  }
+  return out;
+}
+
+/* --------------------------- 实时预览：纯逻辑 --------------------------- */
+
+/**
+ * 从候选行里挑出「需要留白」的行：逐行累加高度，够图高就停。
+ * 图高 0 / 负数 / 非数 → 没有行要留白；null 条目跳过但不断链。
+ *
+ * @param {Element[]} lines  widget 那行的后续兄弟，按文档顺序
+ * @param {number} height    图真实渲染高度（px）
+ * @param {{limit?:number}} [opts]
+ * @returns {Element[]}
+ */
+function planLivePreviewLines(lines, height, opts) {
+  const out = [];
+  const h = Number(height);
+  if (!Array.isArray(lines) || !(h > 0)) return out;
+  const limit = opts && Number(opts.limit) > 0 ? Number(opts.limit) : WRAP_LIMIT;
+  let acc = 0;
+  for (let i = 0; i < lines.length && out.length < limit; i++) {
+    const el = lines[i];
+    if (!el) continue;                       // null 条目跳过，不中断
+    if (out.indexOf(el) >= 0) continue;      // 同一行只留一次白
+    out.push(el);
+    acc += elHeight(el);
+    if (acc >= h) break;
+  }
+  return out;
+}
+
+/**
+ * 多张图合并成「每行该留多少白」。
+ *
+ * 同一行可能被两张图同时压到：留白取最大值，不能相加 —— 相加会把同一块空间
+ * 算两遍，文字被挤成窄条。左右两侧各算各的。
+ *
+ * @param {Array<{lines:Element[], side:'left'|'right', span:number}>} blocks
+ * @param {{reader?:Function}} [opts] reader：读元素现有 padding（默认读 computed）
+ * @returns {Array<{el:Element, left:number, right:number}>}
+ */
+function planLinePads(blocks, opts) {
+  const o = opts || {};
+  const out = [];
+  if (!Array.isArray(blocks)) return out;
+  const reader = typeof o.reader === 'function' ? o.reader : paddingOf;
+  const need = new Map();        // el -> {left, right}：需要的最大留白
+  const order = [];
+  for (const b of blocks) {
+    if (!b || !Array.isArray(b.lines)) continue;
+    const span = Number(b.span);
+    if (!Number.isFinite(span) || span <= 0) continue;
+    const side = b.side === 'left' ? 'left' : (b.side === 'right' ? 'right' : '');
+    if (!side) continue;
+    for (const el of b.lines) {
+      if (!el || !el.style) continue;
+      let cur = need.get(el);
+      if (!cur) { cur = { left: 0, right: 0 }; need.set(el, cur); order.push(el); }
+      if (span > cur[side]) cur[side] = span;
+    }
+  }
+  for (const el of order) {
+    const cur = need.get(el) || { left: 0, right: 0 };
+    let base = { left: 0, right: 0 };
+    try {
+      const got = reader(el);
+      if (got && typeof got === 'object') base = got;
+    } catch (e) { base = { left: 0, right: 0 }; }
+    out.push({
+      el,
+      left: round2((Number(base.left) || 0) + cur.left),
+      right: round2((Number(base.right) || 0) + cur.right),
+    });
+  }
+  return out;
+}
+
+/**
+ * 行内样式账本：记下「写之前的值」，复位时按倒序放回去。
+ *
+ * 为什么不用 WeakSet：复位要还原成原值（可能是主题给的行内值），只记「改过谁」
+ * 会把它抹成空。Map 存 el → {prop: prev}，复位完清空，重复施加不会叠加。
+ */
+function createStyleLedger() {
+  const touched = new Map();     // el -> Map(prop -> 写之前的值)
+  const order = [];              // [el, prop]，复位倒着走
+  return {
+    set(el, prop, value) {
+      if (!el || !el.style) return false;
+      let rec = touched.get(el);
+      if (!rec) { rec = new Map(); touched.set(el, rec); }
+      if (!rec.has(prop)) {
+        const prev = el.style[prop] == null ? '' : String(el.style[prop]);
+        rec.set(prop, prev);
+        order.push([el, prop]);
+      }
+      el.style[prop] = value;
+      return true;
+    },
+    reset() {
+      let n = 0;
+      for (let i = order.length - 1; i >= 0; i--) {
+        const pair = order[i];
+        const el = pair[0];
+        const prop = pair[1];
+        if (!el || !el.style) continue;
+        const rec = touched.get(el);
+        const prev = rec && rec.has(prop) ? rec.get(prop) : '';
+        if (prev) {
+          el.style[prop] = prev;
+        } else if (typeof el.style.removeProperty === 'function') {
+          el.style.removeProperty(cssName(prop));
+        } else {
+          el.style[prop] = '';
+        }
+        n++;
+      }
+      order.length = 0;
+      touched.clear();
+      return n;
+    },
+    has: (el) => touched.has(el),
+    props: (el) => {
+      const rec = touched.get(el);
+      return rec ? Array.from(rec.keys()) : [];
+    },
+    size: () => touched.size,
+  };
+}
+
+/** 把 planLinePads 的结果写进 DOM（经账本，可复位），返回写的条数 */
+function applyLinePads(pads, ledger) {
+  let n = 0;
+  if (!Array.isArray(pads) || !ledger || typeof ledger.set !== 'function') return n;
+  for (const p of pads) {
+    if (!p || !p.el) continue;
+    if (p.right > 0 && ledger.set(p.el, 'paddingRight', round2(p.right) + 'px')) n++;
+    if (p.left > 0 && ledger.set(p.el, 'paddingLeft', round2(p.left) + 'px')) n++;
+  }
+  return n;
+}
+
+/* --------------------------- 实时预览：施加 --------------------------- */
+
+/**
+ * 对一张浮动图施加 Live Preview 版的「浮动」：定位三件套 + 算出该留白的行。
+ * 只碰 opts.ledger 记账的样式，调用方负责在重算前 ledger.reset()。
+ *
+ * @returns {{host,embed,line,content,side,width,height,span,top,lines,ledger}|null}
+ */
+function applyLivePreviewFloat(host, cfg, opts) {
+  const o = opts || {};
+  const mode = cfg && cfg.float;
+  const side = mode === 'left' ? 'left' : (mode === 'right' ? 'right' : '');
+  if (!side) return null;                       // center / inline 保持原表现
+  const ledger = (o.ledger && typeof o.ledger.set === 'function' && typeof o.ledger.reset === 'function')
+    ? o.ledger
+    : createStyleLedger();
+  const parts = livePreviewParts(host);
+  if (!parts) return null;
+  const embed = parts.embed;
+  const line = parts.line;
+  const content = parts.content;
+  if (!embed.style || !line.style || !content.style) return null;
+
+  const cRect = rectOf(content);
+  const eRect = rectOf(embed);
+  if (!cRect || !eRect) return null;
+
+  const gap = Number(o.gap) > 0 ? Number(o.gap) : FLOAT_GAP;
+
+  /* 1) 后面根本没有行可绕：干脆不动手。把 embed 改成 absolute 会让它那行塌成 0 高，
+   *    而后面又没有内容撑着，.cm-content 的滚动高度会跟着缩，图可能被裁掉。
+   *    阅读视图遇到同样情况（没有后续兄弟）也是直接放弃。 */
+  const candidates = collectLineSiblings(line.nextElementSibling, o.maxLines);
+  if (!candidates.length) return null;
+
+  /* 2) 定位上下文：.cm-line 原本是 relative，会把绝对定位的包含块抢到自己身上，
+   *    那样 widget 只能相对这一行定位，后面的行永远绕不上来。 */
+  if (computedPosition(line) !== 'static') ledger.set(line, 'position', 'static');
+  const contentPos = computedPosition(content);
+  if (!contentPos || contentPos === 'static') ledger.set(content, 'position', 'relative');
+
+  /* 3) 图宽：配置优先，没写就用 SVG 实际渲染宽；图高一律按 getBoundingClientRect，
+   *    不读 SVG 的 height 属性（CSS 会缩放它）。 */
+  const svgRect = o.svg ? rectOf(o.svg) : null;
+  const natural = svgRect && svgRect.width > 0 ? svgRect.width : eRect.width;
+  const want = Number(cfg.width) > 0 ? Number(cfg.width) : natural;
+  const boxW = content.clientWidth || cRect.width || want;
+  const width = Math.max(1, Math.min(want, boxW));
+
+  const originX = cRect.left + num(content.clientLeft);
+  const originY = cRect.top + num(content.clientTop);
+  const top = Math.max(0, eRect.top - originY);      // 脱离流之前在文档里的位置
+  const pad = paddingOf(content);
+
+  /* 4) 脱离流：top 沿用原位，横向贴住正文列边界 */
+  ledger.set(embed, 'position', 'absolute');
+  ledger.set(embed, 'float', 'none');
+  ledger.set(embed, 'margin', '0');
+  ledger.set(embed, 'top', round2(top) + 'px');
+  ledger.set(embed, 'width', round2(width) + 'px');
+  ledger.set(embed, 'maxWidth', 'none');
+  if (side === 'right') {
+    ledger.set(embed, 'right', round2(pad.right) + 'px');
+    ledger.set(embed, 'left', 'auto');
+  } else {
+    ledger.set(embed, 'left', round2(pad.left) + 'px');
+    ledger.set(embed, 'right', 'auto');
+  }
+
+  /* 5) 改宽之后图可能整体缩放（.bm-floated .brace-map-svg 是 max-width: 100%），
+   *    留白要按此刻的真实高度算。 */
+  const height = elHeight(embed) || elHeight(host) || eRect.height;
+
+  /* 6) 从 widget 那行的下一个 .cm-line 起逐行留白，累积够图高就停 */
+  const lines = planLivePreviewLines(candidates, height, { limit: o.maxLines });
+
+  return {
+    host, embed, line, content, side,
+    width: round2(width),
+    height: round2(height),
+    span: round2(width + gap),
+    top: round2(top),
+    lines,
+    ledger,
+  };
+}
+
+/* --------------------------- 实时预览：取 CM6 view --------------------------- */
+
+/**
+ * 找 widget 所属的 CM6 view。三条路依次试，全程 try/catch：拿不到就是 null，不报错。
+ *   1. opts.cm（宿主直接给）
+ *   2. opts.getCM(host)（宿主注入的取法，推荐）
+ *   3. 自己在模块里 require('obsidian') + opts.app：只在按标准 Node require 加载
+ *      src/ 时成立；内联构建里 require 是内联表包装，取不到 obsidian，会抛错被这里吃掉。
+ */
+function findEditorView(host, opts) {
+  const o = opts || {};
+  if (o.cm && o.cm.dom) return o.cm;
+  try {
+    if (typeof o.getCM === 'function' && host) {
+      const cm = o.getCM(host);
+      if (cm && cm.dom) return cm;
+    }
+  } catch (e) { /* 注入的取法失败就往下退 */ }
+  if (!o.app || !host) return null;
+  try {
+    if (typeof require !== 'function') return null;
+    const obsidian = require('obsidian');
+    const MarkdownView = obsidian && obsidian.MarkdownView;
+    const ws = o.app.workspace;
+    if (!MarkdownView || !ws) return null;
+    const owns = (cm) => !!(cm && cm.dom && typeof cm.dom.contains === 'function' && cm.dom.contains(host));
+    if (typeof ws.getActiveViewOfType === 'function') {
+      const active = ws.getActiveViewOfType(MarkdownView);
+      const cm = active && active.editor ? active.editor.cm : null;
+      if (owns(cm)) return cm;
+    }
+    if (typeof ws.getLeavesOfType === 'function') {
+      const leaves = ws.getLeavesOfType('markdown') || [];
+      for (let i = 0; i < leaves.length; i++) {
+        const v = leaves[i] && leaves[i].view;
+        const cm = v && v.editor ? v.editor.cm : null;
+        if (owns(cm)) return cm;
+      }
+    }
+  } catch (e) { /* 内部 API，拿不到就静默跳过 */ }
+  return null;
+}
+
+/* --------------------------- 实时预览：每个编辑器一个管理者 --------------------------- */
+
+/**
+ * 一个 .cm-content 对应一个 manager：一套账本、一个 observer、一次 requestMeasure。
+ * 同一文档里多张浮动图共用它，留白才能按行合并（取最大）而不是互相覆盖。
+ */
+const lpManagers = new WeakMap();
+
+function createLivePreviewManager(content, seed) {
+  const o = Object.assign({}, seed || {});
+  const ledger = createStyleLedger();
+  const widgets = new Set();
+  let cm = null;
+  let observer = null;
+  let observedNode = null;
+  let timer = 0;
+  let poll = 0;
+  let disposed = false;
+  let applies = 0;
+  let stats = { widgets: 0, lines: 0, styles: 0, applies: 0 };
+
+  const resolveCm = () => {
+    if (cm && cm.dom && cm.dom.isConnected !== false) return cm;
+    cm = findEditorView(content, o);
+    return cm;
+  };
+
+  const requestMeasure = () => {
+    const view = resolveCm();
+    if (!view || typeof view.requestMeasure !== 'function') return false;
+    try { view.requestMeasure(); return true; } catch (e) { return false; }
+  };
+
+  /** 一轮完整施加：先整体复位上一轮，再按当前 DOM 重算 */
+  const pass = () => {
+    if (disposed) return stats;
+    if (content.isConnected === false) { dispose(); return stats; }
+    // 掉出文档的图（笔记关了、切到阅读视图重建了代码块）直接摘掉
+    for (const w of Array.from(widgets)) {
+      if (!w || !w.host || w.host.isConnected === false) widgets.delete(w);
+    }
+    if (!widgets.size) { dispose(); return stats; }
+    applies++;
+    ledger.reset();                       // 复位在重算之前，改动绝不叠加
+    const blocks = [];
+    const records = [];
+    for (const w of Array.from(widgets)) {
+      let geo = null;
+      try { geo = applyLivePreviewFloat(w.host, w.cfg, { svg: w.svg, gap: w.gap, ledger }); }
+      catch (err) { geo = null; }
+      if (!geo) continue;
+      records.push(geo);
+      blocks.push({ lines: geo.lines, side: geo.side, span: geo.span });
+    }
+    const pads = planLinePads(blocks, { reader: paddingOf });
+    const styles = applyLinePads(pads, ledger);
+    stats = { widgets: records.length, lines: pads.length, styles, applies };
+    requestMeasure();
+    return stats;
+  };
+
+  const schedule = () => {
+    if (disposed || timer) return;
+    try {
+      timer = setTimeout(() => {
+        timer = 0;
+        if (disposed) return;
+        pass();
+      }, LP_DEBOUNCE);
+    } catch (e) { timer = 0; }
+  };
+
+  const ensureObserved = () => {
+    if (disposed || observer) return;
+    const MO = typeof MutationObserver !== 'undefined' ? MutationObserver : null;
+    if (!MO) return;
+    const view = resolveCm();
+    const node = (view && view.dom) ? view.dom : content;
+    try {
+      observer = new MO(() => {
+        if (disposed) return;
+        if (content.isConnected === false) { dispose(); return; }
+        schedule();
+      });
+      observer.observe(node, { childList: true, subtree: true });
+      observedNode = node;
+    } catch (e) { observer = null; observedNode = null; }
+  };
+
+  /* 兜底巡检：observer 只在被观察子树产生 childList 变化时回调，编辑器整个被换掉
+   * （切笔记、切阅读视图）时不会触发。这里低频对一下：图还在不在、观察目标换了没。 */
+  const startPoll = () => {
+    if (poll || disposed || typeof setInterval !== 'function') return;
+    try {
+      poll = setInterval(() => {
+        if (disposed) return;
+        if (content.isConnected === false) { dispose(); return; }
+        for (const w of Array.from(widgets)) {
+          if (!w || !w.host || w.host.isConnected === false) widgets.delete(w);
+        }
+        if (!widgets.size) { dispose(); return; }
+        const view = resolveCm();
+        const want = (view && view.dom) ? view.dom : content;
+        if (observer && observedNode !== want) {
+          try { observer.disconnect(); } catch (e) { /* ignore */ }
+          try {
+            observer.observe(want, { childList: true, subtree: true });
+            observedNode = want;
+            schedule();
+          } catch (e) { observer = null; observedNode = null; }
+        }
+      }, LP_POLL);
+    } catch (e) { poll = 0; }
+  };
+
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    if (timer) { try { clearTimeout(timer); } catch (e) { /* ignore */ } timer = 0; }
+    if (poll) { try { clearInterval(poll); } catch (e) { /* ignore */ } poll = 0; }
+    if (observer) { try { observer.disconnect(); } catch (e) { /* ignore */ } }
+    observer = null;
+    observedNode = null;
+    try { ledger.reset(); } catch (e) { /* ignore */ }
+    widgets.clear();
+    try { lpManagers.delete(content); } catch (e) { /* ignore */ }
+  };
+
+  return {
+    content,
+    attach(w) {
+      if (disposed || !w) return false;
+      if (w.opts) {
+        if (w.opts.cm && !o.cm) o.cm = w.opts.cm;
+        if (w.opts.app && !o.app) o.app = w.opts.app;
+        if (w.opts.getCM && !o.getCM) o.getCM = w.opts.getCM;
+      }
+      widgets.add(w);
+      ensureObserved();
+      startPoll();
+      pass();
+      return true;
+    },
+    detach(w) {
+      widgets.delete(w);
+      if (disposed) return;
+      if (!widgets.size) { dispose(); return; }
+      pass();
+    },
+    refresh() { if (!disposed) pass(); },
+    state() { return { attached: !disposed, widgets: widgets.size, lines: stats.lines, styles: stats.styles, applies: stats.applies }; },
+    dispose,
+  };
+}
+
+/**
+ * Live Preview 版浮动控制。形状与阅读视图的 attachFloatWrap 一致
+ * （host / update / dispose / state），trackFloat 不用分叉。
+ */
+function attachLivePreviewFloat(host, cfg, opts) {
+  const o = opts || {};
+  const side = cfg && cfg.float;
+  if (side !== 'left' && side !== 'right') return null;
+  if (!host || typeof host.getBoundingClientRect !== 'function') return null;
+
+  const widget = { host, cfg, svg: o.svg, gap: o.gap, opts: o };
+  let manager = null;
+  let disposed = false;
+  let attempt = 0;
+  let retry = 0;
+
+  const stopRetry = () => {
+    if (!retry) return;
+    try { clearTimeout(retry); } catch (e) { /* ignore */ }
+    retry = 0;
+  };
+
+  const nextRetry = () => {
+    if (disposed || retry) return;
+    if (attempt >= LP_RETRY.length) return;
+    const delay = LP_RETRY[attempt++];
+    try { retry = setTimeout(attach, delay); } catch (e) { retry = 0; }
+  };
+
+  function attach() {
+    retry = 0;
+    if (disposed || manager) return;
+    const parts = livePreviewParts(host);
+    if (!parts) { nextRetry(); return; }      // 还没插进文档，稍后再试
+    let m = lpManagers.get(parts.content);
+    if (!m) {
+      m = createLivePreviewManager(parts.content, { cm: o.cm, app: o.app, getCM: o.getCM });
+      lpManagers.set(parts.content, m);
+    }
+    manager = m;
+    m.attach(widget);
+  }
+
+  attach();
+
+  return {
+    host,
+    update: () => {
+      if (disposed) return;
+      if (manager) manager.refresh();
+      else attach();
+    },
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      stopRetry();
+      const m = manager;
+      manager = null;
+      if (m) m.detach(widget);
+    },
+    state: () => (manager ? manager.state() : { attached: false, side }),
+  };
+}
+
+/* ============================================================
  * 传统 float 样式（center / inline 仍靠它；left / right 作为
  * 实时预览与 JS 浮动失败时的兜底）
  *
@@ -1889,8 +2463,23 @@ module.exports = {
   FLOAT_GAP,
   CLIMB_LIMIT,
   WRAP_LIMIT,
+  LP_DEBOUNCE,
+  LP_POLL,
+  LP_RETRY,
   elHeight,
   collectWrapTargets,
+  // 实时预览（CM6）
+  classHas,
+  climbTo,
+  livePreviewParts,
+  collectLineSiblings,
+  planLivePreviewLines,
+  planLinePads,
+  applyLinePads,
+  createStyleLedger,
+  applyLivePreviewFloat,
+  findEditorView,
+  attachLivePreviewFloat,
   pxValue,
   setInlineStyle,
   restoreStyles,
@@ -4466,7 +5055,10 @@ function loadModules() {
   ({ FLOAT_GAP, CLIMB_LIMIT, WRAP_LIMIT, pxValue, elHeight, collectWrapTargets,
      setInlineStyle, restoreStyles, applyWrapMargins, restoreWrapMargins, readMargins,
      isLivePreview, pickContext, floatify, resetFloat, attachFloatWrap,
-     applyFloatLayout } = req('src/float.js'));
+     applyFloatLayout, LP_DEBOUNCE, LP_POLL, LP_RETRY, classHas, climbTo, livePreviewParts,
+     collectLineSiblings, planLivePreviewLines, planLinePads, applyLinePads,
+     createStyleLedger, applyLivePreviewFloat, findEditorView,
+     attachLivePreviewFloat } = req('src/float.js'));
 
   loadDirOk();
 }
@@ -4575,6 +5167,34 @@ function disposeFloats() {
   }
 }
 
+/**
+ * 找这块 widget 所属的 CM6 view（实时预览的观察者要挂在编辑器根节点上）。
+ * editor.cm 是内部 API，全程 try/catch，拿不到就返回 null 让下游静默跳过。
+ * 先试活动视图，再看分栏里的其它 markdown 叶子 —— 活动视图可能不是这张图所在的笔记。
+ */
+function findEditorViewOf(app, node) {
+  try {
+    const ws = app && app.workspace;
+    if (!ws || !node) return null;
+    const owns = (cm) => !!(cm && cm.dom && typeof cm.dom.contains === 'function' && cm.dom.contains(node));
+    if (!MarkdownView) return null;
+    if (typeof ws.getActiveViewOfType === 'function') {
+      const view = ws.getActiveViewOfType(MarkdownView);
+      const cm = view && view.editor ? view.editor.cm : null;
+      if (owns(cm)) return cm;
+    }
+    if (typeof ws.getLeavesOfType === 'function') {
+      const leaves = ws.getLeavesOfType('markdown') || [];
+      for (let i = 0; i < leaves.length; i++) {
+        const v = leaves[i] && leaves[i].view;
+        const cm = v && v.editor ? v.editor.cm : null;
+        if (owns(cm)) return cm;
+      }
+    }
+  } catch (err) { /* 内部 API，拿不到就静默 */ }
+  return null;
+}
+
 async function renderBraceMap(source, host, opts) {
   const o = opts || {};
   const cfg = parseSource(source);
@@ -4617,7 +5237,7 @@ async function renderBraceMap(source, host, opts) {
    * 改用绝对定位 + 后续块留白手动模拟，见 src/float.js。
    * center / inline 不走这条路，它们本来就不靠 float。
    */
-  trackFloat(cfg, host, { svg });
+  trackFloat(cfg, host, { svg, app: o.app, getCM: o.getCM });
 
   // 工具条
   const bar = wrap.createDiv({ cls: 'bm-toolbar' });
@@ -4730,6 +5350,8 @@ class BraceMapPlugin extends Plugin {
         await renderBraceMap(source, el, {
           sourcePath: ctx && ctx.sourcePath,
           openLink: (href, evt) => this.openBraceLink(href, evt, ctx && ctx.sourcePath),
+          app: this.app,
+          getCM: (node) => findEditorViewOf(this.app, node),
         });
       } catch (err) {
         console.error('[brace-map]', err);
@@ -4918,6 +5540,22 @@ function buildInternals() {
   setInlineStyle,
   elHeight,
   isLivePreview,
+  // 实时预览（CM6）：每行独立，靠绝对定位 + 逐行 padding 模拟浮动
+  LP_DEBOUNCE,
+  LP_POLL,
+  LP_RETRY,
+  classHas,
+  climbTo,
+  livePreviewParts,
+  collectLineSiblings,
+  planLivePreviewLines,
+  planLinePads,
+  applyLinePads,
+  createStyleLedger,
+  applyLivePreviewFloat,
+  findEditorView,
+  attachLivePreviewFloat,
+  findEditorViewOf,
   FLOAT_GAP,
   CLIMB_LIMIT,
   WRAP_LIMIT,

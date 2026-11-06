@@ -25,6 +25,7 @@ require('./link.test');
 require('./boxnode.test');
 require('./float.test');
 require('./floatwrap.test');
+require('./livefloat.test');
 require('./wrapdiag.test');
 
 runAll().then(() => {
