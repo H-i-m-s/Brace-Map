@@ -140,6 +140,16 @@
 <script src="./main.js"></script>
 <!-- 3) 拆成多文件后 src/ 是运行时才装配的，浏览器侧要显式喊一声 -->
 <script>window.module.exports.__loadModules('');</script>
+<script>
+  // 预览页没有 Obsidian 的 adapter，手动给公式模块一个解析器：
+  // vendor/tex-svg.js 必须作为顶层 <script> 加载才能启动。
+  (function () {
+    var I = window.module.exports && window.module.exports.__internals;
+    if (I && I.setResourceResolver) {
+      I.setResourceResolver(function (rel) { return './' + rel; });
+    }
+  })();
+</script>
 
 <!-- 3) 渲染用例 -->
 <script>

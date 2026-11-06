@@ -128,46 +128,90 @@ function collectMathRuns(cfg) {
  * vendor 模块自己做了隔离（见 build.js 的 wrapVendor），不会碰
  * window.MathJax，Obsidian 自己的公式排版不受影响。
  */
-let ownJax = null;
-let ownTried = false;
+let ownPromise = null;
+let resolveResource = null;
 
-function loadOwnMathJax() {
-  if (ownTried) return ownJax;
-  ownTried = true;
-  const mark = (o) => {
-    if (typeof globalThis !== 'undefined') globalThis.__bmMathDiag = o;
-  };
-  try {
-    const mod = require('../vendor/tex-svg.js');
-    if (mod && (typeof mod.tex2svgPromise === 'function' || typeof mod.tex2svg === 'function')) {
-      ownJax = mod;
-      mark({ stage: 'ok', promise: typeof mod.tex2svgPromise, sync: typeof mod.tex2svg });
-    } else {
-      mark({ stage: 'no-api', keys: mod ? Object.keys(mod).slice(0, 8) : null });
+/**
+ * 注入「插件内相对路径 → 可加载 URL」的解析器。
+ * 由 main.js 在 onload 里传进来，底层是 app.vault.adapter.getResourcePath，
+ * 桌面端和移动端都会给出可用的地址。
+ */
+function setResourceResolver(fn) {
+  if (typeof fn === 'function') resolveResource = fn;
+}
+
+/** 插入一个 <script>，等它加载完 */
+function injectScript(url) {
+  return new Promise((resolve, reject) => {
+    if (typeof document === 'undefined') { reject(new Error('无 document')); return; }
+    const el = document.createElement('script');
+    el.src = url;
+    el.async = true;
+    el.onload = () => resolve();
+    el.onerror = () => reject(new Error('脚本加载失败：' + url));
+    (document.head || document.documentElement).appendChild(el);
+  });
+}
+
+/**
+ * 装配自带的 MathJax。
+ *
+ * 为什么不把 bundle 内联进 main.js 直接 require：实测在模块工厂（函数作用域）
+ * 里执行时，MathJax 只建出 {version,_,config,loader,startup,options} 这个壳，
+ * startup 压根不启动，tex2svgPromise 永远不出现；同一份文件作为顶层 <script>
+ * 加载就正常。所以改成动态插入 <script>，让它在顶层上下文跑。
+ *
+ * 全程不碰 Obsidian 自己的 window.MathJax：加载前存起来并腾空，抓到自建
+ * 实例后立刻还回去，两边互不干扰。
+ */
+async function loadOwnMathJax() {
+  if (ownPromise) return ownPromise;
+
+  ownPromise = (async () => {
+    const mark = (o) => {
+      if (typeof globalThis !== 'undefined') globalThis.__bmMathDiag = o;
+    };
+    const hasApi = (o) => !!o
+      && (typeof o.tex2svgPromise === 'function' || typeof o.tex2svg === 'function');
+
+    const url = resolveResource ? resolveResource('vendor/tex-svg.js') : null;
+    if (url) {
+      const saved = typeof window !== 'undefined' ? window.MathJax : undefined;
+      try {
+        if (typeof window !== 'undefined') window.MathJax = undefined;
+        await injectScript(url);
+        const inst = typeof window !== 'undefined' ? window.MathJax : null;
+        mark({ stage: inst ? 'script-ok' : 'script-null', url: String(url).slice(0, 80) });
+        return inst;
+      } catch (e) {
+        mark({ stage: 'script-throw', message: e && e.message ? e.message : String(e) });
+      } finally {
+        if (typeof window !== 'undefined') window.MathJax = saved;
+      }
     }
-  } catch (e) {
-    ownJax = null;
-    mark({ stage: 'throw', message: e && e.message ? e.message : String(e) });
-  }
-  return ownJax;
+
+    // 没有 resolver（比如浏览器预览页）就退回内联模块。
+    // 这条路在函数作用域里启动不起来，但至少能让调用方拿到对象自己去轮询。
+    try {
+      const mod = require('../vendor/tex-svg.js');
+      if (hasApi(mod)) {
+        mark({ stage: 'inline-ok' });
+        return mod;
+      }
+      mark({ stage: 'inline-no-api', keys: mod ? Object.keys(mod).slice(0, 8) : null });
+      return mod || null;
+    } catch (e) {
+      mark({ stage: 'inline-throw', message: e && e.message ? e.message : String(e) });
+      return null;
+    }
+  })();
+
+  return ownPromise;
 }
 
 function findMathJax(win) {
   const w = win || (typeof window !== 'undefined' ? window : null);
   if (!w) return null;
-
-  // 自带的优先：它是唯一能输出矢量的一组。
-  // 注意不能只看对象在不在——bundle 刚执行完时 startup 还没跑完，
-  // tex2svgPromise 尚未挂上，必须看函数本身。等待由 findMathJaxReady 负责。
-  const own = loadOwnMathJax();
-  if (own) {
-    if (typeof own.tex2svgPromise === 'function') {
-      return makeJax(own, 'tex2svgPromise', 'vendor/tex-svg.js');
-    }
-    if (typeof own.tex2svg === 'function') {
-      return makeJax(own, 'tex2svg', 'vendor/tex-svg.js');
-    }
-  }
 
   const roots = [];
   const add = (obj, where) => {
@@ -261,7 +305,7 @@ async function findMathJaxReady(win) {
   if (!w) return null;
 
   // 自带的 bundle 优先：它是唯一能输出矢量的一组
-  const own = loadOwnMathJax();
+  const own = await loadOwnMathJax();
   if (own) {
     const got = await waitOwnReady(own);
     if (got) return got;
@@ -726,6 +770,7 @@ module.exports = {
   collectMathRuns,
   findMathJax,
   findMathJaxReady,
+  setResourceResolver,
   extractMath,
   namespaceIds,
   inlineUses,
