@@ -279,6 +279,22 @@ function tApplyPadsWrite() {
   eq(I.applyLinePads(null, ledger), 0, 'lp-apply: 没有数据 → 0');
 }
 
+function tPadSurvivesBadRect() {
+  // 行量尺寸会抛错时，排版路径自己不能塌：诊断层已撤掉，守的是留白本身的健壮性
+  const tree = cmTree();
+  tree.lines[0].getBoundingClientRect = () => { throw new Error('boom'); };
+  let ctl = null;
+  let threw = false;
+  try {
+    ctl = I.attachLivePreviewFloat(tree.host, { float: 'right', width: 300 }, { svg: tree.svg });
+  } catch (e) { threw = true; }
+  ok(!threw, 'lp-badrect: 量尺寸抛错不外抛');
+  ok(!!ctl, 'lp-badrect: 控制器照样挂上');
+  eq(tree.lines[0].style.paddingRight, '316px', 'lp-badrect: 留白照样写上');
+  if (ctl) ctl.dispose();
+  I.flushLivePreviewFloats();
+}
+
 function tLedger() {
   const el = fakeEl([], 0, null, { paddingRight: '8px' });
   const ledger = I.createStyleLedger();
@@ -1166,7 +1182,7 @@ function tDeferLogs() {
 }
 
 suite('live-float-lines', () => { tPlanLinesGuard(); tPlanLinesBasic(); tPlanLinesEdge(); });
-suite('live-float-pads', () => { tPlanPadsBasic(); tPlanPadsMerge(); tPlanPadsGuard(); tApplyPadsWrite(); tLedger(); });
+suite('live-float-pads', () => { tPlanPadsBasic(); tPlanPadsMerge(); tPlanPadsGuard(); tApplyPadsWrite(); tPadSurvivesBadRect(); tLedger(); });
 suite('live-float-dom', () => { tParts(); tClassHelpers(); tApplyGeometry(); tApplyGuards(); });
 suite('live-float-reset', () => { tResetThorough(); tAttach(); });
 suite('live-float-direct', () => {

@@ -19,6 +19,9 @@ Module._load = function (request, parent, isMain) {
 const Plugin = require(path.join(__dirname, '..', 'main.js'));
 const I = Plugin && Plugin.__internals;
 
+/* 诊断层正式运行时是关的（DEBUG_LP = false），自测要验它本体，所以这里显式打开 */
+if (I && typeof I.dbgSetEnabled === 'function') I.dbgSetEnabled(true);
+
 /* ------------------------------ 断言 ------------------------------ */
 
 let passed = 0;

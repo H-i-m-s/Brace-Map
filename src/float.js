@@ -1,14 +1,13 @@
 'use strict';
 
 /*
- * 临时诊断（排查中，见 src/debug.js）。
+ * 临时诊断（默认关闭，见 src/debug.js）。
  * 每一次 dbg() / dbgNull() 都是只读的：取元素 / 读样式 / 记一行 JSON，
  * 不改布局、不抛错。DEBUG_LP 关掉后这些调用直接返回。
  */
 const {
   dbg, dbgNull, dbgEl, dbgRect, dbgCss, dbgInline, dbgInlineAll,
   dbgChildCount, dbgFirstChild, dbgChain,
-  dbgClass, dbgConnected, dbgInlinePad, dbgBox, dbgTextExtent,
 } = require('./debug.js');
 
 /* ============================================================
@@ -1117,17 +1116,6 @@ function createStyleLedger() {
       const entry = rec && rec.get(prop);
       return entry && typeof entry.base === 'number' ? entry.base : null;
     },
-    /**
-     * 只读快照：把某条记账拷出来（诊断用）。
-     * 注意 set() 判定「已达标」时拿 entry.written 当事实，并不回读元素 ——
-     * 这个接口存在的意义就是把「账本以为的」和「元素实际的」摆在一起看。
-     */
-    entryOf(el, prop) {
-      const rec = touched.get(el);
-      const entry = rec && rec.get(prop);
-      if (!entry) return null;
-      return { prev: entry.prev, written: entry.written, base: entry.base, gen: entry.gen };
-    },
     /** 接管之前的行内值；没接管过就是 undefined */
     orig(el, prop) {
       const rec = touched.get(el);
@@ -1189,238 +1177,6 @@ function applyLinePads(pads, ledger) {
   return n;
 }
 
-/* --------------------------- 实时预览：留白落地诊断 --------------------------- */
-
-/**
- * 预判本轮哪些 padding 会被「差异写入」跳过（只读，必须在 applyLinePads 之前调）。
- *
- * 复刻的只是 set() 那一条判定：账本里已有记录且 entry.written 等于目标值 → 不写。
- * 拿到结果后再回读元素，就能分辨两件事：
- *   A 账本说写过，元素行内却是空的（值不在元素上）
- *   B 值就在元素上，但文字宽度没变
- *
- * @returns {Map<Element, {left?:object, right?:object}>}
- */
-function readPadExpect(pads, ledger) {
-  const out = new Map();
-  try {
-    if (!Array.isArray(pads)) return out;
-    for (const p of pads) {
-      if (!p || !p.el) continue;
-      const rec = {};
-      for (const key of ['right', 'left']) {
-        const val = Number(p[key]);
-        if (!(val > 0)) continue;
-        const prop = key === 'right' ? 'paddingRight' : 'paddingLeft';
-        const want = round2(val) + 'px';
-        let entry = null;
-        try {
-          entry = ledger && typeof ledger.entryOf === 'function' ? ledger.entryOf(p.el, prop) : null;
-        } catch (e) { entry = null; }
-        const same = !!(entry && String(entry.written == null ? '' : entry.written) === want);
-        rec[key] = {
-          prop,
-          target: want,
-          base: entry && typeof entry.base === 'number' ? entry.base : null,
-          skipped: same,
-          // 判定为「已达标」时，账本拿去做比较的那个值（它不是 computed，是上一轮自己写进去的值）
-          readValue: same ? String(entry.written) : '',
-          readFrom: same ? 'ledger.written' : 'none',
-        };
-      }
-      out.set(p.el, rec);
-    }
-  } catch (e) { /* 预判失败只是少记字段 */ }
-  return out;
-}
-
-/** 账本里某条记账的快照（只读） */
-function ledgerInfoOf(ledger, el, prop) {
-  const out = { inLedger: false, written: '', base: null, prev: '' };
-  try {
-    const e = ledger && typeof ledger.entryOf === 'function' ? ledger.entryOf(el, prop) : null;
-    if (!e) return out;
-    out.inLedger = true;
-    out.written = e.written == null ? '' : String(e.written);
-    out.base = typeof e.base === 'number' ? e.base : null;
-    out.prev = e.prev == null ? '' : String(e.prev);
-  } catch (err) { out.inLedger = null; }
-  return out;
-}
-
-/** 元素的 padding 与目标值对不对得上（px 比，容忍 0.02） */
-function padMatched(px, target) {
-  const a = Number(px);
-  const b = Number(target);
-  if (!Number.isFinite(a) || !Number.isFinite(b) || !(b > 0)) return false;
-  return Math.abs(a - b) < 0.02;
-}
-
-/**
- * 一条「预期」的落地结果。verdict 是重点：
- *   skipped-ok       本轮没写，但值确实在元素上（正常）
- *   skipped-missing  本轮没写，元素上也没有 —— A：值不在元素上
- *   wrote-ok          本轮写了，值在元素上
- *   wrote-missing     本轮写了，元素上却没有（写入失败 / 被同步抹掉）
- */
-function expectResult(exp, inlineNow) {
-  if (!exp) return null;
-  const now = inlineNow == null ? '' : String(inlineNow);
-  const onEl = padMatched(pxValue(now), pxValue(exp.target));
-  let verdict = 'wrote-missing';
-  if (exp.skipped) verdict = onEl ? 'skipped-ok' : 'skipped-missing';
-  else verdict = onEl ? 'wrote-ok' : 'wrote-missing';
-  return {
-    prop: exp.prop,
-    target: exp.target,
-    skipped: exp.skipped,
-    readValue: exp.readValue,
-    readFrom: exp.readFrom,
-    base: exp.base,
-    inlineNow: now,
-    verdict,
-  };
-}
-
-/**
- * 单个留白目标的全部读数。
- * 除了字段本身，末尾给出一个诊断结论：
- *   A  值不在元素上（账本与 DOM 脱节）
- *   B  值在元素上，但文字右（左）边界仍越过了图 —— 没作用到文字宽度
- *   ok 文字没压到图
- *   ? 量不到文字边界（没 Range）
- */
-function padTargetInfo(el, p, expectMap, sideOf, imgs, ledger) {
-  const out = {};
-  out.el = dbgEl(el);
-  out.cls = dbgClass(el);
-  out.connected = dbgConnected(el);
-  out.side = sideOf && typeof sideOf.get === 'function' ? (sideOf.get(el) || '') : '';
-
-  const inline = dbgInlinePad(el);
-  out.inlineR = inline.right;
-  out.inlineL = inline.left;
-  const comp = dbgCss(el, ['paddingRight', 'paddingLeft']);
-  out.compR = comp.paddingRight == null ? '' : String(comp.paddingRight);
-  out.compL = comp.paddingLeft == null ? '' : String(comp.paddingLeft);
-
-  const box = dbgBox(el);
-  out.clientW = box.clientWidth;
-  out.rectW = box.rectWidth;
-  out.cssW = box.cssWidth;
-  out.box = box.boxSizing;
-
-  const r = rectOf(el);
-  out.elLeft = r ? round2(r.left) : null;
-  out.elRight = r ? round2(r.left + r.width) : null;
-  out.elTop = r ? round2(r.top) : null;
-  out.elBottom = r ? round2(r.top + r.height) : null;
-
-  const ext = dbgTextExtent(el);
-  out.textRight = ext.right;
-  out.textLeft = ext.left;
-  out.textRects = ext.rects;
-
-  out.targetR = Number(p.right) > 0 ? round2(Number(p.right)) : 0;
-  out.targetL = Number(p.left) > 0 ? round2(Number(p.left)) : 0;
-  out.ledgerR = ledgerInfoOf(ledger, el, 'paddingRight');
-  out.ledgerL = ledgerInfoOf(ledger, el, 'paddingLeft');
-  out.expectR = expectResult(expectMap ? (expectMap.get(el) || {}).right : null, inline.right);
-  out.expectL = expectResult(expectMap ? (expectMap.get(el) || {}).left : null, inline.left);
-
-  /* 图的位置：只算纵向与本行重叠的那几张，取最左的 left / 最右的 right */
-  let imgLeft = null;
-  let imgRight = null;
-  let hit = 0;
-  for (const im of imgs) {
-    const vOverlap = out.elTop != null && out.elBottom != null
-      && out.elTop < im.bottom && out.elBottom > im.top;
-    if (!vOverlap) continue;
-    hit++;
-    if (imgLeft == null || im.left < imgLeft) imgLeft = im.left;
-    if (imgRight == null || im.right > imgRight) imgRight = im.right;
-  }
-  out.imgHit = hit;
-  out.imgLeft = imgLeft;
-  out.imgRight = imgRight;
-  out.coveredRight = ext.right != null && imgLeft != null ? ext.right > imgLeft : null;
-  out.coveredLeft = ext.left != null && imgRight != null ? ext.left < imgRight : null;
-  out.covered = out.side === 'left' ? out.coveredLeft : out.coveredRight;
-
-  /* 文字有没有溢出自己的 padding 盒：溢出说明不是 padding 的问题（不折行 / 长 token） */
-  const padRight = pxValue(out.compR);
-  out.textOver = ext.right != null && out.elRight != null
-    ? round2(ext.right - (out.elRight - padRight)) : null;
-
-  const missing = ['expectR', 'expectL'].some((k) => {
-    const e = out[k];
-    return !!e && (e.verdict === 'skipped-missing' || e.verdict === 'wrote-missing');
-  });
-  if (missing) out.diagnosis = 'A';
-  else if (out.covered === true) out.diagnosis = 'B';
-  else if (out.covered === false) out.diagnosis = 'ok';
-  else out.diagnosis = '?';
-  return out;
-}
-
-/**
- * 把本轮每个留白目标的落地情况写进日志（只在真的有留白需求时记，避免膨胀）。
- * 全程只读：除了 Range 测量（读布局）之外不碰任何样式；任何异常都只少记一行。
- *
- * @returns {number} 记了几条
- */
-function dbgPadTargets(pads, expectMap, blocks, records, ledger, content) {
-  let n = 0;
-  try {
-    if (!Array.isArray(pads) || !pads.length) return 0;
-    const imgs = [];
-    const recs = Array.isArray(records) ? records : [];
-    for (const rec of recs) {
-      if (!rec || !rec.embed) continue;
-      const r = rectOf(rec.embed);
-      if (!r) continue;
-      imgs.push({
-        side: rec.side === 'left' ? 'left' : 'right',
-        left: round2(r.left),
-        right: round2(r.left + r.width),
-        top: round2(r.top),
-        bottom: round2(r.top + r.height),
-      });
-    }
-    const sideOf = new Map();
-    const list = Array.isArray(blocks) ? blocks : [];
-    for (const b of list) {
-      if (!b || !Array.isArray(b.lines)) continue;
-      for (const el of b.lines) {
-        if (el && !sideOf.has(el)) sideOf.set(el, b.side === 'left' ? 'left' : 'right');
-      }
-    }
-    const cRect = content ? rectOf(content) : null;
-    dbg('lp.padAudit', () => ({
-      pads: pads.length,
-      blocks: list.length,
-      imgs: imgs.length,
-      imgSides: imgs.map((i) => i.side),
-      imgLefts: imgs.map((i) => i.left),
-      imgRights: imgs.map((i) => i.right),
-      imgTops: imgs.map((i) => i.top),
-      imgBottoms: imgs.map((i) => i.bottom),
-      contentW: content && typeof content.clientWidth === 'number' ? content.clientWidth : null,
-      contentRectW: cRect ? round2(cRect.width) : null,
-      ledgerSize: ledger && typeof ledger.size === 'function' ? ledger.size() : null,
-      gen: ledger && typeof ledger.gen === 'function' ? ledger.gen() : null,
-    }));
-    for (const p of pads) {
-      if (!p || !p.el) continue;
-      try {
-        dbg('lp.padTarget', padTargetInfo(p.el, p, expectMap, sideOf, imgs, ledger));
-        n++;
-      } catch (e) { /* 单个元素炸了不影响其它行，更不影响渲染 */ }
-    }
-  } catch (e) { /* ignore */ }
-  return n;
-}
-
 /* --------------------------- 实时预览：纯 CSS float --------------------------- */
 
 /**
@@ -1433,6 +1189,10 @@ function dbgPadTargets(pads, expectMap, blocks, records, ledger, content) {
  *   .cm-content           一个 flex item（width: 0 + flex-grow）
  * `.cm-content` 是 flex 容器的子项，flex item 天然建立独立的格式化上下文 —— 浮动元素
  * 在这里有正常语义：被容器框住、高度由引擎算进文档流。文档高度稳定，滚动就不抖。
+ *
+ * `float` 指令在阅读视图和编辑模式下都生效。编辑模式靠的就是上面这条链：
+ * `.cm-content` 必须是 flex 容器的子项（BFC）；某个主题要是把这层布局改成非 flex
+ * 容器，float 就会被规范作废，浮动失效。
  *
  * 阅读视图那条路不能这么干：那边的宿主是 flex 容器的直接子项，float 被规范作废，
  * 所以必须继续用「绝对定位 + 给后续兄弟加外边距」。两条路各走各的，互不干扰。
@@ -1921,14 +1681,10 @@ function createLivePreviewManager(content, seed) {
       blocks.push({ lines: geo.lines, side: geo.side, span: geo.span });
     }
     const pads = planLinePads(blocks, { reader: padReaderOf(ledger) });
-    // 诊断：先把「哪些属性会被差异写入跳过」预判下来（只读），写完之后再回读元素对账
-    const padExpect = readPadExpect(pads, ledger);
     const styles = applyLinePads(pads, ledger);
     // 先写后撒：这一轮该留白的行已经全部写好了，再收拾上一轮留下、这一轮不再需要的
     const swept = ledger.sweep();
     ledger.pruneDetached();
-    // 诊断：逐条记「留白到底落到文字宽度上了没」（只读，只在有留白目标时记）
-    dbgPadTargets(pads, padExpect, blocks, records, ledger, content);
     stats = { widgets: records.length, lines: pads.length, styles, applies, swept, resetState: 'live' };
     dbg('manager.pass', () => ({
       applies: stats.applies,
@@ -2316,8 +2072,6 @@ module.exports = {
   planLivePreviewLines,
   planLinePads,
   applyLinePads,
-  readPadExpect,
-  dbgPadTargets,
   createStyleLedger,
   padBaseOf,
   padReaderOf,

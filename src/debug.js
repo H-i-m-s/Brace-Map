@@ -11,16 +11,20 @@
  *   日志里每条都有 n（自增序号，缺号说明中间被截断过）和 t（毫秒时间戳），
  *   按文件顺序读就是真实的执行顺序。
  *
- * ⚠ 排查完成后把下面的 DEBUG_LP 改成 false（或者连本文件与调用点一起删掉）。
- *   不做成设置项：这是临时取证，不是产品功能。
+ * ⚠ 这一层默认关闭（DEBUG_LP = false），保留结构备查。关着的时候 dbg() /
+ *   dbgNull() / flush() 都在入口早退，几乎零开销；要再取证时把它改回 true
+ *   （或者调用 dbgSetEnabled(true)）。不做成设置项：这是临时取证，不是产品功能。
  *
  * 纪律：本文件导出的每个函数都自己 try/catch，绝不外抛；调用方用
  *   dbg('点名', () => ({...})) 的惰性写法，连字段计算也在 try/catch 里面，
  *   任何一条诊断炸掉都只是少一行日志，不会影响渲染。
  * ============================================================ */
 
-/** 总开关：默认开（正在查问题）。排查结束后必须改成 false。 */
-const DEBUG_LP = true;
+/** 总开关：排查结束，已关。关掉后 dbg() / dbgNull() / flush() 都在入口早退，几乎零开销。 */
+const DEBUG_LP = false;
+
+/** 当前是否开着。正式运行始终等于 DEBUG_LP；自测用 dbgSetEnabled(true) 临时打开。 */
+let enabled = DEBUG_LP;
 
 /** 日志文件名（相对 vault 根目录） */
 const DEBUG_FILE = 'brace-map-debug.log';
@@ -203,101 +207,6 @@ function dbgChain(el, depth) {
   return out;
 }
 
-/* --------------- 深度读数（留白到底有没有落到文字宽度上） --------------- */
-
-/** className 原文（截 80 字符）。dbgEl 给的是点连摘要，这里要原样类名。 */
-function dbgClass(el) {
-  try { return classNameOf(el).trim().slice(0, 80); } catch (e) { return ''; }
-}
-
-/** 元素是否还在文档里。读不到 isConnected 就当不在（假 DOM 常常没这个字段）。 */
-function dbgConnected(el) {
-  try { return el ? el.isConnected !== false : false; } catch (e) { return false; }
-}
-
-/** 行内 padding 两侧原样值（读 element.style，不是 computed） */
-function dbgInlinePad(el) {
-  const out = { left: '', right: '' };
-  try {
-    if (!el || !el.style) return out;
-    out.left = dbgInline(el, 'paddingLeft');
-    out.right = dbgInline(el, 'paddingRight');
-  } catch (e) { /* ignore */ }
-  return out;
-}
-
-/**
- * 盒模型读数：clientWidth（内容区 + padding）、边框盒宽、computed width / box-sizing。
- * 分辨「B：值写在元素上但没作用到文字宽度」全靠这几个数。
- */
-function dbgBox(el) {
-  const out = { clientWidth: null, rectWidth: null, cssWidth: '', boxSizing: '' };
-  try {
-    if (!el) return out;
-    const cw = Number(el.clientWidth);
-    if (Number.isFinite(cw) && el.clientWidth !== undefined) out.clientWidth = cw;
-    const r = dbgRect(el);
-    if (r) out.rectWidth = r.w;
-    const cs = computedOf(el);
-    if (cs) {
-      try { out.cssWidth = String(cs.width == null ? '' : cs.width); } catch (e) { out.cssWidth = ''; }
-      try { out.boxSizing = String(cs.boxSizing == null ? '' : cs.boxSizing); } catch (e) { out.boxSizing = ''; }
-    }
-  } catch (e) { /* ignore */ }
-  return out;
-}
-
-/**
- * 元素内文字的几何边界：Range 选中全部内容，取所有 client rect 的极值。
- * 这是「文字到底画到哪」最直接的读数：padding / width 推算都可能骗人，这个不会。
- * 拿不到 Range（假 DOM / 离屏节点）时各字段是 null。
- */
-function dbgTextExtent(el) {
-  const out = { right: null, left: null, top: null, bottom: null, rects: 0 };
-  try {
-    if (!el) return out;
-    const doc = el.ownerDocument && typeof el.ownerDocument.createRange === 'function'
-      ? el.ownerDocument
-      : (typeof document !== 'undefined' && document && typeof document.createRange === 'function'
-        ? document : null);
-    if (!doc) return out;
-    const range = doc.createRange();
-    if (!range || typeof range.selectNodeContents !== 'function') return out;
-    range.selectNodeContents(el);
-    if (typeof range.getClientRects !== 'function') return out;
-    const list = range.getClientRects();
-    if (!list || !list.length) return out;
-    let right = -Infinity;
-    let left = Infinity;
-    let top = Infinity;
-    let bottom = -Infinity;
-    let n = 0;
-    for (let i = 0; i < list.length; i++) {
-      const r = list[i];
-      if (!r) continue;
-      const rr = Number(r.right);
-      const rl = Number(r.left);
-      if (!Number.isFinite(rr) || !Number.isFinite(rl)) continue;
-      const rt = Number(r.top);
-      const rb = Number(r.bottom);
-      // 折叠位置会产生零尺寸 rect，让它参与极值会把 left/right 拉歪
-      if (!(rr - rl > 0) && !(rb - rt > 0)) continue;
-      if (rr > right) right = rr;
-      if (rl < left) left = rl;
-      if (Number.isFinite(rt) && rt < top) top = rt;
-      if (Number.isFinite(rb) && rb > bottom) bottom = rb;
-      n++;
-    }
-    if (!n) return out;
-    out.right = round1(right);
-    out.left = round1(left);
-    out.top = Number.isFinite(top) ? round1(top) : null;
-    out.bottom = Number.isFinite(bottom) ? round1(bottom) : null;
-    out.rects = n;
-  } catch (e) { /* 拿不到就算了，不能外抛 */ }
-  return out;
-}
-
 /* ------------------------------ 记录与落盘 ------------------------------ */
 
 function push(point, data) {
@@ -327,7 +236,7 @@ function push(point, data) {
  * 所以调用点不需要再包一层（包了也无害）。
  */
 function dbg(point, fn) {
-  if (!DEBUG_LP) return;
+  if (!enabled) return;
   try {
     let data = null;
     try {
@@ -342,7 +251,7 @@ function dbg(point, fn) {
 
 /** 记一条「在这里 return null」，at 是稳定的原因代号 */
 function dbgNull(point, at) {
-  if (!DEBUG_LP) return;
+  if (!enabled) return;
   dbg(point, () => ({ at: String(at) }));
 }
 
@@ -369,7 +278,7 @@ function fallbackToConsole(text, err) {
 }
 
 function flush() {
-  if (!DEBUG_LP) return;
+  if (!enabled) return;
   if (!app) return;
   const ad = adapterOf(app);
   if (!ad) { noAdapter = true; return; }          // 没有 adapter 写权限：静默跳过
@@ -403,7 +312,7 @@ function flush() {
 }
 
 function scheduleFlush() {
-  if (!DEBUG_LP || noAdapter || !app || pending) return;
+  if (!enabled || noAdapter || !app || pending) return;
   let wait = FLUSH_GAP;
   try {
     const gap = nowMs() - lastWrite;
@@ -441,7 +350,7 @@ function start() {
     innerW: envNumber('innerWidth'),
     innerH: envNumber('innerHeight'),
     app: !!(app && app.vault),
-    note: '临时诊断；排查完成后把 src/debug.js 的 DEBUG_LP 改成 false',
+    note: '临时诊断；默认关闭（src/debug.js 的 DEBUG_LP）',
   });
 }
 
@@ -450,7 +359,7 @@ function start() {
  * 只在第一次成功时写一条 session.start。
  */
 function dbgConfigure(a) {
-  if (!DEBUG_LP) return false;
+  if (!enabled) return false;
   try {
     if (!a || !a.vault) return false;
     if (app === a) return true;
@@ -489,7 +398,7 @@ function dbgReset() {
 
 /** 测试用：马上落一次盘（不等节流） */
 function dbgFlush() {
-  if (!DEBUG_LP) return false;
+  if (!enabled) return false;
   try {
     flush();
     return true;
@@ -498,8 +407,22 @@ function dbgFlush() {
   }
 }
 
+/**
+ * 打开 / 关闭诊断层。只给自测用：正式运行永远是 DEBUG_LP 的默认值（false）。
+ * 关掉时顺手把没落盘的定时器清掉，避免关完又写一次盘。
+ */
+function dbgSetEnabled(on) {
+  enabled = !!on;
+  if (!enabled && pending) {
+    try { clearTimeout(pending); } catch (e) { /* ignore */ }
+    pending = 0;
+  }
+  return enabled;
+}
+
 module.exports = {
   DEBUG_LP,
+  dbgSetEnabled,
   DEBUG_FILE,
   LINE_MAX,
   TRIM_TO,
@@ -519,9 +442,4 @@ module.exports = {
   dbgCount,
   dbgReset,
   dbgFlush,
-  dbgClass,
-  dbgConnected,
-  dbgInlinePad,
-  dbgBox,
-  dbgTextExtent,
 };

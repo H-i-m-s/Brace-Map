@@ -26,7 +26,6 @@ require('./boxnode.test');
 require('./float.test');
 require('./floatwrap.test');
 require('./livefloat.test');
-require('./padaudit.test');
 require('./wrapdiag.test');
 require('./debug.test');
 

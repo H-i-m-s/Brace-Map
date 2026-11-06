@@ -32,6 +32,7 @@ function last() {
 /* ------------------------------ 记录格式 ------------------------------ */
 
 function tShape() {
+  eq(I.DEBUG_LP, false, 'dbg: 正式运行默认关闭（DEBUG_LP = false）');
   I.dbgReset();
   I.dbg('unit.shape', () => ({ a: 1, b: 'two' }));
   I.dbg('unit.shape2', () => ({ c: true }));
