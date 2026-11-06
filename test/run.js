@@ -12,6 +12,11 @@
 
 const { I, runAll } = require('./framework');
 
+// 自测里把编辑模式浮动摆到「开」：受测的是浮动逻辑本身，而产品默认值是关的
+// （关的原因见 src/float.js 顶部注释）。开关行为由 remeasure.test 里的用例
+// 自己开开关关去验，不依赖这里的默认值。
+I.setLpFloatEnabled(true);
+
 require('./parse.test');
 require('./brace.test');
 require('./layout.test');
