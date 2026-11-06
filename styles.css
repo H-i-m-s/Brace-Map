@@ -1,0 +1,182 @@
+/* ============================================================
+   Brace Map
+   ============================================================ */
+
+.brace-map-block {
+  position: relative;
+  margin: 0.9em 0;
+}
+
+.brace-map-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 4px;
+}
+
+.brace-map-svg {
+  display: block;
+  font-size: 0.95em;
+  max-width: none;
+  height: auto;
+  overflow: visible;
+
+  /* 图里的文字要能选中、能复制。SVG 本身不继承正文的 user-select 行为，
+     必须在容器和 text 上显式放开。 */
+  user-select: text;
+  -webkit-user-select: text;
+
+  /* 必须切断 letter-spacing 的继承。
+     不少主题（Blue Topaz 就在 .markdown-reading-view 上设了
+     letter-spacing: calc(var(--letter-space-main) * 0.03em)）会把这
+     个可继承属性一路传到 SVG 的 <text>；而 canvas 的 measureText
+     完全不认 letter-spacing。两边不一致时，文字会按字符数逐步溢出
+     方框，括号位置也会随之忽近忽远。normal 让渲染与测量对齐。 */
+  letter-spacing: normal;
+  word-spacing: normal;
+
+  /* 全部颜色走主题变量，深色浅色都跟随 Obsidian */
+  --bm-fg: var(--text-normal);
+  --bm-line: var(--text-faint);
+  --bm-box: var(--text-muted);
+  --bm-brace-weight: 1.4;
+}
+
+.brace-map-svg text {
+  font-family: inherit;
+  fill: var(--bm-fg);
+  white-space: pre;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+  letter-spacing: normal;
+  word-spacing: normal;
+}
+
+.brace-map-svg .bm-title {
+  font-weight: 600;
+  fill: var(--text-normal);
+}
+
+/* 括号：圆头圆角，方括号靠 linejoin: round 得到小圆角 */
+.brace-map-svg .bm-brace {
+  fill: none;
+  stroke: var(--bm-line);
+  stroke-width: var(--bm-brace-weight);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.brace-map-svg .bm-box {
+  fill: none;
+  stroke: var(--bm-box);
+  stroke-width: 1.2;
+}
+
+/* 图里的链接：颜色沿用 run 自己的 fill（<font color> 写的），
+   没写 fill 才落到主题的 accent 色。用 :not([fill]) 而不是直接写 fill，
+   否则这条规则的优先级会把 <font color> 的填充色盖掉。 */
+.brace-map-svg .bm-link {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: currentColor;
+  text-decoration-thickness: 1px;
+}
+
+.brace-map-svg .bm-link:not([fill]) {
+  fill: var(--text-accent, var(--bm-fg));
+}
+
+/* 公式：MathJax 的矢量用 currentColor 上色，color 设在这里就跟随正文色；
+   带 <font color> 的公式会在 <g> 上写 color 属性直接盖掉这一条。 */
+.brace-map-svg .bm-math {
+  color: var(--bm-fg);
+  fill: var(--bm-fg);
+}
+
+/* ---------- 工具条 ---------- */
+
+.bm-toolbar {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 0.16s ease;
+}
+
+.brace-map-block:hover .bm-toolbar,
+.brace-map-block:focus-within .bm-toolbar {
+  opacity: 1;
+}
+
+.bm-btn {
+  height: auto;
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.bm-btn:hover {
+  color: var(--text-normal);
+  border-color: var(--text-faint);
+  background: var(--background-secondary);
+}
+
+/* ---------- 异常与空态 ---------- */
+
+.bm-empty {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.bm-empty-demo {
+  margin-top: 6px;
+  font-size: 0.85em;
+  color: var(--text-faint);
+}
+
+.bm-error {
+  color: var(--text-error);
+  font-size: 0.88em;
+  margin-bottom: 6px;
+}
+
+.bm-error + pre {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+}
+
+/* ---------- 浮动布局 ---------- */
+
+/* 浮动后宿主不能再裁剪：float 元素的内容溢出时会被 overflow 切成
+   带滚动条的盒子，图文混排就废了。滚动交给内部的 .brace-map-scroll。 */
+.bm-floated {
+  overflow: visible !important;
+  max-width: 100%;
+}
+
+/* 浮动时图的高度由宽度决定，内部滚动条要隐藏 */
+.bm-floated .brace-map-scroll {
+  overflow-x: auto;
+}
+
+/* SVG 默认 max-width: none，会顶住宿主的 width 不让缩。
+   浮动时放开，让图跟着宿主宽度走。 */
+.bm-floated .brace-map-svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* 居中/行内模式下不需要内部横向滚动条撑高度 */
+.bm-float-center .brace-map-scroll,
+.bm-float-inline .brace-map-scroll {
+  overflow-x: visible;
+}

@@ -1,0 +1,14 @@
+# 依赖与构建产物
+node_modules/
+
+# 临时诊断页（diag*.html 是排查时一次性的现场复现，不进版本库）
+diag*.html
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+*.log
+
+# 注意：main.js 是产物，但必须提交。
+# 移动端 Obsidian 没有文件系统的 require，插件只能靠这份自包含的 main.js 运行。
+# 改了 src/ 之后跑 node build.js 重新生成，一并提交。

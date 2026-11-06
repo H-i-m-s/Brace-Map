@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>brace-map v0.4.0 · 渲染后自校准判定</title>
+<link rel="stylesheet" href="./styles.css">
+<style>
+  :root {
+    --text-normal: #e6e6e6;
+    --text-muted: #a8a8a8;
+    --text-faint: #7d7d7d;
+    --background-primary: #242424;
+    --background-secondary: #2d2d2d;
+    --background-modifier-border: #3a3a3a;
+    --text-error: #ff7b72;
+    --bm-fg: #dcdcdc;
+    --bm-line: #8a8a8a;
+    --bm-box: #a2a2a2;
+  }
+
+  html, body {
+    background: #1a1a1a;
+    color: #d8d8d8;
+    margin: 0;
+    padding: 24px;
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font-size: 15px;
+  }
+
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 18px; font-size: 12.5px; color: #8c8c8c; }
+
+  .case { margin-bottom: 20px; }
+  .case h2 { font-size: 13.5px; margin: 0 0 8px; color: #c9c9c9; font-weight: 600; }
+  .render { padding: 10px 12px; background: #171717; border-radius: 8px; overflow-x: auto; }
+
+  /* 模拟主题给正文加字距：canvas measureText 不算它，SVG 渲染算。
+
+     styles.css 里 .brace-map-svg 和 .brace-map-svg text 都钉了 letter-spacing: normal
+     （v0.3.x 的老缓解手段），直接给 .brace-map-svg 加字距会被 text 上那条直接声明
+     顶掉、根本传不到 <text>。这里用 !important 把它压下去，才真正造成
+     「渲染宽度 > canvas 估算」的条件，否则这个用例什么都测不出来。 */
+  #spaced .brace-map-svg,
+  #spaced .brace-map-svg text {
+    letter-spacing: 0.12em !important;
+  }
+
+  #out {
+    margin: 0;
+    padding: 12px 14px;
+    background: #101010;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.75;
+    color: #c8d6c8;
+    white-space: pre;
+    overflow-x: auto;
+  }
+</style>
+</head>
+<body>
+
+<h1>brace-map v0.4.0 · 渲染后自校准判定</h1>
+<p class="sub">
+  同一段源码分别渲染在不加字距 / 加 0.12em 字距的容器里，逐个方框核对
+  rect 宽度是否装得下实测文字宽度。
+</p>
+
+<div class="case">
+  <h2>#normal · 不加字距</h2>
+  <div class="render" id="normal"></div>
+</div>
+
+<div class="case">
+  <h2>#spaced · .brace-map-svg 加 letter-spacing: 0.12em</h2>
+  <div class="render" id="spaced"></div>
+</div>
+
+<pre id="out">(waiting)</pre>
+
+<!-- 1) 浏览器端的 CommonJS 加载器：提供 window.require，同步加载 src/*.js -->
+<script src="./preview-loader.js"></script>
+
+<!-- 2) 插件本体（挂 window.__braceMapRender） -->
+<script src="./main.js"></script>
+<!-- 3) 拆成多文件后 src/ 是运行时才装配的，浏览器侧要显式喊一声 -->
+<script>window.module.exports.__loadModules('');</script>
+
+<!-- 3) 双容器渲染 + 机器判定 -->
+<script>
+(function () {
+  var SRC = [
+    'box: 1',
+    '- 按冶炼方法',
+    '  - 平炉钢',
+    '    - 甲',
+    '    - 乙',
+    '  - 转炉钢',
+    '- 按金相（退火）组织',
+    '  - 亚共析钢',
+    '    - 丙'
+  ].join('\n');
+
+  var out = document.getElementById('out');
+  var lines = [];
+  var render = window.__braceMapRender;
+
+  if (typeof render !== 'function') {
+    out.textContent = 'ERROR: main.js 没有挂上 window.__braceMapRender';
+    return;
+  }
+
+  var IN = (window.module && window.module.exports && window.module.exports.__internals) || null;
+  if (!IN || !IN.OPT) {
+    out.textContent = 'ERROR: main.js 没有暴露 __internals.OPT';
+    return;
+  }
+  var PADX = IN.OPT.boxPadX;
+
+  /**
+   * 收集方框：markup 里每个 rect.bm-box 紧跟着自己的 text，
+   * 所以从 text 往前找最近的兄弟 rect 就是它的框。
+   * 宽度一律用 SVG 用户坐标（属性值），和 getComputedTextLength() 同一量纲。
+   */
+  function collect(svg) {
+    var res = [];
+    var texts = svg.querySelectorAll('text[data-seq]');
+    for (var i = 0; i < texts.length; i++) {
+      var t = texts[i];
+      var prev = t.previousElementSibling;
+      if (!prev || prev.localName !== 'rect' || !prev.classList.contains('bm-box')) continue;
+      var len = t.getComputedTextLength();
+      res.push({
+        seq: t.getAttribute('data-seq'),
+        text: t.textContent,
+        len: len,
+        rectW: Number(prev.getAttribute('width'))
+      });
+    }
+    return res;
+  }
+
+  function fmt(v) { return (Math.round(v * 100) / 100).toFixed(2); }
+
+  async function run(id) {
+    var host = document.getElementById(id);
+    var err = null;
+    try {
+      // 渲染入口是 async（公式要先把 TeX 转成矢量再布局）
+      await render(SRC, host);
+    } catch (e) {
+      err = e;
+    }
+
+    var head = '=== #' + id + ' ===';
+    lines.push(head);
+
+    if (err) {
+      lines.push('  RENDER ERROR: ' + (err && err.message ? err.message : String(err)));
+      lines.push('RESULT #' + id + ': FAIL');
+      lines.push('');
+      return false;
+    }
+
+    var svg = host.querySelector('svg.brace-map-svg');
+    if (!svg) {
+      lines.push('  ERROR: 容器里没有 svg.brace-map-svg');
+      lines.push('RESULT #' + id + ': FAIL');
+      lines.push('');
+      return false;
+    }
+
+    var ls = getComputedStyle(svg).letterSpacing;
+    lines.push('  svg width/height : ' + svg.getAttribute('width') + ' x ' + svg.getAttribute('height'));
+    lines.push('  computed letter-spacing: ' + ls);
+    lines.push('  boxPadX = ' + PADX + '（来自 main.js OPT）');
+
+    var boxes = collect(svg);
+    lines.push('  boxed text 数量: ' + boxes.length);
+    if (!boxes.length) {
+      lines.push('  ERROR: 没找到带方框的文字');
+      lines.push('RESULT #' + id + ': FAIL');
+      lines.push('');
+      return false;
+    }
+
+    var pass = true;
+    for (var i = 0; i < boxes.length; i++) {
+      var b = boxes[i];
+      var need = b.len + 2 * PADX - 0.6;   // 判定下限（含 0.6px 容差）
+      var slack = b.rectW - (b.len + 2 * PADX);
+      var good = b.rectW >= need;
+      if (!good) pass = false;
+      lines.push(
+        '  [' + (good ? 'PASS' : 'FAIL') + '] seq=' + b.seq
+        + '  rectWidth=' + fmt(b.rectW)
+        + '  textLen=' + fmt(b.len)
+        + '  need>=' + fmt(need)
+        + '  slack=' + fmt(slack)
+        + '  "' + b.text + '"'
+      );
+    }
+
+    lines.push('RESULT #' + id + ': ' + (pass ? 'PASS' : 'FAIL'));
+    lines.push('');
+    return pass;
+  }
+
+  (async function () {
+    var a = await run('normal');
+    var b = await run('spaced');
+
+    lines.push('BOTH: ' + (a && b ? 'PASS' : 'FAIL'));
+
+    out.textContent = lines.join('\n');
+  })();
+})();
+</script>
+
+</body>
+</html>

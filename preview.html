@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>brace-map v0.3.0 · 括号预览</title>
+<link rel="stylesheet" href="./styles.css">
+<style>
+  :root {
+    /* styles.css 里全部颜色走 Obsidian 主题变量，这里给浏览器一份兜底 */
+    --text-normal: #e6e6e6;
+    --text-muted: #a8a8a8;
+    --text-faint: #7d7d7d;
+    --background-primary: #242424;
+    --background-secondary: #2d2d2d;
+    --background-modifier-border: #3a3a3a;
+    --text-error: #ff7b72;
+  }
+
+  html, body {
+    background: #1a1a1a;
+    color: #d8d8d8;
+  }
+
+  body {
+    margin: 0;
+    padding: 32px 28px 80px;
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+  }
+
+  header {
+    max-width: 1100px;
+    margin: 0 auto 28px;
+  }
+
+  h1 {
+    margin: 0 0 6px;
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+
+  .sub {
+    margin: 0;
+    color: #8f8f8f;
+    font-size: 13px;
+  }
+
+  main {
+    max-width: 1100px;
+    margin: 0 auto;
+    display: grid;
+    gap: 22px;
+  }
+
+  .case {
+    background: #202020;
+    border: 1px solid #2e2e2e;
+    border-radius: 10px;
+    padding: 16px 18px 14px;
+  }
+
+  .case h2 {
+    margin: 0 0 2px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #f0f0f0;
+  }
+
+  .note {
+    margin: 0 0 12px;
+    font-size: 12.5px;
+    color: #8c8c8c;
+  }
+
+  .render {
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    background: #171717;
+    border-radius: 8px;
+    overflow-x: auto;
+  }
+
+  .src {
+    margin: 0;
+    padding: 10px 12px;
+    font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: #9fb7a0;
+    background: #141414;
+    border-left: 2px solid #3d5a3f;
+    border-radius: 4px;
+    white-space: pre;
+    overflow-x: auto;
+  }
+
+  /* styles.css 的自定义属性是 var(--text-*)，这里直接钉死成浅色，免得浏览器里变黑 */
+  .brace-map-svg {
+    --bm-fg: #dcdcdc;
+    --bm-line: #8a8a8a;
+    --bm-box: #a2a2a2;
+  }
+
+  .err {
+    color: #ff7b72;
+    font-size: 13px;
+  }
+
+  .badge {
+    display: inline-block;
+    margin-bottom: 10px;
+    padding: 1px 8px;
+    font-size: 11.5px;
+    color: #9ad0a0;
+    background: #1d2a1e;
+    border-radius: 999px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>brace-map v0.3.0 · 括号几何预览</h1>
+  <p class="sub">
+    不需要重启 Obsidian。每组下面是实际渲染结果，再下面是它对应的代码块源码。
+    括号比例已改为按跨度取比例（<code>r = clamp(0.15·H, 3, 0.6w)</code>、
+    <code>t = clamp(0.11·H, 2.5, 0.5w)</code>），包围盒在父节点与子列之间居中。
+  </p>
+</header>
+
+<main id="cases"></main>
+
+<!-- 1) 先装浏览器端的 CommonJS 加载器：它提供 window.require，负责同步加载 src/*.js -->
+<script src="./preview-loader.js"></script>
+
+<!-- 2) 再加载同目录的插件本体（它会挂 window.__braceMapRender） -->
+<script src="./main.js"></script>
+<!-- 3) 拆成多文件后 src/ 是运行时才装配的，浏览器侧要显式喊一声 -->
+<script>window.module.exports.__loadModules('');</script>
+
+<!-- 3) 渲染用例 -->
+<script>
+(function () {
+  var CASES = [
+    {
+      title: 'span 很小 · 父节点只有一个子节点',
+      note: '括号最矮的情况。钩子与尖端不能把整段高度吃光，中间必须还留得下直线段。',
+      src: [
+        'dir: lr',
+        '- 只有一个孩子的父节点',
+        '  - 唯一子节点'
+      ].join('\n')
+    },
+    {
+      title: 'span 中等 · 两三个子节点',
+      note: '最常见的情况，括号刚好包住下一层那几行文字。',
+      src: [
+        'dir: lr',
+        '- 父节点',
+        '  - 子节点一',
+        '  - 子节点二',
+        '  - 子节点三'
+      ].join('\n')
+    },
+    {
+      title: 'span 很大 · 子节点里还挂着高子树',
+      note: '跨度大时钩子是否显得太小。括号仍然只包住下一层那几行，不包整棵子树。',
+      src: [
+        'dir: lr',
+        '- 父节点',
+        '  - 子节点一',
+        '    - 孙一',
+        '    - 孙二',
+        '    - 孙三',
+        '    - 孙四',
+        '  - 子节点二',
+        '    - 孙五',
+        '    - 孙六'
+      ].join('\n')
+    },
+    {
+      title: '方向 lr · 从左往右长',
+      note: '默认方向。尖端靠父节点，开口朝子节点。',
+      src: [
+        'dir: lr',
+        '- 父节点',
+        '  - 子节点一',
+        '  - 子节点二',
+        '  - 子节点三'
+      ].join('\n')
+    },
+    {
+      title: '方向 rl · 从右往左长',
+      note: '沿 x 轴镜像，尖端仍在父节点一侧。',
+      src: [
+        'dir: rl',
+        '- 父节点',
+        '  - 子节点一',
+        '  - 子节点二',
+        '  - 子节点三'
+      ].join('\n')
+    },
+    {
+      title: '方向 tb · 从上往下长',
+      note: '竖生长：括号整体转置，钩子半径按纵向跨度算。',
+      src: [
+        'dir: tb',
+        '- 父节点',
+        '  - 子节点一',
+        '  - 子节点二'
+      ].join('\n')
+    },
+    {
+      title: '方向 bt · 从下往上长',
+      note: '竖生长再沿 y 轴镜像。',
+      src: [
+        'dir: bt',
+        '- 父节点',
+        '  - 子节点一',
+        '  - 子节点二'
+      ].join('\n')
+    },
+    {
+      title: '样式 curly · 大括号',
+      note: '尖端是两条直线相交的锐角，上下两端是 1/4 圆弧。',
+      src: [
+        'dir: lr',
+        'brace: curly',
+        '- 父节点',
+        '  - 子节点一',
+        '  - 子节点二',
+        '  - 子节点三'
+      ].join('\n')
+    },
+    {
+      title: '样式 square · 方括号',
+      note: '三段折线，方括号没有钩子和尖端。',
+      src: [
+        'dir: lr',
+        'brace: square',
+        '- 父节点',
+        '  - 子节点一',
+        '  - 子节点二',
+        '  - 子节点三'
+      ].join('\n')
+    },
+    {
+      title: '带 box · 第 1、2 层加方框',
+      note: '带框节点用 text-anchor: middle，文字锚点直接在节点中心，框内左右留白对称。',
+      src: [
+        'dir: lr',
+        'box: 1,2',
+        '- 带框的父节点',
+        '  - 带框的子节点一',
+        '  - 带框的子节点二',
+        '    - 不带框的孙节点'
+      ].join('\n')
+    },
+    {
+      title: '不带 box · 纯文字',
+      note: '对照用。不带框的节点保留 start/end 锚点，兄弟之间靠边缘对齐。',
+      src: [
+        'dir: lr',
+        'box: none',
+        '- 纯文字的父节点',
+        '  - 纯文字的子节点一',
+        '  - 纯文字的子节点二',
+        '    - 纯文字的孙节点'
+      ].join('\n')
+    },
+    {
+      title: '行内公式 $...$',
+      note: '公式由 MathJax 转成矢量 SVG 内嵌（<g> 包裹，颜色跟随文字）。浏览器预览页没有 MathJax，'
+        + '这里正好走降级路径：$...$ 原样当文字显示，整图照常能出。',
+      src: [
+        'dir: lr',
+        'box: 1',
+        '- 应力 $\\sigma = F/A$ 单位 MPa',
+        '  - 应变 $\\varepsilon = \\Delta L / L$',
+        '  - 弹性模量 $E = \\sigma/\\varepsilon$'
+      ].join('\n')
+    },
+    {
+      title: '独立公式 $$...$$',
+      note: '$$...$$ 标记 display。预览页没有 MathJax，同样降级成文字；在 Obsidian 里则是竖排居中的公式。',
+      src: [
+        'dir: lr',
+        '- 欧拉恒等式 $$e^{i\\pi} + 1 = 0$$',
+        '  - 圆的面积 $$S = \\pi r^2$$',
+        '  - 字面美元符 \\$5 不是公式'
+      ].join('\n')
+    },
+    {
+      title: '公式 + 行内样式混排',
+      note: '公式与粗体、颜色共存，公式是折行时的不可拆原子。',
+      src: [
+        'dir: lr',
+        'maxWidth: 150',
+        'brace: square',
+        '- **应力** $\\sigma = F/A$ 与 <font color="#d99694">应变</font> $\\varepsilon$ 的关系',
+        '  - 胡克定律 $\\sigma = E\\varepsilon$'
+      ].join('\n')
+    },
+    {
+      title: 'closing + title · 末端总括号与标题',
+      note: '总括号居中在「内容末端」和「画布内边距」之间，两侧留白相等。',
+      src: [
+        'dir: lr',
+        'brace: curly',
+        'closing: true',
+        'title: 钢的分类与编号',
+        '- 按冶炼方法',
+        '  - 平炉钢',
+        '    - 甲',
+        '    - 乙',
+        '  - 转炉钢',
+        '- 按金相组织',
+        '  - 亚共析钢'
+      ].join('\n')
+    }
+  ];
+
+  var host = document.getElementById('cases');
+
+  if (typeof window.__braceMapRender !== 'function') {
+    var p = document.createElement('p');
+    p.className = 'err';
+    p.textContent = 'main.js 没有挂上 window.__braceMapRender，检查同目录 main.js 是否存在。';
+    host.appendChild(p);
+    return;
+  }
+
+  var pending = [];
+
+  CASES.forEach(function (c, i) {
+    var sec = document.createElement('section');
+    sec.className = 'case';
+
+    var badge = document.createElement('span');
+    badge.className = 'badge';
+    badge.textContent = '#' + (i + 1);
+    sec.appendChild(badge);
+
+    var h = document.createElement('h2');
+    h.textContent = c.title;
+    sec.appendChild(h);
+
+    var note = document.createElement('p');
+    note.className = 'note';
+    note.textContent = c.note;
+    sec.appendChild(note);
+
+    var render = document.createElement('div');
+    render.className = 'render';
+    sec.appendChild(render);
+
+    var pre = document.createElement('pre');
+    pre.className = 'src';
+    pre.textContent = c.src;
+    sec.appendChild(pre);
+
+    host.appendChild(sec);
+    pending.push({ src: c.src, host: render });
+  });
+
+  // 渲染入口是 async（公式要先批量转换再布局），一例一例串着跑
+  (async function () {
+    for (var i = 0; i < pending.length; i++) {
+      try {
+        await window.__braceMapRender(pending[i].src, pending[i].host);
+      } catch (err) {
+        var e = document.createElement('div');
+        e.className = 'err';
+        e.textContent = '渲染失败：' + (err && err.message ? err.message : String(err));
+        pending[i].host.appendChild(e);
+      }
+    }
+  })();
+})();
+</script>
+
+</body>
+</html>
