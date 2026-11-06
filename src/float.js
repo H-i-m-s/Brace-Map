@@ -18,13 +18,25 @@ const { createMeasureScheduler, RMEASURE_GAP, RMEASURE_SCROLL_IDLE } = require('
  * 图按 Obsidian 原生的块级 widget 排，光标跟没装插件时一样。
  * 阅读视图的图文混排不受它影响。
  *
+ * 默认关闭，原因写在文件里：
+ * CM6 用「各行高度累加」算文档坐标，而它测量的是 block widget 自己那个盒子的
+ * 高度。浮动只是不再把高度贡献给父容器，盒子自己的 rect 不变，所以 CM6 账上
+ * 一直留着「图这么高」的位置，光标就按旧账反推，点第 18 行会落到第 14 行。
+ * 实测重测（requestMeasure）无效：重测前后 content 高度差恒为 0。
+ * 把盒子高度归零能让账对上，但布局引擎的浮动排除区纵向范围受限于浮动盒高度，
+ * 归零后文字不绕了（headless 对照实验：height 0 → 压图 7 行；85px → 3 行；
+ * 170px → 0 行）。两者不可兼得，所以默认关掉。
+ *
+ * 用户仍然可以在设置里打开，代价是光标错位。
+ * 阅读视图不受影响，那边的图文混排是好的。
+ *
  * 两个关法：
- *   1. 插件设置 → Brace Map → 「编辑模式浮动」关掉（立刻生效，不用重载）
- *   2. 把下面这行的 true 改成 false，再 node build.js（默认值跟着变）
+ *   1. 插件设置 → Brace Map → 「编辑模式浮动」默认就是关的
+ *   2. 把下面这行的 false 改成 true，再 node build.js（默认值跟着变）
  *
  * 设置页里的值用插件自己的 loadData / saveData 存，这里只是它的默认值。
  * ============================================================ */
-const LP_FLOAT = true;
+const LP_FLOAT = false;
 
 /** 运行时的真值：插件加载设置页之后会用 setLpFloatEnabled() 覆盖它 */
 let lpFloatEnabled = LP_FLOAT;
