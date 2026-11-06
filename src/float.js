@@ -1,5 +1,15 @@
 'use strict';
 
+/*
+ * 临时诊断（排查中，见 src/debug.js）。
+ * 每一次 dbg() / dbgNull() 都是只读的：取元素 / 读样式 / 记一行 JSON，
+ * 不改布局、不抛错。DEBUG_LP 关掉后这些调用直接返回。
+ */
+const {
+  dbg, dbgNull, dbgEl, dbgRect, dbgCss, dbgInline, dbgInlineAll,
+  dbgChildCount, dbgFirstChild, dbgChain,
+} = require('./debug.js');
+
 /* ============================================================
  * 浮动：图文混排
  *
@@ -444,11 +454,23 @@ function resetFloat(record) {
 function attachFloatWrap(host, cfg, opts) {
   const o = opts || {};
   const side = cfg && cfg.float;
+  // 诊断：直接回答「isLivePreview(host) 是不是 false，于是走了阅读视图那条路」
+  dbg('attach.enter', () => ({
+    side: side || null,
+    live: isLivePreview(host),
+    host: dbgEl(host),
+    inDoc: !!(host && host.isConnected),
+    chain: dbgChain(host, 5),
+  }));
   if (side !== 'left' && side !== 'right') return null;
   if (!host || typeof host.getBoundingClientRect !== 'function') return null;
   if (typeof host.style === 'undefined') return null;
   // 实时预览走另一条路：CM6 每行独立，阅读视图的「给兄弟加外边距」对它无效
-  if (isLivePreview(host)) return attachLivePreviewFloat(host, cfg, o);
+  if (isLivePreview(host)) {
+    dbg('attach.branch', () => ({ branch: 'live-preview' }));
+    return attachLivePreviewFloat(host, cfg, o);
+  }
+  dbg('attach.branch', () => ({ branch: 'reader' }));
   const doc = host.ownerDocument || (typeof document !== 'undefined' ? document : null);
   if (!doc) return null;
 
@@ -652,6 +674,51 @@ function livePreviewParts(el) {
   return { embed, line, content };
 }
 
+/* --------------------------- 实时预览：诊断摘要 --------------------------- */
+
+/**
+ * 诊断：三件东西找到没、各自是什么。找不到时把 host 的祖先链一起带上——
+ * 真机 CM6 的 embed 很可能不在 .cm-line 里，靠这条链子能一眼看出来。
+ */
+function lpPartsInfo(host, parts) {
+  return {
+    ok: !!parts,
+    found: parts ? ['embed', 'line', 'content'] : [],
+    embed: parts && parts.embed ? dbgEl(parts.embed) : null,
+    line: parts && parts.line ? dbgEl(parts.line) : null,
+    content: parts && parts.content ? dbgEl(parts.content) : null,
+    host: dbgEl(host),
+    chain: dbgChain(host, 7),
+  };
+}
+
+/** 诊断：一行 .cm-line 的四个高度口径（内联 height / 内联 min-height / computed / rect） */
+function lpLineInfo(line) {
+  return {
+    el: dbgEl(line),
+    inlineCss: dbgInlineAll(line),
+    inlineHeight: dbgInline(line, 'height'),       // 非空就是 CM6 写死了行高
+    inlineMinHeight: dbgInline(line, 'minHeight'),
+    computed: dbgCss(line, ['position', 'height', 'minHeight', 'display', 'paddingTop']),
+    rect: dbgRect(line),
+    childCount: dbgChildCount(line),
+    firstChild: dbgFirstChild(line),
+  };
+}
+
+/** 诊断：内容列 */
+function lpContentInfo(content) {
+  let scrollH = -1;
+  try { scrollH = Number(content.scrollHeight) || 0; } catch (e) { scrollH = -1; }
+  return {
+    el: dbgEl(content),
+    clientWidth: Number(content.clientWidth) || 0,
+    scrollHeight: scrollH,
+    computed: dbgCss(content, ['position', 'display', 'paddingTop', 'paddingRight']),
+    rect: dbgRect(content),
+  };
+}
+
 /** 从 widget 那行的下一个兄弟起收集同级 .cm-line（不是行的兄弟跳过但继续走） */
 function collectLineSiblings(startEl, limit) {
   const out = [];
@@ -820,20 +887,30 @@ function applyLivePreviewFloat(host, cfg, opts) {
   const o = opts || {};
   const mode = cfg && cfg.float;
   const side = mode === 'left' ? 'left' : (mode === 'right' ? 'right' : '');
-  if (!side) return null;                       // center / inline 保持原表现
+  dbg('apply.enter', () => ({ mode: mode || null, host: dbgEl(host), hasSvg: !!o.svg }));
+  if (!side) { dbgNull('apply.null', 'apply.side'); return null; }         // center / inline 保持原表现
   const ledger = (o.ledger && typeof o.ledger.set === 'function' && typeof o.ledger.reset === 'function')
     ? o.ledger
     : createStyleLedger();
   const parts = livePreviewParts(host);
-  if (!parts) return null;
+  dbg('apply.parts', () => lpPartsInfo(host, parts));
+  if (!parts) { dbgNull('apply.null', 'apply.parts'); return null; }
   const embed = parts.embed;
   const line = parts.line;
   const content = parts.content;
-  if (!embed.style || !line.style || !content.style) return null;
+  if (!embed.style || !line.style || !content.style) { dbgNull('apply.null', 'apply.noStyle'); return null; }
 
   const cRect = rectOf(content);
   const eRect = rectOf(embed);
-  if (!cRect || !eRect) return null;
+  if (!cRect || !eRect) { dbgNull('apply.null', 'apply.rect'); return null; }
+
+  dbg('apply.dom', () => ({
+    line: lpLineInfo(line),
+    content: lpContentInfo(content),
+    embed: { el: dbgEl(embed), rect: dbgRect(embed), computed: dbgCss(embed, ['position', 'display', 'marginTop']) },
+    embedParentIsContent: !!embed.parentElement && embed.parentElement === content,
+    embedParent: dbgEl(embed && embed.parentElement),
+  }));
 
   const gap = Number(o.gap) > 0 ? Number(o.gap) : FLOAT_GAP;
 
@@ -841,7 +918,13 @@ function applyLivePreviewFloat(host, cfg, opts) {
    *    而后面又没有内容撑着，.cm-content 的滚动高度会跟着缩，图可能被裁掉。
    *    阅读视图遇到同样情况（没有后续兄弟）也是直接放弃。 */
   const candidates = collectLineSiblings(line.nextElementSibling, o.maxLines);
-  if (!candidates.length) return null;
+  dbg('apply.candidates', () => ({
+    count: candidates.length,
+    next: dbgEl(line.nextElementSibling),
+    lineIsDirectChildOfContent: !!line.parentElement && line.parentElement === content,
+    lineNext: candidates.length ? dbgEl(candidates[0]) : null,
+  }));
+  if (!candidates.length) { dbgNull('apply.null', 'apply.noCandidates'); return null; }
 
   /* 2) 定位上下文：.cm-line 原本是 relative，会把绝对定位的包含块抢到自己身上，
    *    那样 widget 只能相对这一行定位，后面的行永远绕不上来。 */
@@ -863,6 +946,13 @@ function applyLivePreviewFloat(host, cfg, opts) {
   const pad = paddingOf(content);
 
   /* 4) 脱离流：top 沿用原位，横向贴住正文列边界 */
+  dbg('apply.embed.before', () => ({
+    el: dbgEl(embed),
+    rect: dbgRect(embed),
+    top: round2(top),
+    width: round2(width),
+    computed: dbgCss(embed, ['position', 'float', 'marginLeft', 'marginRight']),
+  }));
   ledger.set(embed, 'position', 'absolute');
   ledger.set(embed, 'float', 'none');
   ledger.set(embed, 'margin', '0');
@@ -883,6 +973,27 @@ function applyLivePreviewFloat(host, cfg, opts) {
 
   /* 6) 从 widget 那行的下一个 .cm-line 起逐行留白，累积够图高就停 */
   const lines = planLivePreviewLines(candidates, height, { limit: o.maxLines });
+
+  dbg('apply.after', () => ({
+    height: round2(height),
+    width: round2(width),
+    span: round2(width + gap),
+    embedInline: dbgInlineAll(embed),
+    lineInline: dbgInlineAll(line),
+    contentInline: dbgInlineAll(content),
+    embedRect: dbgRect(embed),
+    lineRectHeight: (dbgRect(line) || {}).h,
+    linePosition: dbgCss(line, ['position']).position,
+    contentPosition: dbgCss(content, ['position']).position,
+  }));
+
+  dbg('apply.planLines', () => ({
+    candidates: candidates.length,
+    lines: lines.length,
+    height: round2(height),
+    maxLines: Number(o.maxLines) > 0 ? Number(o.maxLines) : null,
+    lineHeights: lines.slice(0, 4).map((el) => elHeight(el)),
+  }));
 
   return {
     host, embed, line, content, side,
@@ -959,6 +1070,8 @@ function createLivePreviewManager(content, seed) {
   let applies = 0;
   let stats = { widgets: 0, lines: 0, styles: 0, applies: 0 };
 
+  dbg('manager.create', () => ({ content: dbgEl(content), chain: dbgChain(content, 4) }));
+
   const resolveCm = () => {
     if (cm && cm.dom && cm.dom.isConnected !== false) return cm;
     cm = findEditorView(content, o);
@@ -995,6 +1108,14 @@ function createLivePreviewManager(content, seed) {
     const pads = planLinePads(blocks, { reader: paddingOf });
     const styles = applyLinePads(pads, ledger);
     stats = { widgets: records.length, lines: pads.length, styles, applies };
+    dbg('manager.pass', () => ({
+      applies: stats.applies,
+      registered: widgets.size,
+      records: records.length,
+      pads: pads.length,
+      styles: stats.styles,
+      padSamples: pads.slice(0, 3).map((p) => ({ el: dbgEl(p.el), left: p.left, right: p.right })),
+    }));
     requestMeasure();
     return stats;
   };
@@ -1024,7 +1145,17 @@ function createLivePreviewManager(content, seed) {
       });
       observer.observe(node, { childList: true, subtree: true });
       observedNode = node;
-    } catch (e) { observer = null; observedNode = null; }
+      dbg('manager.observe', () => ({
+        ok: !!observer,
+        node: dbgEl(node),
+        isContent: node === content,
+        cmFound: !!view,
+      }));
+    } catch (e) {
+      observer = null;
+      observedNode = null;
+      dbg('manager.observe', () => ({ ok: false, error: String(e && e.message ? e.message : e) }));
+    }
   };
 
   /* 兜底巡检：observer 只在被观察子树产生 childList 变化时回调，编辑器整个被换掉
@@ -1056,6 +1187,7 @@ function createLivePreviewManager(content, seed) {
   const dispose = () => {
     if (disposed) return;
     disposed = true;
+    dbg('manager.dispose', () => ({ content: dbgEl(content), applies, widgets: widgets.size }));
     if (timer) { try { clearTimeout(timer); } catch (e) { /* ignore */ } timer = 0; }
     if (poll) { try { clearInterval(poll); } catch (e) { /* ignore */ } poll = 0; }
     if (observer) { try { observer.disconnect(); } catch (e) { /* ignore */ } }
@@ -1076,6 +1208,7 @@ function createLivePreviewManager(content, seed) {
         if (w.opts.getCM && !o.getCM) o.getCM = w.opts.getCM;
       }
       widgets.add(w);
+      dbg('manager.attach', () => ({ host: dbgEl(w && w.host), registered: widgets.size, hasCmHook: !!(o.cm || o.getCM) }));
       ensureObserved();
       startPoll();
       pass();
@@ -1100,8 +1233,9 @@ function createLivePreviewManager(content, seed) {
 function attachLivePreviewFloat(host, cfg, opts) {
   const o = opts || {};
   const side = cfg && cfg.float;
-  if (side !== 'left' && side !== 'right') return null;
-  if (!host || typeof host.getBoundingClientRect !== 'function') return null;
+  dbg('lpf.enter', () => ({ side: side || null, host: dbgEl(host), chain: dbgChain(host, 5), inDoc: !!(host && host.isConnected) }));
+  if (side !== 'left' && side !== 'right') { dbgNull('lpf.null', 'lpf.side'); return null; }
+  if (!host || typeof host.getBoundingClientRect !== 'function') { dbgNull('lpf.null', 'lpf.host'); return null; }
 
   const widget = { host, cfg, svg: o.svg, gap: o.gap, opts: o };
   let manager = null;
@@ -1117,7 +1251,11 @@ function attachLivePreviewFloat(host, cfg, opts) {
 
   const nextRetry = () => {
     if (disposed || retry) return;
-    if (attempt >= LP_RETRY.length) return;
+    if (attempt >= LP_RETRY.length) {
+      // 重试额度用完了：这一条就是「静默放弃」的证据
+      dbg('lpf.giveup', () => ({ attempts: attempt, host: dbgEl(host), inDoc: !!(host && host.isConnected) }));
+      return;
+    }
     const delay = LP_RETRY[attempt++];
     try { retry = setTimeout(attach, delay); } catch (e) { retry = 0; }
   };
@@ -1126,7 +1264,20 @@ function attachLivePreviewFloat(host, cfg, opts) {
     retry = 0;
     if (disposed || manager) return;
     const parts = livePreviewParts(host);
-    if (!parts) { nextRetry(); return; }      // 还没插进文档，稍后再试
+    if (!parts) {
+      dbg('lpf.wait', () => ({
+        attempt,
+        host: dbgEl(host),
+        inDoc: !!(host && host.isConnected),
+        chain: dbgChain(host, 7),
+        hasEmbed: !!climbTo(host, 'cm-embed-block', CLIMB_LIMIT + 8),
+        hasContent: !!climbTo(host, 'cm-content', CLIMB_LIMIT + 12),
+        hasLine: !!climbTo(host, 'cm-line', CLIMB_LIMIT),
+      }));
+      nextRetry();
+      return;                              // 还没插进文档，稍后再试
+    }
+    dbg('lpf.parts', () => lpPartsInfo(host, parts));
     let m = lpManagers.get(parts.content);
     if (!m) {
       m = createLivePreviewManager(parts.content, { cm: o.cm, app: o.app, getCM: o.getCM });
@@ -1134,6 +1285,7 @@ function attachLivePreviewFloat(host, cfg, opts) {
     }
     manager = m;
     m.attach(widget);
+    dbg('lpf.attach.done', () => ({ attempt, state: typeof m.state === 'function' ? m.state() : null }));
   }
 
   attach();
@@ -1141,6 +1293,7 @@ function attachLivePreviewFloat(host, cfg, opts) {
   return {
     host,
     update: () => {
+      dbg('lpf.update', () => ({ hasManager: !!manager, disposed }));
       if (disposed) return;
       if (manager) manager.refresh();
       else attach();
@@ -1148,6 +1301,7 @@ function attachLivePreviewFloat(host, cfg, opts) {
     dispose: () => {
       if (disposed) return;
       disposed = true;
+      dbg('lpf.dispose', () => ({ host: dbgEl(host), hadManager: !!manager }));
       stopRetry();
       const m = manager;
       manager = null;

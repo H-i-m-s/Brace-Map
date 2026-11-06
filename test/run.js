@@ -27,6 +27,7 @@ require('./float.test');
 require('./floatwrap.test');
 require('./livefloat.test');
 require('./wrapdiag.test');
+require('./debug.test');
 
 runAll().then(() => {
   // 路径样例，便于人工比对形状
