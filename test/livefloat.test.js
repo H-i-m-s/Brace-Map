@@ -93,6 +93,42 @@ function cmTree(opts) {
   return { content, line, embed, host, svg, lines };
 }
 
+/**
+ * 复刻 Obsidian 1.13.7 的实测结构：
+ *   .cm-content > .cm-embed-block > host        （中间没有 .cm-line）
+ * .cm-embed-block 后面直接接三行 .cm-line（与它平级）。图 400×106，正文列宽 820。
+ */
+function cmTreeDirect(opts) {
+  const o = opts || {};
+  const content = fakeEl(['cm-content'], 0,
+    { top: 0, left: 0, width: 820, height: 2000, right: 820, bottom: 2000 });
+  content.clientWidth = 820;
+
+  const embedH = o.embedH == null ? 106 : o.embedH;
+  const embed = fakeEl(['cm-embed-block'], embedH,
+    { top: 0, left: 0, width: 820, height: embedH, right: 820, bottom: embedH });
+  embed.className = 'cm-embed-block markdown-rendered';
+  embed.parentElement = content;
+
+  const host = fakeEl([], embedH, { top: 0, left: 0, width: 400, height: embedH, right: 400, bottom: embedH });
+  host.parentElement = embed;
+
+  const svg = fakeEl(['brace-map-svg'], embedH,
+    { top: 0, left: 0, width: 400, height: embedH, right: 400, bottom: embedH });
+
+  const heights = o.lineHeights || [60, 60, 60];
+  const lines = linkChain(heights.map((h) => cmLine(h)));
+  embed.nextElementSibling = lines[0] || null;
+
+  return { content, embed, host, svg, lines };
+}
+
+/** 给假元素补上 className（classHas 走 classList，放宽规则要读 className） */
+function withClass(el, names) {
+  el.className = names.join(' ');
+  return el;
+}
+
 /** 把一张图的几何算完再写留白（与 manager 里的两段调用同构） */
 function applyAll(host, cfg, opts) {
   const rec = I.applyLivePreviewFloat(host, cfg, opts);
@@ -438,7 +474,197 @@ function tAttach() {
   if (c2) c2.dispose();
 }
 
+/* ---------------------- 结构回退（Obsidian 1.13.7） ---------------------- */
+
+function tDirectParts() {
+  const tree = cmTreeDirect();
+  const parts = I.livePreviewParts(tree.host);
+  ok(!!parts, 'lp-direct: 没有 .cm-line 的新结构也能认出三件东西');
+  ok(parts && parts.mode === 'direct-embed', 'lp-direct: 走 direct-embed 分支');
+  ok(parts && parts.line === tree.embed, 'lp-direct: line 回退成 embed 自己');
+  ok(parts && parts.embed === tree.embed, 'lp-direct: embed 还是那个 .cm-embed-block');
+  ok(parts && parts.content === tree.content, 'lp-direct: content 还是 .cm-content');
+
+  // 直接把 embed 传进来也认
+  const p2 = I.livePreviewParts(tree.embed);
+  ok(p2 && p2.mode === 'direct-embed' && p2.line === tree.embed, 'lp-direct: 传 embed 自己也认回退');
+
+  // 旧结构不能回退吃掉：仍然走 .cm-line
+  const old = cmTree();
+  const p3 = I.livePreviewParts(old.host);
+  ok(p3 && p3.mode === 'cm-line', 'lp-direct: 老结构仍走 cm-line 分支');
+  ok(p3 && p3.line === old.line, 'lp-direct: 老结构的 line 是 .cm-line');
+  ok(p3 && p3.line !== p3.embed, 'lp-direct: 老结构里 line ≠ embed');
+
+  // 既没有 .cm-line、父级又是别的容器：认不出就是 null，不猜
+  const content = fakeEl(['cm-content'], 0);
+  const wrap = fakeEl(['cm-nope'], 0);
+  const embed = fakeEl(['cm-embed-block'], 10);
+  wrap.parentElement = content;
+  embed.parentElement = wrap;
+  eq(I.livePreviewParts(embed), null, 'lp-direct: 父级不是 .cm-content → null');
+}
+
+function tDirectCandidates() {
+  const tree = cmTreeDirect();
+  const got = I.collectLineSiblings(tree.embed.nextElementSibling, 0, tree.embed);
+  eq(got.length, 3, 'lp-direct: 另外三个兄弟 .cm-line 全收进来');
+  ok(got[0] === tree.lines[0], 'lp-direct: 第一行就是 embed 的下一个兄弟');
+
+  // 混进非正文节点：跳过但不断链
+  const self = withClass(fakeEl(['cm-embed-block'], 100), ['cm-embed-block']);
+  const line1 = cmLine(60);
+  const gap = withClass(fakeEl(['cm-gap'], 12), ['cm-gap']);
+  const other = withClass(fakeEl(['cm-embed-block'], 40), ['cm-embed-block', 'markdown-rendered']);
+  const layer = withClass(fakeEl(['cm-cursorLayer'], 0), ['cm-cursorLayer']);
+  const plain = withClass(fakeEl([], 60), []);    // 裸 div（无类名，className === ''）
+  const themed = withClass(fakeEl([], 60), ['HyperMD-list-line']);
+  const alien = withClass(fakeEl([], 60), ['cm-someWidget']);
+  linkChain([self, line1, gap, other, layer, plain, themed, alien]);
+
+  const all = I.collectLineSiblings(self.nextElementSibling, 0, self);
+  eq(all.length, 3, 'lp-direct: 只留真正的正文行');
+  ok(all.indexOf(line1) >= 0, 'lp-direct: .cm-line 收');
+  ok(all.indexOf(plain) >= 0, 'lp-direct: 裸 div 当正文块收');
+  ok(all.indexOf(themed) >= 0, 'lp-direct: 非 cm- 类名的正文块收（类名变了也活）');
+  eq(all.indexOf(gap), -1, 'lp-direct: .cm-gap 不收');
+  eq(all.indexOf(other), -1, 'lp-direct: 另一个 .cm-embed-block 不收');
+  eq(all.indexOf(layer), -1, 'lp-direct: 浮层 .cm-cursorLayer 不收');
+  eq(all.indexOf(alien), -1, 'lp-direct: cm-* 的内部节点不收（不把所有 div 收进来）');
+
+  // 起点给成 widget 自己：它自己不会被当成正文行
+  const fromSelf = I.collectLineSiblings(self, 1, self);
+  eq(fromSelf.length, 1, 'lp-direct: 起点是 widget 自己时只往后收一行');
+  ok(fromSelf[0] === line1, 'lp-direct: 起点自身被排除');
+
+  // 另一个 widget 自己也算排除对象
+  const onlyWidget = I.collectLineSiblings(other, 0, self);
+  eq(onlyWidget.length, 2, 'lp-direct: 从另一个 widget 起步也继续往后扫');
+}
+
+function tDirectApply() {
+  const tree = cmTreeDirect();
+  const ledger = I.createStyleLedger();
+  const rec = applyAll(tree.host, { float: 'right' }, { svg: tree.svg, ledger });
+  ok(!!rec, 'lp-direct: 新结构能施加（旧代码在这里一个样式都不写）');
+  eq(rec.mode, 'direct-embed', 'lp-direct: 结果里带分支名');
+  ok(rec.line === tree.embed, 'lp-direct: 结果是拿 embed 当行算的');
+  eq(rec.width, 400, 'lp-direct: 图宽取 SVG 渲染宽');
+  eq(rec.height, 106, 'lp-direct: 图高取真实渲染高');
+  eq(rec.span, 416, 'lp-direct: 留白 = 图宽 + 间距');
+  eq(rec.lines.length, 2, 'lp-direct: 图高 106 盖住两行 60');
+
+  eq(tree.embed.style.position, 'absolute', 'lp-direct: embed 脱离流（中间的 static 被绝对定位接管）');
+  eq(tree.content.style.position, 'relative', 'lp-direct: content 成为包含块');
+  eq(tree.embed.style.top, '0px', 'lp-direct: top 沿用流里的原位置');
+  eq(tree.embed.style.right, '0px', 'lp-direct: 贴住右边');
+  eq(tree.embed.style.left, 'auto', 'lp-direct: 另一侧归零');
+  eq(tree.embed.style.width, '400px', 'lp-direct: 宽度落到行内样式');
+  eq(tree.embed.style.margin, '0', 'lp-direct: 清掉外边距');
+
+  ok(ledger.props(tree.embed).indexOf('position') >= 0, 'lp-direct: embed 的 position 走了账本（它当行用）');
+  eq(tree.lines[0].style.paddingRight, '416px', 'lp-direct: 第一行留白 416');
+  eq(tree.lines[1].style.paddingRight, '416px', 'lp-direct: 第二行留白 416');
+  eq(tree.lines[2].style.paddingRight, undefined, 'lp-direct: 图下面那行 paddingRight 归零');
+
+  const n = ledger.reset();
+  ok(n > 0, 'lp-direct: 复位有动作');
+  ok(tree.embed.style.position === undefined, 'lp-direct: 复位把 embed 的位置还回去');
+  ok(tree.content.style.position === undefined, 'lp-direct: 复位把 content 的位置还回去');
+  ok(tree.lines[0].style.paddingRight === undefined, 'lp-direct: 复位把第一行留白清掉');
+  ok(tree.lines[1].style.paddingRight === undefined, 'lp-direct: 复位把第二行留白清掉');
+
+  // 左浮动镜像
+  const left = cmTreeDirect();
+  const lrec = applyAll(left.host, { float: 'left' }, { svg: left.svg });
+  ok(!!lrec && lrec.mode === 'direct-embed', 'lp-direct: 左浮动同样走回退');
+  eq(left.embed.style.left, '0px', 'lp-direct: 左浮动贴左边');
+  eq(left.embed.style.right, 'auto', 'lp-direct: 左浮动的另一侧归零');
+  eq(left.lines[1].style.paddingLeft, '416px', 'lp-direct: 左浮动给行加 paddingLeft');
+  eq(left.lines[2].style.paddingLeft, undefined, 'lp-direct: 左浮动下图下方那行不留白');
+
+  // cfg.width 优先
+  const cfgW = cmTreeDirect();
+  const wrec = I.applyLivePreviewFloat(cfgW.host, { float: 'right', width: 300 }, { svg: cfgW.svg });
+  eq(wrec.width, 300, 'lp-direct: cfg.width 优先');
+  eq(wrec.span, 316, 'lp-direct: 留白跟着配置宽走');
+}
+
+function tDirectGuards() {
+  // 后面一行正文都没有：保留放弃逻辑，避免图被裁、scroll 高度塔缩
+  const solo = cmTreeDirect({ lineHeights: [] });
+  eq(I.applyLivePreviewFloat(solo.host, { float: 'right' }, {}), null,
+    'lp-direct: 后面没有正文行 → 直接放弃');
+  ok(solo.embed.style.position === undefined, 'lp-direct: 放弃时 embed 一点样式都不写');
+  ok(solo.content.style.position === undefined, 'lp-direct: 放弃时 content 也不动');
+
+  // 兄弟只有 .cm-gap / 另一个 widget：也算没有行
+  const gapOnly = cmTreeDirect({ lineHeights: [] });
+  gapOnly.embed.nextElementSibling = withClass(fakeEl(['cm-gap'], 12), ['cm-gap']);
+  eq(I.applyLivePreviewFloat(gapOnly.host, { float: 'right' }, {}), null,
+    'lp-direct: 兄弟只有 .cm-gap → 同样放弃');
+
+  const widgetOnly = cmTreeDirect({ lineHeights: [] });
+  widgetOnly.embed.nextElementSibling = withClass(fakeEl(['cm-embed-block'], 40), ['cm-embed-block']);
+  eq(I.applyLivePreviewFloat(widgetOnly.host, { float: 'right' }, {}), null,
+    'lp-direct: 兄弟只有另一个 widget → 同样放弃');
+
+  // center / inline 在新结构里也不动
+  const cn = cmTreeDirect();
+  eq(I.applyLivePreviewFloat(cn.host, { float: 'center' }, {}), null, 'lp-direct: center 不处理');
+  ok(cn.embed.style.position === undefined, 'lp-direct: center 时一点样式都不写');
+}
+
+function tWrappedPlan() {
+  // 行高随留白变：没留白时一行 25.6，加了 padding 就折成两行 51.2（真实浏览器就是这样）
+  const tree = cmTreeDirect({ lineHeights: [25.6, 25.6, 25.6, 25.6, 25.6] });
+  tree.lines.forEach((l) => {
+    l.getBoundingClientRect = () => {
+      const rows = parseFloat(l.style.paddingRight) > 0 ? 2 : 1;
+      const h = 25.6 * rows;
+      return { top: 0, left: 0, width: 820, height: h, right: 820, bottom: h };
+    };
+  });
+
+  const rec = I.applyLivePreviewFloat(tree.host, { float: 'right' }, { svg: tree.svg });
+  ok(!!rec, 'lp-wrap: 能施加');
+  eq(rec.lines.length, 3, 'lp-wrap: 按折行后的行高规划（不是按挤窄前的 5 行）');
+
+  // 试写量完必须复原：applyLivePreviewFloat 自己不写最终留白
+  ok(tree.lines[0].style.paddingRight === undefined, 'lp-wrap: 试写后复原第一行');
+  ok(tree.lines[3].style.paddingRight === undefined, 'lp-wrap: 图下方那行从来没被写过');
+
+  const pads = I.planLinePads([{ lines: rec.lines, side: rec.side, span: rec.span }],
+    { reader: () => ({ left: 0, right: 0 }) });
+  I.applyLinePads(pads, rec.ledger);
+  eq(tree.lines[0].style.paddingRight, '416px', 'lp-wrap: 重叠行留白');
+  eq(tree.lines[2].style.paddingRight, '416px', 'lp-wrap: 最后一行重叠的也留白');
+  ok(tree.lines[3].style.paddingRight === undefined, 'lp-wrap: 图下方那行 paddingRight 归零');
+  ok(tree.lines[4].style.paddingRight === undefined, 'lp-wrap: 再往下也不留白');
+
+  // 留白没改变高度时，结果与只读规划一致（回归）
+  const flat = cmTreeDirect();
+  const frec = I.applyLivePreviewFloat(flat.host, { float: 'right' }, { svg: flat.svg });
+  eq(frec.lines.length, 2, 'lp-wrap: 行高不变时还是按原高度算（两行 60 盖住 106）');
+
+  // 行本来就有内联 padding：试写时叠上去、复原回原值
+  const keep = cmTreeDirect({ lineHeights: [25.6, 25.6, 25.6] });
+  keep.lines[0].style.paddingRight = '4px';
+  keep.lines.forEach((l) => {
+    l.getBoundingClientRect = () => {
+      const rows = parseFloat(l.style.paddingRight) > 4 ? 2 : 1;
+      const h = 25.6 * rows;
+      return { top: 0, left: 0, width: 820, height: h, right: 820, bottom: h };
+    };
+  });
+  I.applyLivePreviewFloat(keep.host, { float: 'right' }, { svg: keep.svg });
+  eq(keep.lines[0].style.paddingRight, '4px', 'lp-wrap: 行原本的 padding 试写后原样还回去');
+}
+
 suite('live-float-lines', () => { tPlanLinesGuard(); tPlanLinesBasic(); tPlanLinesEdge(); });
 suite('live-float-pads', () => { tPlanPadsBasic(); tPlanPadsMerge(); tPlanPadsGuard(); tApplyPadsWrite(); tLedger(); });
 suite('live-float-dom', () => { tParts(); tClassHelpers(); tApplyGeometry(); tApplyGuards(); });
 suite('live-float-reset', () => { tResetThorough(); tAttach(); });
+suite('live-float-direct', () => {
+  tDirectParts(); tDirectCandidates(); tDirectApply(); tDirectGuards(); tWrappedPlan();
+});

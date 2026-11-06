@@ -2348,8 +2348,22 @@ function climbTo(el, name, limit) {
 /**
  * 从代码块渲染出的元素往上找 CM6 的三件东西：
  *   embed   .cm-embed-block  —— 要脱离流的那个盒子
- *   line    它的父 .cm-line  —— 原本 position: relative，会抢走包含块
+ *   line    「这一行」—— 默认是它的父 .cm-line；新版 Obsidian 没有这一层时就是 embed 自己
  *   content .cm-content      —— 变成包含块的那个
+ *
+ * 两种结构都认（实机祖先链差一整层，两种都出现过）：
+ *   结构一  content > .cm-line > .cm-embed-block   → mode 'cm-line'      （旧版 / 部分主题）
+ *   结构二  content > .cm-embed-block              → mode 'direct-embed' （Obsidian 1.13.7 实测）
+ *
+ * 结构二里没有 .cm-line 这一层：block widget 直接是 .cm-content 的子项，
+ * 它自己就跟后面的正文行平级。旧实现在「找 line」那一步返回 null，重试五轮后
+ * 静默放弃，一次样式都没施加过。这里把 embed 自己当成 line 返回：
+ * nextElementSibling 正好是后面第一行，位置关系跟旧结构一致，后续逻辑不用分叉。
+ *
+ * 注意 embed 自身 computed position 是 relative（Obsidian app.css 写死），
+ * 当 line 用时施加阶段必须照旧把它改掉，否则绝对定位的包含块会被它自己抢走。
+ *
+ * @returns {{embed:Element, line:Element, content:Element, mode:'cm-line'|'direct-embed'}|null}
  */
 function livePreviewParts(el) {
   if (!el) return null;
@@ -2357,10 +2371,17 @@ function livePreviewParts(el) {
   if (!embed) return null;
   const content = climbTo(embed, 'cm-content', CLIMB_LIMIT + 12);
   if (!content) return null;
+
+  /* 结构一：embed 在 .cm-line 里 —— 老路，先走它，不能被回退吃掉 */
   let line = embed.parentElement;
   if (!classHas(line, 'cm-line')) line = climbTo(embed, 'cm-line', CLIMB_LIMIT);
-  if (!line || line === content) return null;
-  return { embed, line, content };
+  if (line && line !== content) return { embed, line, content, mode: 'cm-line' };
+
+  /* 结构二：embed 直接挂在 .cm-content 下，中间没有 .cm-line —— 把它自己当这一行 */
+  const parent = embed.parentElement;
+  if (parent && parent === content) return { embed, line: embed, content, mode: 'direct-embed' };
+
+  return null;
 }
 
 /* --------------------------- 实时预览：诊断摘要 --------------------------- */
@@ -2372,10 +2393,17 @@ function livePreviewParts(el) {
 function lpPartsInfo(host, parts) {
   return {
     ok: !!parts,
+    /* 走了哪条结构分支：'cm-line'（embed 在 .cm-line 里）还是 'direct-embed'（回退） */
+    mode: parts ? (parts.mode || null) : null,
     found: parts ? ['embed', 'line', 'content'] : [],
     embed: parts && parts.embed ? dbgEl(parts.embed) : null,
     line: parts && parts.line ? dbgEl(parts.line) : null,
     content: parts && parts.content ? dbgEl(parts.content) : null,
+    lineIsEmbed: !!(parts && parts.line && parts.line === parts.embed),
+    /* 最终能用来绕排的正文行数：0 就是「后面一行都没有」，会走放弃分支 */
+    candidates: parts && parts.line
+      ? collectLineSiblings(parts.line.nextElementSibling, WRAP_LIMIT, parts.embed).length
+      : -1,
     host: dbgEl(host),
     chain: dbgChain(host, 7),
   };
@@ -2408,8 +2436,60 @@ function lpContentInfo(content) {
   };
 }
 
-/** 从 widget 那行的下一个兄弟起收集同级 .cm-line（不是行的兄弟跳过但继续走） */
-function collectLineSiblings(startEl, limit) {
+/** 采集正文行时一律排除的东西：CM6 的占位、浮层，以及别的 block widget */
+const WRAP_SKIP_CLASS = ['cm-gap', 'cm-embed-block', 'cm-widgetBuffer', 'cm-selectionLayer', 'cm-cursorLayer'];
+
+/** 类名数组；读不到（残缺的假 DOM 之类）返回 null，交给调用方决定怎么处理 */
+function classNamesOf(el) {
+  try {
+    if (!el) return null;
+    const cls = el.classList;
+    if (cls && typeof cls.length === 'number' && typeof cls.item === 'function') {
+      const out = [];
+      for (let i = 0; i < cls.length; i++) {
+        const name = String(cls.item(i) || '').trim();
+        if (name) out.push(name);
+      }
+      return out;
+    }
+    const raw = el.className;
+    if (typeof raw === 'string') return raw.trim() ? raw.trim().split(/\s+/) : [];
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 这个兄弟能不能当「正文行」用（给它加 padding 才有意义）。
+ *
+ * 主判据仍是 .cm-line（旧结构、以及新结构里的正文行都是它）。新版若把正文行换成
+ * 别的类名，放宽到这里只接「不带 cm- 前缀类名」的块：主题/编辑器可以叫 .HyperMD-xxx、
+ * .markdown-xxx，而那些都是正文块；CM6 自己的 cm-* 一律不当正文行（多半是 widget、
+ * 占位或浮层）。这样不会把所有 div 都收进来。
+ * 另一个 block widget 的 .cm-embed-block 也排除：它不是正文，绕排没有意义。
+ */
+function isWrapLine(el, exclude) {
+  if (!el || el === exclude) return false;
+  for (let i = 0; i < WRAP_SKIP_CLASS.length; i++) {
+    if (classHas(el, WRAP_SKIP_CLASS[i])) return false;
+  }
+  if (classHas(el, 'cm-line')) return true;
+  const names = classNamesOf(el);
+  if (!names) return false;                    // 连类名都读不到：不猜
+  if (!names.length) return true;              // 裸 div：正文块
+  for (let i = 0; i < names.length; i++) {
+    if (names[i].indexOf('cm-') === 0) return false;
+  }
+  return true;
+}
+
+/**
+ * 从 widget 那行的下一个兄弟起收集能绕排的正文行。
+ * 不是正文行的兄弟（另一个 widget、.cm-gap、浮层）跳过但继续往后走。
+ * exclude 是 widget 自己：万一调用方把起点给成了它，不会被当成正文行收进来。
+ */
+function collectLineSiblings(startEl, limit, exclude) {
   const out = [];
   const max = Number(limit) > 0 ? Number(limit) : WRAP_LIMIT;
   const steps = max * 4 + 8;
@@ -2417,9 +2497,22 @@ function collectLineSiblings(startEl, limit) {
   let n = 0;
   while (el && out.length < max && n < steps) {
     n++;
-    if (classHas(el, 'cm-line')) {
-      if (out.indexOf(el) < 0) out.push(el);
-    }
+    if (isWrapLine(el, exclude) && out.indexOf(el) < 0) out.push(el);
+    el = el.nextElementSibling;
+  }
+  return out;
+}
+
+/** 诊断：往后取几个兄弟的摘要，下一轮日志能看清正文行到底叫什么 */
+function siblingSamples(startEl, count) {
+  const out = [];
+  const max = Number(count) > 0 ? Number(count) : 6;
+  const steps = max * 4;
+  let el = startEl;
+  let n = 0;
+  while (el && out.length < max && n < steps) {
+    n++;
+    out.push(dbgEl(el));
     el = el.nextElementSibling;
   }
   return out;
@@ -2448,6 +2541,52 @@ function planLivePreviewLines(lines, height, opts) {
     if (out.indexOf(el) >= 0) continue;      // 同一行只留一次白
     out.push(el);
     acc += elHeight(el);
+    if (acc >= h) break;
+  }
+  return out;
+}
+
+/**
+ * 同 planLivePreviewLines，但每行的高度按「加了留白之后折行」量。
+ *
+ * 为什么不能直接用施加前的行高：留白把文字挤窄，长行会多折几行、变高。
+ * 按变高前的尺寸累加，会把图下面本来不重叠的行也算进去，结果图底下挂着一条
+ * 多余的右边距。做法是逐行试写留白、量真实高度、马上把行内样式还回去：
+ * 试写只碰候选行的 paddingRight/Left（这些行本来就要写），同一任务内复原，
+ * 最终写入仍由调用方的账本负责。
+ *
+ * 拿不到 style / 量不出高度时退回只读的 planLivePreviewLines。
+ */
+function planWrappedLines(lines, height, opts) {
+  const o = opts || {};
+  const h = Number(height);
+  const span = Number(o.span);
+  const side = o.side === 'left' ? 'left' : 'right';
+  const prop = side === 'left' ? 'paddingLeft' : 'paddingRight';
+  if (!Array.isArray(lines) || !(h > 0) || !(span > 0)) return planLivePreviewLines(lines, height, opts);
+  const limit = Number(o.limit) > 0 ? Number(o.limit) : WRAP_LIMIT;
+  const out = [];
+  let acc = 0;
+  for (let i = 0; i < lines.length && out.length < limit; i++) {
+    const el = lines[i];
+    if (!el) continue;
+    if (out.indexOf(el) >= 0) continue;
+    let measured = -1;
+    if (el.style && typeof el.style === 'object') {
+      const prev = el.style[prop] == null ? '' : String(el.style[prop]);
+      const base = Number(parseFloat(prev));
+      try {
+        el.style[prop] = round2((Number.isFinite(base) ? base : 0) + span) + 'px';
+        if (typeof el.getBoundingClientRect === 'function') measured = elHeight(el);
+      } catch (e) { measured = -1; }
+      try {
+        if (prev) el.style[prop] = prev;
+        else if (typeof el.style.removeProperty === 'function') el.style.removeProperty(cssName(prop));
+        else el.style[prop] = '';
+      } catch (e) { /* 复原失败也不能外抛 */ }
+    }
+    out.push(el);
+    acc += measured > 0 ? measured : elHeight(el);
     if (acc >= h) break;
   }
   return out;
@@ -2570,7 +2709,8 @@ function applyLinePads(pads, ledger) {
  * 对一张浮动图施加 Live Preview 版的「浮动」：定位三件套 + 算出该留白的行。
  * 只碰 opts.ledger 记账的样式，调用方负责在重算前 ledger.reset()。
  *
- * @returns {{host,embed,line,content,side,width,height,span,top,lines,ledger}|null}
+ * @returns {{host,embed,line,content,side,mode,width,height,span,top,lines,ledger}|null}
+ *   mode：'cm-line' | 'direct-embed'，走了哪条结构分支（两边都会施加同样的定位三件套）
  */
 function applyLivePreviewFloat(host, cfg, opts) {
   const o = opts || {};
@@ -2606,14 +2746,29 @@ function applyLivePreviewFloat(host, cfg, opts) {
   /* 1) 后面根本没有行可绕：干脆不动手。把 embed 改成 absolute 会让它那行塌成 0 高，
    *    而后面又没有内容撑着，.cm-content 的滚动高度会跟着缩，图可能被裁掉。
    *    阅读视图遇到同样情况（没有后续兄弟）也是直接放弃。 */
-  const candidates = collectLineSiblings(line.nextElementSibling, o.maxLines);
+  const candidates = collectLineSiblings(line.nextElementSibling, o.maxLines, embed);
   dbg('apply.candidates', () => ({
+    mode: parts.mode,
     count: candidates.length,
     next: dbgEl(line.nextElementSibling),
+    lineIsEmbed: line === embed,
     lineIsDirectChildOfContent: !!line.parentElement && line.parentElement === content,
     lineNext: candidates.length ? dbgEl(candidates[0]) : null,
+    siblings: siblingSamples(line.nextElementSibling, 6),
   }));
-  if (!candidates.length) { dbgNull('apply.null', 'apply.noCandidates'); return null; }
+  /* 后面一行正文都没有：不动手（否则 embed 脱离流后那行塌成 0 高，图会被裁、scroll 高度塌缩）。
+   * 日志单独一条，一眼能看出放弃是因为「没有行」，不是结构没认出来。 */
+  if (!candidates.length) {
+    dbg('apply.giveup', () => ({
+      at: 'no-candidates',
+      mode: parts.mode,
+      line: dbgEl(line),
+      next: dbgEl(line.nextElementSibling),
+      siblings: siblingSamples(line.nextElementSibling, 6),
+    }));
+    dbgNull('apply.null', 'apply.noCandidates');
+    return null;
+  }
 
   /* 2) 定位上下文：.cm-line 原本是 relative，会把绝对定位的包含块抢到自己身上，
    *    那样 widget 只能相对这一行定位，后面的行永远绕不上来。 */
@@ -2660,8 +2815,10 @@ function applyLivePreviewFloat(host, cfg, opts) {
    *    留白要按此刻的真实高度算。 */
   const height = elHeight(embed) || elHeight(host) || eRect.height;
 
-  /* 6) 从 widget 那行的下一个 .cm-line 起逐行留白，累积够图高就停 */
-  const lines = planLivePreviewLines(candidates, height, { limit: o.maxLines });
+  /* 6) 从 widget 那行的下一个正文行起逐行留白，累积够图高就停。
+   *    高度按「加了留白、真的折行之后」量：留白会把长行挤窄，不改量法会把
+   *    图下方本来不重叠的行也算进去。 */
+  const lines = planWrappedLines(candidates, height, { limit: o.maxLines, span: width + gap, side });
 
   dbg('apply.after', () => ({
     height: round2(height),
@@ -2677,15 +2834,19 @@ function applyLivePreviewFloat(host, cfg, opts) {
   }));
 
   dbg('apply.planLines', () => ({
+    mode: parts.mode,
     candidates: candidates.length,
     lines: lines.length,
+    wrapped: true,
     height: round2(height),
+    span: round2(width + gap),
     maxLines: Number(o.maxLines) > 0 ? Number(o.maxLines) : null,
-    lineHeights: lines.slice(0, 4).map((el) => elHeight(el)),
+    lineHeights: lines.slice(0, 6).map((el) => elHeight(el)),
   }));
 
   return {
     host, embed, line, content, side,
+    mode: parts.mode,
     width: round2(width),
     height: round2(height),
     span: round2(width + gap),
