@@ -203,6 +203,101 @@ function dbgChain(el, depth) {
   return out;
 }
 
+/* --------------- 深度读数（留白到底有没有落到文字宽度上） --------------- */
+
+/** className 原文（截 80 字符）。dbgEl 给的是点连摘要，这里要原样类名。 */
+function dbgClass(el) {
+  try { return classNameOf(el).trim().slice(0, 80); } catch (e) { return ''; }
+}
+
+/** 元素是否还在文档里。读不到 isConnected 就当不在（假 DOM 常常没这个字段）。 */
+function dbgConnected(el) {
+  try { return el ? el.isConnected !== false : false; } catch (e) { return false; }
+}
+
+/** 行内 padding 两侧原样值（读 element.style，不是 computed） */
+function dbgInlinePad(el) {
+  const out = { left: '', right: '' };
+  try {
+    if (!el || !el.style) return out;
+    out.left = dbgInline(el, 'paddingLeft');
+    out.right = dbgInline(el, 'paddingRight');
+  } catch (e) { /* ignore */ }
+  return out;
+}
+
+/**
+ * 盒模型读数：clientWidth（内容区 + padding）、边框盒宽、computed width / box-sizing。
+ * 分辨「B：值写在元素上但没作用到文字宽度」全靠这几个数。
+ */
+function dbgBox(el) {
+  const out = { clientWidth: null, rectWidth: null, cssWidth: '', boxSizing: '' };
+  try {
+    if (!el) return out;
+    const cw = Number(el.clientWidth);
+    if (Number.isFinite(cw) && el.clientWidth !== undefined) out.clientWidth = cw;
+    const r = dbgRect(el);
+    if (r) out.rectWidth = r.w;
+    const cs = computedOf(el);
+    if (cs) {
+      try { out.cssWidth = String(cs.width == null ? '' : cs.width); } catch (e) { out.cssWidth = ''; }
+      try { out.boxSizing = String(cs.boxSizing == null ? '' : cs.boxSizing); } catch (e) { out.boxSizing = ''; }
+    }
+  } catch (e) { /* ignore */ }
+  return out;
+}
+
+/**
+ * 元素内文字的几何边界：Range 选中全部内容，取所有 client rect 的极值。
+ * 这是「文字到底画到哪」最直接的读数：padding / width 推算都可能骗人，这个不会。
+ * 拿不到 Range（假 DOM / 离屏节点）时各字段是 null。
+ */
+function dbgTextExtent(el) {
+  const out = { right: null, left: null, top: null, bottom: null, rects: 0 };
+  try {
+    if (!el) return out;
+    const doc = el.ownerDocument && typeof el.ownerDocument.createRange === 'function'
+      ? el.ownerDocument
+      : (typeof document !== 'undefined' && document && typeof document.createRange === 'function'
+        ? document : null);
+    if (!doc) return out;
+    const range = doc.createRange();
+    if (!range || typeof range.selectNodeContents !== 'function') return out;
+    range.selectNodeContents(el);
+    if (typeof range.getClientRects !== 'function') return out;
+    const list = range.getClientRects();
+    if (!list || !list.length) return out;
+    let right = -Infinity;
+    let left = Infinity;
+    let top = Infinity;
+    let bottom = -Infinity;
+    let n = 0;
+    for (let i = 0; i < list.length; i++) {
+      const r = list[i];
+      if (!r) continue;
+      const rr = Number(r.right);
+      const rl = Number(r.left);
+      if (!Number.isFinite(rr) || !Number.isFinite(rl)) continue;
+      const rt = Number(r.top);
+      const rb = Number(r.bottom);
+      // 折叠位置会产生零尺寸 rect，让它参与极值会把 left/right 拉歪
+      if (!(rr - rl > 0) && !(rb - rt > 0)) continue;
+      if (rr > right) right = rr;
+      if (rl < left) left = rl;
+      if (Number.isFinite(rt) && rt < top) top = rt;
+      if (Number.isFinite(rb) && rb > bottom) bottom = rb;
+      n++;
+    }
+    if (!n) return out;
+    out.right = round1(right);
+    out.left = round1(left);
+    out.top = Number.isFinite(top) ? round1(top) : null;
+    out.bottom = Number.isFinite(bottom) ? round1(bottom) : null;
+    out.rects = n;
+  } catch (e) { /* 拿不到就算了，不能外抛 */ }
+  return out;
+}
+
 /* ------------------------------ 记录与落盘 ------------------------------ */
 
 function push(point, data) {
@@ -424,4 +519,9 @@ module.exports = {
   dbgCount,
   dbgReset,
   dbgFlush,
+  dbgClass,
+  dbgConnected,
+  dbgInlinePad,
+  dbgBox,
+  dbgTextExtent,
 };
