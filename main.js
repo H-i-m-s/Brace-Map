@@ -44,6 +44,7 @@ let LP_DEBOUNCE, LP_POLL, LP_RETRY, LP_RESET_DELAY, classHas, climbTo, livePrevi
   planLivePreviewLines, planWrappedLines, planLinePads, applyLinePads, createStyleLedger, padBaseOf,
   padReaderOf, applyLivePreviewFloat, findEditorView, attachLivePreviewFloat, flushLivePreviewFloats,
   livePreviewManagerCount;
+let CSS_FLOAT_BOTTOM_GAP, cssFloatMargin, setImportantStyle, applyLivePreviewCssFloat, createCssFloatControl;
 /* 临时诊断（Live Preview 图文混排）：见 src/debug.js。DEBUG_LP 关掉后全为空转。 */
 let DEBUG_LP, DEBUG_FILE, DEBUG_LINE_MAX, DEBUG_FIELD_MAX, dbg, dbgNull, dbgConfigure, dbgEl, dbgRect, dbgCss,
   dbgInline, dbgInlineAll, dbgChildCount, dbgFirstChild, dbgChain, dbgText, dbgCount, dbgReset, dbgFlush;
@@ -2401,23 +2402,32 @@ function attachFloatWrap(host, cfg, opts) {
 }
 
 /* ============================================================
- * 实时预览（CM6）：每行独立，float 跨不了行
+ * 实时预览（CM6）：两条路，按结构分派
  *
- * 阅读视图那套「脱离流 + 给后续兄弟加外边距」在这里不成立：CM6 把正文切成
- * 一个个 .cm-line，widget 浮在自己那一行里，后面的行跟它没有兄弟关系，
- * float 再正确也不会有文字绕上来。真正的做法是让 widget 相对整个 .cm-content 定位：
+ * 结构一 direct-embed（Obsidian 1.13.7 实测）
+ *     .cm-content > .cm-embed-block > host
+ *   .cm-content 是 flex item，自成格式化上下文 → 原生 float 完整可用。
+ *   走纯 CSS float：只写 float / width / margin，零 JS 布局、零观察者、零定时器。
+ *   见后面「实时预览：纯 CSS float」。
  *
- *   1. widget 所在的 .cm-line 设 position: static（它原本是 relative，
- *      会抢走绝对定位的包含块）
- *   2. .cm-content 设 position: relative，成为包含块
- *   3. .cm-embed-block 设 position: absolute，top 沿用它在流里的原位置，
- *      右浮动贴 right: 0、左浮动贴 left: 0
- *   4. 从 widget 那行的下一行起逐行加 paddingRight / paddingLeft，
- *      累积高度超过图高就停 —— 图下面那行不留白
+ * 结构二 cm-line（旧版 / 部分主题）
+ *     .cm-content > .cm-line > .cm-embed-block > host
+ *   阅读视图那套「脱离流 + 给后续兄弟加外边距」在这里不成立：CM6 把正文切成
+ *   一个个 .cm-line，widget 浮在自己那一行里，后面的行跟它没有兄弟关系，
+ *   float 再正确也不会有文字绕上来。真正的做法是让 widget 相对整个 .cm-content 定位：
  *
- * CM6 是虚拟滚动的，滚动、输入、折叠都会增删 .cm-line，加上的样式随时会丢。
- * 所以每次施加都先整体复位上一轮、再重算一遍，由挂在编辑器根节点上的
- * MutationObserver 驱动（150ms 合并），施加完调一次 requestMeasure 让 CM6 重新量行高。
+ *     1. widget 所在的 .cm-line 设 position: static（它原本是 relative，
+ *        会抢走绝对定位的包含块）
+ *     2. .cm-content 设 position: relative，成为包含块
+ *     3. .cm-embed-block 设 position: absolute，top 沿用它在流里的原位置，
+ *        右浮动贴 right: 0、左浮动贴 left: 0
+ *     4. 从 widget 那行的下一行起逐行加 paddingRight / paddingLeft，
+ *        累积高度超过图高就停 —— 图下面那行不留白
+ *
+ *   这条路下的节拍：CM6 是虚拟滚动的，滚动、输入、折叠都会增删 .cm-line，
+ *   加上的样式随时会丢。每次施加先整体复位上一轮再重算，由挂在编辑器根节点上的
+ *   MutationObserver 驱动（150ms 合并），施加完调一次 requestMeasure 让 CM6
+ *   重新量行高。direct-embed 结构不进这条路，这套机制只在老结构里跑。
  * ============================================================ */
 
 /** MutationObserver 到重算之间的合并窗口（ms）。滚动时每帧都变，不合并会卡。 */
@@ -2462,8 +2472,9 @@ function climbTo(el, name, limit) {
  * 静默放弃，一次样式都没施加过。这里把 embed 自己当成 line 返回：
  * nextElementSibling 正好是后面第一行，位置关系跟旧结构一致，后续逻辑不用分叉。
  *
- * 注意 embed 自身 computed position 是 relative（Obsidian app.css 写死），
- * 当 line 用时施加阶段必须照旧把它改掉，否则绝对定位的包含块会被它自己抢走。
+ * 注意 embed 自身 computed position 是 relative（Obsidian app.css 写死）。
+ * 老结构当 line 用时，施加阶段必须把它改掉，否则绝对定位的包含块会被它自己抢走；
+ * direct-embed 结构走纯 CSS float，position 不用动（浮动元素带 relative 不影响排版）。
  *
  * @returns {{embed:Element, line:Element, content:Element, mode:'cm-line'|'direct-embed'}|null}
  */
@@ -3201,6 +3212,216 @@ function dbgPadTargets(pads, expectMap, blocks, records, ledger, content) {
   return n;
 }
 
+/* --------------------------- 实时预览：纯 CSS float --------------------------- */
+
+/**
+ * direct-embed 结构（.cm-embed-block 直接挂在 .cm-content 下）的浮动：一条 float
+ * 声明交给浏览器排版，零 JS 布局。
+ *
+ * 这条路能成立，靠的是 Obsidian 自己的布局（app.css 实测）：
+ *   .cm-sizer             display: flex; flex-direction: column
+ *   .cm-contentContainer  display: flex
+ *   .cm-content           一个 flex item（width: 0 + flex-grow）
+ * `.cm-content` 是 flex 容器的子项，flex item 天然建立独立的格式化上下文 —— 浮动元素
+ * 在这里有正常语义：被容器框住、高度由引擎算进文档流。文档高度稳定，滚动就不抖。
+ *
+ * 阅读视图那条路不能这么干：那边的宿主是 flex 容器的直接子项，float 被规范作废，
+ * 所以必须继续用「绝对定位 + 给后续兄弟加外边距」。两条路各走各的，互不干扰。
+ *
+ * 这条路上一个 JS 布局都不做：不绝对定位、不算 top、不给 .cm-line 加 padding、
+ * 不动 .cm-content 的 position。写下的属性全部记账，卸载 / 图被删时原样还回去。
+ */
+
+/** 浮动图与下方正文的纵向间距（px） */
+const CSS_FLOAT_BOTTOM_GAP = 8;
+
+/**
+ * 浮动图的间距写法：右浮动留左边距、左浮动留右边距（文字在那一边绕上来），
+ * 下边给一点，免得图下面紧跟的文字顶着图底。
+ */
+function cssFloatMargin(side, gap) {
+  const g = round2(Number(gap) > 0 ? Number(gap) : FLOAT_GAP);
+  const b = CSS_FLOAT_BOTTOM_GAP;
+  return side === 'left'
+    ? '0 ' + g + 'px ' + b + 'px 0'
+    : '0 0 ' + b + 'px ' + g + 'px';
+}
+
+/**
+ * 写一条行内样式，带 !important。
+ *
+ * 为什么必须带：app.css 里有
+ *   `.markdown-source-view.mod-cm6 .cm-content > * { margin: 0 !important; display: block; }`
+ * 浮动图的宿主就是 `.cm-content` 的直接子项，行内普通声明打不过作者 !important，
+ * 间距会被抹成 0（图贴着文字）。行内 !important 在作者 !important 之上，是唯一
+ * 不改主题也能让间距生效的写法。其余属性照旧用普通行内值。
+ */
+function setImportantStyle(el, prop, value) {
+  if (!el || !el.style) return null;
+  const prev = el.style[prop] == null ? '' : String(el.style[prop]);
+  try {
+    if (typeof el.style.setProperty === 'function') el.style.setProperty(cssName(prop), value, 'important');
+    else el.style[prop] = value;
+  } catch (e) {
+    return null;
+  }
+  return { el, prop, cssProp: cssName(prop), prev };
+}
+
+/**
+ * 给一张浮动图写纯 CSS float。只认 direct-embed 结构；老结构（embed 在 .cm-line 里）
+ * 返回 null，交给原来的绝对定位实现。
+ *
+ * 写的属性（都记原值、可还原）：
+ *   embed  float / width / margin(!important)
+ *   host   float:none / margin:0 / display:flow-root
+ * host 必须一起收拾：applyFloatLayout 已经把它设成 float:right + margin，留着的话
+ * 图会先被自己的 margin 往里推，贴不到正文列边界，留的间距也被这层 margin 吃掉。
+ * flow-root 让它自成一块，内部 .brace-map-block 的上下 margin 不外溢。
+ *
+ * @returns {{mode,side,width,margin,host,embed,content,styles}|null}
+ */
+function applyLivePreviewCssFloat(host, cfg, opts) {
+  const o = opts || {};
+  const mode = cfg && cfg.float;
+  const side = mode === 'left' ? 'left' : (mode === 'right' ? 'right' : '');
+  if (!side) return null;                                   // center / inline 维持现状
+  const parts = livePreviewParts(host);
+  if (!parts || parts.mode !== 'direct-embed') return null;  // 老结构走绝对定位那条
+  const embed = parts.embed;
+  const content = parts.content;
+  if (!embed || !embed.style || !content) return null;
+
+  /* 图宽：配置优先，没写就用 SVG 实际渲染宽；超了正文列宽就收到列宽 */
+  const svgRect = o.svg ? rectOf(o.svg) : null;
+  const eRect = rectOf(embed);
+  const natural = svgRect && svgRect.width > 0 ? svgRect.width : (eRect && eRect.width > 0 ? eRect.width : 0);
+  const want = Number(cfg.width) > 0 ? Number(cfg.width) : natural;
+  const cRect = rectOf(content);
+  const boxW = Number(content.clientWidth) > 0
+    ? Number(content.clientWidth)
+    : (cRect && cRect.width > 0 ? cRect.width : 0);
+  let width = want > 0 ? want : boxW;
+  if (!(width > 0)) return null;                             // 连宽度都量不到：不动手
+  if (boxW > 0 && width > boxW) width = boxW;
+  width = round2(Math.max(1, width));
+
+  const margin = cssFloatMargin(side, o.gap);
+  const styles = [];
+  const put = (el, prop, value, important) => {
+    if (!el || !el.style) return;
+    const s = important ? setImportantStyle(el, prop, value) : setInlineStyle(el, prop, value);
+    if (s) styles.push(s);
+  };
+
+  put(embed, 'float', side);
+  put(embed, 'width', width + 'px');
+  put(embed, 'margin', margin, true);
+  put(host, 'float', 'none');
+  put(host, 'margin', '0');
+  put(host, 'display', 'flow-root');
+
+  return { mode: parts.mode, side, width, margin, host, embed, content, styles };
+}
+
+/** 诊断：新路径的点位记录（结构分支 / 写了哪些样式 / 图 rect / content 高度） */
+function cssFloatInfo(rec, applies) {
+  const e = rectOf(rec.embed);
+  const c = rec.content ? rectOf(rec.content) : null;
+  const eBottom = e ? round2(e.top + e.height) : null;
+  const cBottom = c ? round2(c.top + c.height) : null;
+  let scrollH = null;
+  try { scrollH = Number(rec.content.scrollHeight) || 0; } catch (err) { scrollH = null; }
+  return {
+    mode: rec.mode,
+    side: rec.side,
+    width: rec.width,
+    margin: rec.margin,
+    applies,
+    /* 实际写下去的样式（值取自元素，避免和记账对不上） */
+    styles: {
+      embed: ['float:' + rec.side, 'width:' + rec.width + 'px', 'margin:' + rec.margin + '!important'],
+      host: ['float:none', 'margin:0', 'display:flow-root'],
+      count: rec.styles.length,
+    },
+    embed: dbgEl(rec.embed),
+    embedRect: dbgRect(rec.embed),
+    embedBottom: eBottom,
+    content: dbgEl(rec.content),
+    contentRect: dbgRect(rec.content),
+    contentH: c ? round2(c.height) : null,
+    contentBottom: cBottom,
+    contentScrollH: scrollH,
+    /* ≥0 表示容器把浮动元素框住了（高度含图高）；<0 就是图漏出了容器底边 */
+    bottomSlack: (cBottom != null && eBottom != null) ? round2(cBottom - eBottom) : null,
+  };
+}
+
+/**
+ * direct-embed 的浮动控制器，形状与其他路径一致（host / update / dispose / state）。
+ *
+ * 没有观察者、没有定时器、没有巡检、没有账本、没有延迟复位 —— CSS 是声明式的，
+ * 这里只剩一件真事：谁在什么时候把样式还回去。update 先还原再写，重复调用不会
+ * 把上一轮的值当成「原值」。
+ */
+const lpCssLive = new Set();          // 活着的控制器（卸载时要一起还原）
+
+function createCssFloatControl(host, cfg, opts) {
+  const o = opts || {};
+  let record = null;
+  let disposed = false;
+  let applies = 0;
+  let api = null;
+
+  const clear = () => {
+    if (!record) return 0;
+    const n = restoreStyles(record.styles);
+    record = null;
+    return n;
+  };
+
+  const apply = () => {
+    if (disposed) return null;
+    clear();                            // 先还原再写：update 不会把我们的值记成原值
+    let next = null;
+    try { next = applyLivePreviewCssFloat(host, cfg, o); } catch (e) { next = null; }
+    record = next;
+    applies++;
+    if (next) dbg('lpf.css', () => cssFloatInfo(next, applies));
+    else dbgNull('lpf.css.null', 'css.no-record');
+    return next;
+  };
+
+  api = {
+    host,
+    kind: 'css-float',
+    update() { if (!disposed) apply(); return !!record; },
+    dispose() {
+      if (disposed) return false;
+      disposed = true;
+      const restored = clear();
+      lpCssLive.delete(api);
+      dbg('lpf.css.dispose', () => ({ host: dbgEl(host), restored, applies }));
+      return true;
+    },
+    state() {
+      return {
+        kind: 'css-float',
+        attached: !disposed,
+        mode: record ? record.mode : null,
+        side: record ? record.side : null,
+        width: record ? record.width : 0,
+        styles: record ? record.styles.length : 0,
+        applies,
+      };
+    },
+  };
+
+  apply();
+  lpCssLive.add(api);
+  return api;
+}
+
 /* --------------------------- 实时预览：施加 --------------------------- */
 
 /**
@@ -3222,6 +3443,9 @@ function applyLivePreviewFloat(host, cfg, opts) {
   const parts = livePreviewParts(host);
   dbg('apply.parts', () => lpPartsInfo(host, parts));
   if (!parts) { dbgNull('apply.null', 'apply.parts'); return null; }
+  /* direct-embed 结构不走这里：它归纯 CSS float（applyLivePreviewCssFloat）。
+   * 「绝对定位 + 逐行留白」只服务 embed 在 .cm-line 里的老结构。 */
+  if (parts.mode !== 'cm-line') { dbgNull('apply.null', 'apply.direct-embed'); return null; }
   const embed = parts.embed;
   const line = parts.line;
   const content = parts.content;
@@ -3689,8 +3913,8 @@ function createLivePreviewManager(content, seed) {
 }
 
 /**
- * 插件卸载 / 页面关掉：把所有待复位的 manager 当场同步复位。
- * 不走延迟 —— 卸载后没人会来接管，留着定时器就是脏样式 + 泄漏。
+ * 插件卸载 / 页面关掉：把所有待复位的 manager 和纯 CSS 浮动控制器当场同步复位。
+ * 卸载后没人会来接管，留着定时器就是脏样式 + 泄漏。
  */
 function flushLivePreviewFloats() {
   const list = Array.from(lpLive);
@@ -3698,6 +3922,10 @@ function flushLivePreviewFloats() {
   for (const m of list) {
     if (!m || typeof m.flush !== 'function') continue;
     try { m.flush(); n++; } catch (e) { /* ignore */ }
+  }
+  /* direct-embed 的纯 CSS 控制器：没有定时器，只需要把行内样式还回去 */
+  for (const c of Array.from(lpCssLive)) {
+    try { if (c && typeof c.dispose === 'function' && c.dispose()) n++; } catch (e) { /* ignore */ }
   }
   return n;
 }
@@ -3720,6 +3948,7 @@ function attachLivePreviewFloat(host, cfg, opts) {
 
   const widget = { host, cfg, svg: o.svg, gap: o.gap, opts: o };
   let manager = null;
+  let control = null;          // direct-embed：纯 CSS float 的控制器（不建 manager）
   let disposed = false;
   let attempt = 0;
   let retry = 0;
@@ -3743,7 +3972,7 @@ function attachLivePreviewFloat(host, cfg, opts) {
 
   function attach() {
     retry = 0;
-    if (disposed || manager) return;
+    if (disposed || manager || control) return;
     const parts = livePreviewParts(host);
     if (!parts) {
       dbg('lpf.wait', () => ({
@@ -3759,6 +3988,12 @@ function attachLivePreviewFloat(host, cfg, opts) {
       return;                              // 还没插进文档，稍后再试
     }
     dbg('lpf.parts', () => lpPartsInfo(host, parts));
+    /* direct-embed：纯 CSS float。不建 manager、不观察、不定时、不给任何行加 padding */
+    if (parts.mode === 'direct-embed') {
+      control = createCssFloatControl(host, cfg, o);
+      dbg('lpf.attach.done', () => ({ attempt, branch: 'css-float', state: control.state() }));
+      return;
+    }
     let m = lpManagers.get(parts.content);
     if (m) {
       // 已经收尾的旧 manager 不能复用（它连账本都清空了）
@@ -3781,8 +4016,9 @@ function attachLivePreviewFloat(host, cfg, opts) {
   return {
     host,
     update: () => {
-      dbg('lpf.update', () => ({ hasManager: !!manager, disposed }));
+      dbg('lpf.update', () => ({ hasManager: !!manager, hasCss: !!control, disposed }));
       if (disposed) return;
+      if (control) { control.update(); return; }
       if (manager && manager.state().attached === false) manager = null;   // 已收尾的旧 manager
       if (manager) manager.refresh();
       else attach();
@@ -3790,13 +4026,19 @@ function attachLivePreviewFloat(host, cfg, opts) {
     dispose: () => {
       if (disposed) return;
       disposed = true;
-      dbg('lpf.dispose', () => ({ host: dbgEl(host), hadManager: !!manager }));
+      dbg('lpf.dispose', () => ({ host: dbgEl(host), hadManager: !!manager, hadCss: !!control }));
       stopRetry();
+      if (control) {                       // 纯 CSS：当场还原，不留观察者与定时器
+        const c = control;
+        control = null;
+        c.dispose();
+        return;
+      }
       const m = manager;
       manager = null;
       if (m) m.detach(widget);
     },
-    state: () => (manager ? manager.state() : { attached: false, side }),
+    state: () => (control ? control.state() : (manager ? manager.state() : { attached: false, side })),
   };
 }
 
@@ -3876,6 +4118,12 @@ module.exports = {
   flushLivePreviewFloats,
   livePreviewManagerCount,
   planWrappedLines,
+  // 实时预览（CM6）：direct-embed 走纯 CSS float
+  CSS_FLOAT_BOTTOM_GAP,
+  cssFloatMargin,
+  setImportantStyle,
+  applyLivePreviewCssFloat,
+  createCssFloatControl,
   pxValue,
   setInlineStyle,
   restoreStyles,
@@ -6455,7 +6703,9 @@ function loadModules() {
      collectLineSiblings, planLivePreviewLines, planWrappedLines, planLinePads, applyLinePads,
      createStyleLedger, padBaseOf, padReaderOf, applyLivePreviewFloat, findEditorView,
      attachLivePreviewFloat, flushLivePreviewFloats,
-     livePreviewManagerCount } = req('src/float.js'));
+     livePreviewManagerCount,
+     CSS_FLOAT_BOTTOM_GAP, cssFloatMargin, setImportantStyle, applyLivePreviewCssFloat,
+     createCssFloatControl } = req('src/float.js'));
 
   // 临时诊断（Live Preview 图文混排）：开关与日志器都在 src/debug.js
   ({ DEBUG_LP, DEBUG_FILE, LINE_MAX: DEBUG_LINE_MAX, FIELD_MAX: DEBUG_FIELD_MAX, dbg, dbgNull,
@@ -6959,7 +7209,7 @@ function buildInternals() {
   setInlineStyle,
   elHeight,
   isLivePreview,
-  // 实时预览（CM6）：每行独立，靠绝对定位 + 逐行 padding 模拟浮动
+  // 实时预览（CM6）：老结构（embed 在 .cm-line 里）靠绝对定位 + 逐行 padding
   LP_DEBOUNCE,
   LP_POLL,
   LP_RETRY,
@@ -6980,6 +7230,12 @@ function buildInternals() {
   padBaseOf,
   padReaderOf,
   planWrappedLines,
+  // 实时预览（CM6）：新结构（direct-embed）走纯 CSS float
+  CSS_FLOAT_BOTTOM_GAP,
+  cssFloatMargin,
+  setImportantStyle,
+  applyLivePreviewCssFloat,
+  createCssFloatControl,
   findEditorViewOf,
   // 临时诊断（Live Preview 图文混排）：排查完成后整组删掉
   DEBUG_LP,

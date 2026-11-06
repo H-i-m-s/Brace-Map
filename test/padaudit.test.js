@@ -48,8 +48,11 @@ function linkChain(list) {
 }
 
 /**
- * 复刻 Obsidian 1.13.7 的结构：.cm-content > .cm-embed-block > host，
- * 后面接三行 .cm-line。图贴右侧（嵌入块 rect.left = 623.5），与现场日志一致。
+ * 复刻老结构：.cm-content > .cm-line > .cm-embed-block > host，
+ * widget 那行后面接三行 .cm-line。图贴右侧（嵌入块 rect.left = 623.5），与现场日志一致。
+ *
+ * 绝对定位 + 逐行留白这套现在只服务老结构（新结构的 direct-embed 走纯 CSS float），
+ * 所以诊断也只在这里跑。
  */
 function tree(opts) {
   const o = opts || {};
@@ -57,11 +60,16 @@ function tree(opts) {
     { top: 0, left: 0, width: 940, height: 2000, right: 940, bottom: 2000 });
   content.clientWidth = 940;
 
+  const widgetLine = fakeEl(['cm-line'], 0,
+    { top: 177.2, left: 0, width: 940, height: 0, right: 940, bottom: 177.2 });
+  widgetLine.className = 'cm-line';
+  widgetLine.parentElement = content;
+
   const embedH = o.embedH == null ? 190.8 : o.embedH;
   const embed = fakeEl(['cm-embed-block'], embedH,
     { top: 177.2, left: 623.5, width: 300, height: embedH, right: 923.5, bottom: 177.2 + embedH });
   embed.className = 'cm-embed-block markdown-rendered';
-  embed.parentElement = content;
+  embed.parentElement = widgetLine;
 
   const host = fakeEl([], embedH,
     { top: 177.2, left: 623.5, width: 300, height: embedH, right: 923.5, bottom: 177.2 + embedH });
@@ -78,9 +86,9 @@ function tree(opts) {
     return el;
   });
   linkChain(lines);
-  embed.nextElementSibling = lines[0] || null;
+  widgetLine.nextElementSibling = lines[0] || null;
 
-  return { content, embed, host, svg, lines };
+  return { content, line: widgetLine, embed, host, svg, lines };
 }
 
 /** 给元素装一个假 Range：文字右边界固定为 right（单位 px） */
@@ -222,7 +230,7 @@ function tAuditSilentWithoutPads() {
   I.flushLivePreviewFloats();
   I.dbgReset();
   const t = tree();
-  t.embed.nextElementSibling = null;
+  t.line.nextElementSibling = null;
   const ctl = I.attachLivePreviewFloat(t.host, { float: 'right' }, { svg: t.svg });
   ok(!!ctl, 'pad-silent: 控制器挂上（图本身照样定位）');
   eq(points('lp.padAudit').length, 0, 'pad-silent: 没有留白目标就不记汇总');
