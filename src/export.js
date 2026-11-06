@@ -213,7 +213,7 @@ function colorAlpha(color) {
 
 /**
  * PNG 背景色：从 svg 往上找第一个 alpha > 0 的背景色，找到 body 也没有就用白色。
- * 页面上的图是透明底、字色跟主题走，透明 PNG 贴进白底文档里会整片看不见。
+ * 只在显式要求 "主题底" 时用；默认导出是透明的。
  */
 function pickExportBg(svg) {
   const body = typeof document !== 'undefined' ? document.body : null;
@@ -228,6 +228,25 @@ function pickExportBg(svg) {
     el = el.parentElement || null;
   }
   return '#ffffff';
+}
+
+/**
+ * 决定 PNG 要不要铺底。
+ *
+ * 返回 null 表示保持 canvas 透明的 alpha 通道。
+ *   （不写）      透明，默认
+ *   none / transparent  透明
+ *   theme / auto        取页面主题底色（浅色字贴到白纸上也能看清）
+ *   #fff / white / ...  指定颜色
+ *
+ * 以前的实现一律铺主题底色，导出的 PNG 就永远不是真透明，贴到别处
+ * 还得再抠一次。要用哪个由用户写指令决定。
+ */
+function resolveExportBg(svg, mode) {
+  const m = String(mode == null ? '' : mode).trim().toLowerCase();
+  if (!m || m === 'none' || m === 'transparent' || m === 'alpha') return null;
+  if (m === 'theme' || m === 'auto') return pickExportBg(svg);
+  return mode;                      // 其余当颜色值，写错就让 canvas 忽略、退回透明
 }
 
 function pad2(n) {
@@ -257,7 +276,8 @@ function svgPixelSize(svg) {
   };
 }
 
-function exportPng(svg, fileName) {
+function exportPng(svg, fileName, opts) {
+  const o = opts || {};
   let clone;
   try {
     clone = cloneWithInlineStyles(svg);
@@ -276,7 +296,8 @@ function exportPng(svg, fileName) {
 
   const w = Math.round(size.w * PNG_SCALE);
   const h = Math.round(size.h * PNG_SCALE);
-  const bg = pickExportBg(svg);
+  // null = 不铺底，保留 alpha
+  const bg = resolveExportBg(svg, o.bg);
   const name = exportFileName(fileName || '括号图', 'png');
 
   let url = '';
@@ -294,9 +315,12 @@ function exportPng(svg, fileName) {
       canvas.height = h;
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('canvas 2d 上下文不可用');
-      // 背景铺在画布上，不进 clone：加 rect 会改变导出 SVG 的结果
-      ctx.fillStyle = bg;
-      ctx.fillRect(0, 0, w, h);
+      // 背景只在显式要底色时才铺：canvas 新建时就是全透明，不填即为透明底。
+      // 铺背景不进 clone，加 rect 会把导出的 SVG 也改脏。
+      if (bg) {
+        ctx.fillStyle = bg;
+        ctx.fillRect(0, 0, w, h);
+      }
       ctx.drawImage(img, 0, 0, w, h);
       canvas.toBlob((out) => {
         if (!out) {
@@ -338,6 +362,7 @@ module.exports = {
   parseAlphaText,
   colorAlpha,
   pickExportBg,
+  resolveExportBg,
   exportFileName,
   svgPixelSize,
   bodyFillOf,

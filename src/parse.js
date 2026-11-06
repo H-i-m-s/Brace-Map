@@ -44,6 +44,7 @@ function parseSource(source) {
   let maxWidth = 0;              // 节点文字折行宽度上限（SVG 坐标，px）；0 = 不折行
   let floatMode = '';            // 'left' | 'right' | 'center' | 'inline' | ''
   let width = 0;                 // 浮动时的宽度（px）；0 = 按图自身宽
+  let bg = '';                   // PNG 底色；空 = 透明（默认）
   let firstContentSeen = false;
 
   for (const raw of lines) {
@@ -119,6 +120,9 @@ function parseSource(source) {
         // 浮动时用来定宽；不写就让图按自身宽度自然收缩
         const n = parseFloat(val);
         width = Number.isFinite(n) && n > 0 ? n : 0;
+      } else if (key === 'bg') {
+        // PNG 导出底色：不写 = 透明（默认）；theme = 取主题底色；其余当颜色值
+        bg = val;
       }
     }
     // 4) 其余忽略
@@ -133,6 +137,7 @@ function parseSource(source) {
     maxWidth,
     float: floatMode,
     width,
+    bg,
     roots,
   };
 }

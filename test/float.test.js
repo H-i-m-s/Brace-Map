@@ -114,3 +114,29 @@ suite('float-parse', () => { tParseFloat(); tParseWidth(); });
 suite('float-apply', () => {
   tApplyRight(); tApplyLeft(); tApplyCenter(); tApplyInline(); tApplyNone(); tWidthCap(); tOnlyHost();
 });
+
+/* ------------------------------ PNG 底色 ------------------------------ */
+
+function tExportBg() {
+  // 不写指令：保持透明（canvas 新建就是全透明，不填即可）
+  eq(I.resolveExportBg(null, ''), null, 'export-bg: 不写 → 透明');
+  eq(I.resolveExportBg(null, undefined), null, 'export-bg: undefined → 透明');
+  eq(I.resolveExportBg(null, 'none'), null, 'export-bg: none → 透明');
+  eq(I.resolveExportBg(null, 'transparent'), null, 'export-bg: transparent → 透明');
+  eq(I.resolveExportBg(null, 'NONE'), null, 'export-bg: 大小写不敏感');
+
+  // 显式颜色：原样交给 canvas
+  eq(I.resolveExportBg(null, '#ffffff'), '#ffffff', 'export-bg: 颜色值原样返回');
+  eq(I.resolveExportBg(null, 'white'), 'white', 'export-bg: 颜色名也行');
+
+  // 写错的值当颜色交给 canvas，无效时 canvas 会忽略并退回透明，不报错
+  eq(I.resolveExportBg(null, 'no-such-color'), 'no-such-color', 'export-bg: 非法值也原样传下去');
+}
+
+function tParseBg() {
+  eq(I.parseSource('bg: theme\n- 父').bg, 'theme', 'export-bg: 解析 bg 指令');
+  eq(I.parseSource('bg: #fff\n- 父').bg, '#fff', 'export-bg: 解析颜色');
+  eq(I.parseSource('- 父').bg, '', 'export-bg: 不写为空（即透明）');
+}
+
+suite('export-bg', () => { tExportBg(); tParseBg(); });

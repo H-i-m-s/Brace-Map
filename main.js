@@ -32,7 +32,7 @@ let prepareMath, resolveMathWidths, findMathJax, findMathJaxReady, extractMath,
   collectMathRuns, degradeRun, degradeAll, mathGroupMarkup, nodeHasMath, hasMathIn,
   EX_PER_EM, UNITS_PER_EM;
 let EXPORT_STYLE_PROPS, PNG_SCALE, computedStyleOf, cloneWithInlineStyles,
-  downloadBlob, exportSvg, exportPng, colorAlpha, parseAlphaText, pickExportBg,
+  downloadBlob, exportSvg, exportPng, colorAlpha, parseAlphaText, pickExportBg, resolveExportBg,
   exportFileName, svgPixelSize, bodyFillOf, dropClass, stripLinkMarkers;
 let CALIB_TOLERANCE, MAX_REBUILDS, readActualWidths, measureWidestLine, calibratedMeasure,
   replaceSvgContent, calibrateSvg, mountBraceSvg, collectWrapDiagnosis, formatWrapDiagnosis;
@@ -1086,7 +1086,7 @@ function colorAlpha(color) {
 
 /**
  * PNG 背景色：从 svg 往上找第一个 alpha > 0 的背景色，找到 body 也没有就用白色。
- * 页面上的图是透明底、字色跟主题走，透明 PNG 贴进白底文档里会整片看不见。
+ * 只在显式要求 "主题底" 时用；默认导出是透明的。
  */
 function pickExportBg(svg) {
   const body = typeof document !== 'undefined' ? document.body : null;
@@ -1101,6 +1101,25 @@ function pickExportBg(svg) {
     el = el.parentElement || null;
   }
   return '#ffffff';
+}
+
+/**
+ * 决定 PNG 要不要铺底。
+ *
+ * 返回 null 表示保持 canvas 透明的 alpha 通道。
+ *   （不写）      透明，默认
+ *   none / transparent  透明
+ *   theme / auto        取页面主题底色（浅色字贴到白纸上也能看清）
+ *   #fff / white / ...  指定颜色
+ *
+ * 以前的实现一律铺主题底色，导出的 PNG 就永远不是真透明，贴到别处
+ * 还得再抠一次。要用哪个由用户写指令决定。
+ */
+function resolveExportBg(svg, mode) {
+  const m = String(mode == null ? '' : mode).trim().toLowerCase();
+  if (!m || m === 'none' || m === 'transparent' || m === 'alpha') return null;
+  if (m === 'theme' || m === 'auto') return pickExportBg(svg);
+  return mode;                      // 其余当颜色值，写错就让 canvas 忽略、退回透明
 }
 
 function pad2(n) {
@@ -1130,7 +1149,8 @@ function svgPixelSize(svg) {
   };
 }
 
-function exportPng(svg, fileName) {
+function exportPng(svg, fileName, opts) {
+  const o = opts || {};
   let clone;
   try {
     clone = cloneWithInlineStyles(svg);
@@ -1149,7 +1169,8 @@ function exportPng(svg, fileName) {
 
   const w = Math.round(size.w * PNG_SCALE);
   const h = Math.round(size.h * PNG_SCALE);
-  const bg = pickExportBg(svg);
+  // null = 不铺底，保留 alpha
+  const bg = resolveExportBg(svg, o.bg);
   const name = exportFileName(fileName || '括号图', 'png');
 
   let url = '';
@@ -1167,9 +1188,12 @@ function exportPng(svg, fileName) {
       canvas.height = h;
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('canvas 2d 上下文不可用');
-      // 背景铺在画布上，不进 clone：加 rect 会改变导出 SVG 的结果
-      ctx.fillStyle = bg;
-      ctx.fillRect(0, 0, w, h);
+      // 背景只在显式要底色时才铺：canvas 新建时就是全透明，不填即为透明底。
+      // 铺背景不进 clone，加 rect 会把导出的 SVG 也改脏。
+      if (bg) {
+        ctx.fillStyle = bg;
+        ctx.fillRect(0, 0, w, h);
+      }
       ctx.drawImage(img, 0, 0, w, h);
       canvas.toBlob((out) => {
         if (!out) {
@@ -1211,6 +1235,7 @@ module.exports = {
   parseAlphaText,
   colorAlpha,
   pickExportBg,
+  resolveExportBg,
   exportFileName,
   svgPixelSize,
   bodyFillOf,
@@ -2640,6 +2665,7 @@ function parseSource(source) {
   let maxWidth = 0;              // 节点文字折行宽度上限（SVG 坐标，px）；0 = 不折行
   let floatMode = '';            // 'left' | 'right' | 'center' | 'inline' | ''
   let width = 0;                 // 浮动时的宽度（px）；0 = 按图自身宽
+  let bg = '';                   // PNG 底色；空 = 透明（默认）
   let firstContentSeen = false;
 
   for (const raw of lines) {
@@ -2715,6 +2741,9 @@ function parseSource(source) {
         // 浮动时用来定宽；不写就让图按自身宽度自然收缩
         const n = parseFloat(val);
         width = Number.isFinite(n) && n > 0 ? n : 0;
+      } else if (key === 'bg') {
+        // PNG 导出底色：不写 = 透明（默认）；theme = 取主题底色；其余当颜色值
+        bg = val;
       }
     }
     // 4) 其余忽略
@@ -2729,6 +2758,7 @@ function parseSource(source) {
     maxWidth,
     float: floatMode,
     width,
+    bg,
     roots,
   };
 }
@@ -3766,7 +3796,7 @@ function loadModules() {
      collectMathRuns, degradeRun, degradeAll, mathGroupMarkup, nodeHasMath,
      hasMathIn, EX_PER_EM, UNITS_PER_EM, setResourceResolver } = req('src/math.js'));
   ({ EXPORT_STYLE_PROPS, PNG_SCALE, computedStyleOf, cloneWithInlineStyles,
-     downloadBlob, exportSvg, exportPng, colorAlpha, parseAlphaText, pickExportBg,
+     downloadBlob, exportSvg, exportPng, colorAlpha, parseAlphaText, pickExportBg, resolveExportBg,
      exportFileName, svgPixelSize, bodyFillOf, dropClass, stripLinkMarkers } = req('src/export.js'));
   ({ CALIB_TOLERANCE, MAX_REBUILDS, readActualWidths, measureWidestLine, calibratedMeasure,
      replaceSvgContent, calibrateSvg, mountBraceSvg, collectWrapDiagnosis,
@@ -3942,7 +3972,7 @@ async function renderBraceMap(source, host, opts) {
   btnPng.setAttribute('title', '导出 PNG');
   btnPng.addEventListener('click', (e) => {
     e.stopPropagation();
-    exportPng(svg, cfg.title || '括号图');
+    exportPng(svg, cfg.title || '括号图', { bg: cfg.bg });
   });
   const btnSvg = bar.createEl('button', { cls: 'bm-btn', text: 'SVG' });
   btnSvg.setAttribute('title', '导出 SVG');
@@ -4280,6 +4310,7 @@ function buildInternals() {
   colorAlpha,
   parseAlphaText,
   pickExportBg,
+  resolveExportBg,
   exportFileName,
   svgPixelSize,
   };
