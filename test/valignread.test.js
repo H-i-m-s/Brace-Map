@@ -365,6 +365,52 @@ function tReaderClearance() {
     'valign-reader-clear: 假 DOM 里壳真的上移了（横向量法却没变）');
 }
 
+/* ------------------------------ 留白跟着偏移走 ------------------------------ */
+
+/**
+ * 留白范围必须跟 valign 的偏移走：图上下挪了多少，留白的块就跟着挪多少。
+ *
+ * 现场：图高 151，四个 60 高的后续段落（加上壳自己那一块 60）。
+ *   bottom  偏移 0     → 图底到 151 的深度 → 3 块
+ *   middle  偏移 −59.25 → 图底到 91.75   → 2 块
+ *   top     偏移 −119.5 → 图底到 31.5    → 1 块
+ * 每块两条样式记录（margin + max-width）。
+ */
+function tReaderWrapFollowsOffset() {
+  function scene(valign, roots) {
+    const sc = readerScene({ roots: roots || [], paraH: 60 });
+    const extra = [0, 1, 2].map(() => el({ tag: 'DIV', cls: 'el-p', h: 60, w: 820 }));
+    let prev = sc.para;
+    for (const e of extra) {
+      prev.nextElementSibling = e;
+      e.previousElementSibling = prev;
+      prev = e;
+    }
+    const cfg = { float: 'right', width: 300, valign };
+    const rec = I.floatify(sc.host, cfg, {});
+    return { sc, rec };
+  }
+
+  const b = scene('bottom');
+  eq(b.rec.wrap.length, 6, 'valign-reader-wrap: bottom 偏移 0 → 覆盖 3 块');
+
+  const m = scene('middle', [rootText(560, 30)]);
+  eq(m.rec.valign.offset, -59.25, 'valign-reader-wrap: middle 偏移 −59.25');
+  eq(m.rec.wrap.length, 4, 'valign-reader-wrap: middle 上移后少覆盖一块');
+
+  const t = scene('top');
+  eq(t.rec.valign.offset, -119.5, 'valign-reader-wrap: top 偏移 −119.5');
+  eq(t.rec.wrap.length, 2, 'valign-reader-wrap: 图上移后只覆盖第一块');
+
+  // 不改留白横向量法：每档的 margin 值仍然一样
+  ok(b.rec.margin > 0 && m.rec.margin === b.rec.margin && t.rec.margin === b.rec.margin,
+    'valign-reader-wrap: 偏移只改块数，不改横向留白');
+
+  // middle 只覆盖两块（para + 第二块），第三块必须还是干净的
+  ok(m.sc.para.nextElementSibling.nextElementSibling.style.marginRight === undefined,
+    'valign-reader-wrap: middle 档第三块之后保持干净');
+}
+
 /* ------------------------------ 不碰编辑模式 ------------------------------ */
 
 function tEditModeUntouched() {
@@ -387,4 +433,5 @@ suite('valign-reader-top', () => {
 });
 suite('valign-reader-book', tReaderBookkeeping);
 suite('valign-reader-clear', tReaderClearance);
+suite('valign-reader-wrap', tReaderWrapFollowsOffset);
 suite('valign-reader-guard', tEditModeUntouched);

@@ -188,9 +188,17 @@ function restoreStyles(entries) {
  * 规则：逐块累加高度，累加到够 height（图高）为止，最后一块也带上 ——
  * 宁可多留一点白，也不要让文字压到图上。
  *
+ * startOffset 是「图顶相对第一个兄弟顶边」的有符号距离（px）：
+ *   0    图顶正好贴第一个兄弟顶边 —— 默认值，与加这个参数之前逐位一致
+ *   > 0  图整体下移，图底也更靠下，要多覆盖一段
+ *   < 0  图整体上移，图底也跟着上移，少覆盖一段
+ * acc 累加的是「块底相对第一个兄弟顶边」的深度，所以判据是「块底 >= 图底」，
+ * 图底 = startOffset + height。整张图都落在第一个兄弟上方（图底 <= 0）时没有块
+ * 需要绕，返回空数组。
+ *
  * @param {Element|null} startEl  第一个候选（通常是宿主的 nextElementSibling）
  * @param {number} height         图真实渲染高度（px）
- * @param {{limit?:number}} [opts]
+ * @param {{limit?:number, startOffset?:number}} [opts]
  * @returns {Element[]}
  */
 function collectWrapTargets(startEl, height, opts) {
@@ -198,13 +206,17 @@ function collectWrapTargets(startEl, height, opts) {
   const h = Number(height);
   if (!startEl || !(h > 0)) return out;
   const limit = opts && Number(opts.limit) > 0 ? Number(opts.limit) : WRAP_LIMIT;
+  const rawOffset = opts ? Number(opts.startOffset) : 0;
+  const startOffset = Number.isFinite(rawOffset) ? rawOffset : 0;   // 非数字按 0
+  const bottom = startOffset + h;       // 图底相对第一个兄弟顶边的深度
+  if (!(bottom > 0)) return out;        // 整图在第一个兄弟上方：一块都不用留白
   let el = startEl;
   let acc = 0;
   while (el && out.length < limit) {
-    if (out.indexOf(el) >= 0) break;      // 兄弟链成环（假 DOM / 异常结构）
+    if (out.indexOf(el) >= 0) break;    // 兄弟链成环（假 DOM / 异常结构）
     out.push(el);
     acc += elHeight(el);
-    if (acc >= h) break;                  // 图高已盖住，后面恢复整宽
+    if (acc >= bottom) break;           // 图底已盖住，后面恢复整宽
     el = el.nextElementSibling;
   }
   return out;
@@ -429,11 +441,22 @@ function floatify(el, cfg, opts) {
   };
 
   /*
+   * 垂直基准（valign）先量：它不只是改 top，留白范围也跟着它走（图上下挪了
+   * 多少，需要绕的段落就跟着挪多少）。量的时候什么都还没写，所以提前到
+   * 留白范围之前不会引入任何状态差异。
+   */
+  const vin = readerValignInfo(el, block, cfg, bRect);
+
+  /*
    * 后面没有兄弟块时别动手：浮动的全部意义是「让后面的文字绕上来」，
    * 没有可绕的内容，脱离流只是白拆一次排版（还会把嵌套在 callout 里的图
    * 从它自己的壳里抽出来）。用流里的高度先数一遍上界。
+   * startOffset 把 valign 的偏移量带进来：图顶不再默认贴第一个兄弟顶边。
    */
-  const plan = collectWrapTargets(block.nextElementSibling, record.height, { limit: o.maxBlocks });
+  const plan = collectWrapTargets(block.nextElementSibling, record.height, {
+    limit: o.maxBlocks,
+    startOffset: vin.offset,
+  });
   if (!plan.length) return null;
 
   // 定位祖先进程：只补 position: relative，不动 display（动 display 会改整页排版）
@@ -452,7 +475,6 @@ function floatify(el, cfg, opts) {
    * 写出来的 top 与没写 valign 时逐位相同。
    */
   const baseTop = bRect.top - originY;
-  const vin = readerValignInfo(el, block, cfg, bRect);
   const top = baseTop + vin.offset;
   record.valign = {
     valign: vin.valign,
@@ -506,7 +528,7 @@ function floatify(el, cfg, opts) {
     const got = applyWrapMargins([target], side, record.margin, { limit: contentW, reader: o.reader });
     for (const g of got) record.wrap.push(g);
     acc += elHeight(target);
-    if (acc >= record.height) break;
+    if (acc >= record.height + vin.offset) break;   // 图底 = 图高 + 垂直偏移
   }
   return record;
 }

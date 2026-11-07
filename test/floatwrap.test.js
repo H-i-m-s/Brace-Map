@@ -118,6 +118,134 @@ function tCollectEdge() {
   eq(I.collectWrapTargets(many[0], 1e9, { limit: 3 }).length, 3, 'wrap-target: limit 生效');
 }
 
+/* ------------------------------ 留白范围：起点偏移 ------------------------------ */
+
+/**
+ * 改动前的 collectWrapTargets 原样拷一份，专做 A/B 对照。
+ * 只用于测试：任何 ``startOffset` 为 `0`（或压根不传）的调用，
+ * 新旧两个实现的返回必须逐位相同——元素身份、顺序、长度全一样。
+ */
+function legacyCollectWrapTargets(startEl, height, opts) {
+  const out = [];
+  const h = Number(height);
+  if (!startEl || !(h > 0)) return out;
+  const limit = opts && Number(opts.limit) > 0 ? Number(opts.limit) : 200;
+  let el = startEl;
+  let acc = 0;
+  while (el && out.length < limit) {
+    if (out.indexOf(el) >= 0) break;
+    out.push(el);
+    acc += I.elHeight(el);
+    if (acc >= h) break;
+    el = el.nextElementSibling;
+  }
+  return out;
+}
+
+/** 两个 plan 是否逐位相同：长度、元素身份、顺序 */
+function samePlan(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function tStartOffsetDefault() {
+  // 不传 / 传 0 / 传非数字：都要与旧行为逐位一致
+  const cases = [
+    { heights: [100], h: 100 },                 // 图高正好等于 1 块
+    { heights: [100, 100], h: 200 },            // 正好等于 2 块
+    { heights: [100, 100, 100], h: 250 },       // 跨块
+    { heights: [100, 100, 100], h: 1e9 },      // 超过所有块
+    { heights: [33.5, 66.25, 12.75], h: 100 },  // 块高带小数
+    { heights: [0, 0, 300], h: 100 },           // 零高块
+    { heights: [1, 1, 1, 1], h: 1e9, limit: 2 },
+  ];
+  for (const c of cases) {
+    // 两个实现都是纯函数（只读元素），可以直接对同一条链 A/B，身份也能逐个比
+    const a = chain(c.heights);
+    const opts = c.limit ? { limit: c.limit } : undefined;
+    const oldOnes = legacyCollectWrapTargets(a[0], c.h, opts);
+    const dflt = I.collectWrapTargets(a[0], c.h, opts);
+    ok(samePlan(oldOnes, dflt), 'wrap-offset: 不传 startOffset 与旧实现逐位一致',
+      'h=' + c.h + ' old=' + oldOnes.length + ' new=' + dflt.length);
+
+    ok(samePlan(oldOnes, I.collectWrapTargets(a[0], c.h, Object.assign({ startOffset: 0 }, opts || {}))),
+      'wrap-offset: startOffset: 0 与旧实现逐位一致', 'h=' + c.h);
+
+    // 非数字一律当 0
+    for (const bad of [undefined, null, NaN, 'abc', {}, []]) {
+      ok(samePlan(oldOnes, I.collectWrapTargets(a[0], c.h, Object.assign({ startOffset: bad }, opts || {}))),
+        'wrap-offset: startOffset=' + String(bad) + ' 当 0 处理', 'h=' + c.h);
+    }
+  }
+}
+
+function tStartOffsetShift() {
+  // 五块 60，图高 150：默认盖上前 3 块（60 / 120 / 180 >= 150）
+  const base = chain([60, 60, 60, 60, 60]);
+  eq(I.collectWrapTargets(base[0], 150).length, 3, 'wrap-offset: 默认覆盖 3 块');
+
+  // 图下移 50：图底到 200 的深度，第 4 块也要留白
+  const down = chain([60, 60, 60, 60, 60]);
+  eq(I.collectWrapTargets(down[0], 150, { startOffset: 50 }).length, 4,
+    'wrap-offset: 下移 50 → 多覆盖一块（图底更靠下）');
+
+  // 图上移 50：图底只到 100 的深度，第 3 块不用留白
+  const up = chain([60, 60, 60, 60, 60]);
+  eq(I.collectWrapTargets(up[0], 150, { startOffset: -50 }).length, 2,
+    'wrap-offset: 上移 50 → 少覆盖一块（图底跟着上移）');
+
+  // 起点偏移不影响 limit 与成环守卫
+  const lim = chain([10, 10, 10, 10, 10]);
+  eq(I.collectWrapTargets(lim[0], 10, { startOffset: 100, limit: 2 }).length, 2,
+    'wrap-offset: limit 仍生效');
+
+  // 小数块高：99.75 与 100 之间差一个偏移就能翻页
+  const frac = chain([33.5, 66.25, 12.75]);
+  eq(I.collectWrapTargets(frac[0], 100).length, 3, 'wrap-offset: 小数额定覆盖 3 块');
+  const frac2 = chain([33.5, 66.25, 12.75]);
+  eq(I.collectWrapTargets(frac2[0], 100, { startOffset: -0.5 }).length, 2,
+    'wrap-offset: 上移 0.5px 就少一块（99.75 刚够旧判据）');
+}
+
+function tStartOffsetDegenerate() {
+  // 整张图在第一个兄弟上方：一块都不该留白
+  const a = chain([60, 60, 60]);
+  eq(I.collectWrapTargets(a[0], 150, { startOffset: -200 }), [],
+    'wrap-offset: 图底在兄弟上方 → 空数组');
+
+  // 边界：图底正好贴第一个兄弟顶边（offset + h === 0）也算「全在上方」
+  const b = chain([60, 60]);
+  eq(I.collectWrapTargets(b[0], 150, { startOffset: -150 }), [],
+    'wrap-offset: 图底正好贴顶边 → 空数组');
+
+  // 只差一点点：图底刚好探进第一块
+  const c = chain([60, 60]);
+  eq(I.collectWrapTargets(c[0], 150, { startOffset: -149.5 }).length, 1,
+    'wrap-offset: 图底探进 0.5px → 仍要第一块');
+}
+
+function tStartOffsetMargins() {
+  // A/B：bottom 档（offset 0）的实际外边距必须与改动前逐位相同
+  const heights = [80, 120, 60.5, 40];
+  const mk = () => heights.map((h) => marginBlock(h));
+  for (const imgH of [80, 200, 260.5, 10000]) {
+    const oldEls = mk();
+    for (let i = 0; i + 1 < oldEls.length; i++) oldEls[i].nextElementSibling = oldEls[i + 1];
+    const oldPlan = legacyCollectWrapTargets(oldEls[0], imgH);
+    for (const t of oldPlan) I.applyWrapMargins([t], 'right', 416, { limit: 820 });
+
+    const newEls = mk();
+    for (let i = 0; i + 1 < newEls.length; i++) newEls[i].nextElementSibling = newEls[i + 1];
+    const newPlan = I.collectWrapTargets(newEls[0], imgH, { startOffset: 0 });
+    for (const t of newPlan) I.applyWrapMargins([t], 'right', 416, { limit: 820 });
+
+    const oldVals = oldEls.map((e) => [e.style.marginRight, e.style.maxWidth]);
+    const newVals = newEls.map((e) => [e.style.marginRight, e.style.maxWidth]);
+    eq(newVals, oldVals, 'wrap-offset: 图高 ' + imgH + ' 的外边距逐位相同');
+  }
+}
+
 /* ------------------------------ 外边距与复位 ------------------------------ */
 
 function tMarginsApply() {
@@ -270,5 +398,11 @@ function tGuards() {
 }
 
 suite('float-wrap-target', () => { tCollectGuard(); tCollectBasic(); tCollectEdge(); });
+suite('float-wrap-offset', () => {
+  tStartOffsetDefault();
+  tStartOffsetShift();
+  tStartOffsetDegenerate();
+  tStartOffsetMargins();
+});
 suite('float-wrap-margin', () => { tMarginsApply(); tMarginsBase(); tMarginsMaxWidth(); tMarginsGuard(); tMarginsMultiple(); });
 suite('float-context', () => { tPickContext(); tGuards(); });
