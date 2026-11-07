@@ -370,10 +370,11 @@ function tApplyDegenerate() {
     eq(r.info.lineH, 0, 'valign-apply-degenerate: h=0 时诊断记 0');
     eq(r.host.style.marginTop, undefined, 'valign-apply-degenerate: h=0 时 ' + v + ' 不动样式');
   }
-  // yTitle 量不到（根节点在，但文字框高 0）：middle 退化为 bottom，top 照旧
+  // yTitle 量不到（根节点在，但文字框高 0）：middle 视为「没准备好」，保留上一次结果
   const mid = applyCase('middle', { rootTexts: [rootText(140, 0)] });
-  eq(mid.off, 0, 'valign-apply-degenerate: yTitle 缺失时 middle 退化为 bottom');
-  eq(mid.info.yTitle, null, 'valign-apply-degenerate: 诊断记 yTitle 为 null');
+  eq(mid.off, 0, 'valign-apply-degenerate: yTitle 缺失时 middle 视作未就绪');
+  eq(mid.info, undefined, 'valign-apply-degenerate: middle 未就绪时不写记录');
+  eq(mid.host.style.marginTop, undefined, 'valign-apply-degenerate: middle 未就绪时不动样式');
   const top = applyCase('top', { rootTexts: [rootText(140, 0)] });
   near(top.off, -102.71, 'valign-apply-degenerate: yTitle 缺失不影响 top');
   eq(top.info.yTitle, null, 'valign-apply-degenerate: top 也记 yTitle 为 null');

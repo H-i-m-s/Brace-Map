@@ -1584,6 +1584,18 @@ function valignPass(host, cfg, src) {
   info.lineH = round2(measureLineHeight(host));
   const y = measureTitleCenter(host);
   info.yTitle = Number.isFinite(y) ? round2(y) : null;
+
+  /*
+   * 第二扇门：根节点在、但它们的文字框全是 0 高（图还没真正排出来）时
+   * yTitle 量到 NaN。middle 档下 valignOffset 会给 0，然后走“还原旧偏移”
+   * 那条路，把上一次算好的 margin-top 撤掉；效果跟上一扇门一模一样。
+   *
+   * 只有 middle 依赖 yTitle（top 只看行高和图高），所以只拦这一档。
+   */
+  if (info.valign === 'middle' && info.yTitle == null) {
+    vtTrace(host, cfg, src, 'not-ready');
+    return 0;
+  }
   host.__bmValignInfo = info;
 
   // 行高量不到（0）或 yTitle 取不到（null）时，valignOffset 自己退化为 0
