@@ -24,7 +24,7 @@ const HEAD_RE = /^#{1,6}\s+(.*)$/;
  * 但它同时长得像指令（`注意: 这个很重要`）。这时看键——白名单里的还是指令
  * （`float: left` 不会被续行吞掉），不认识的当正文（不会被指令分支吃掉）。
  */
-const DIR_KEYS = ['dir', 'brace', 'box', 'closing', 'title', 'maxwidth', 'float', 'width', 'bg'];
+const DIR_KEYS = ['dir', 'brace', 'box', 'closing', 'title', 'maxwidth', 'float', 'width', 'valign', 'bg'];
 
 // 续行拼接用的硬换行符：原样留在 raw 里，由 text.js 的行内解析层切开
 const SOFT_BREAK = '\n';
@@ -108,6 +108,7 @@ function parseSource(source) {
   let titleHash = '';
   let maxWidth = 0;              // 节点文字折行宽度上限（SVG 坐标，px）；0 = 不折行
   let floatMode = '';            // 'left' | 'right' | 'center' | 'inline' | ''
+  let valign = 'top';            // 浮动图的垂直基准：'top' | 'middle' | 'bottom'
   let width = 0;                 // 浮动时的宽度（px）；0 = 按图自身宽
   let bg = '';                   // PNG 底色；空 = 透明（默认）
   let firstContentSeen = false;
@@ -189,6 +190,11 @@ function parseSource(source) {
         else if (v === 'r' || v === 'right') floatMode = 'right';
         else if (v === 'c' || v === 'center' || v === 'centre') floatMode = 'center';
         else if (v === 'inl' || v === 'inline') floatMode = 'inline';
+      } else if (key === 'valign') {
+        // 浮动图的垂直基准。只认三个词，写错就回落到默认的 top
+        const v = val.toLowerCase();
+        if (v === 'top' || v === 'middle' || v === 'bottom') valign = v;
+        else valign = 'top';
       } else if (key === 'width') {
         // 浮动时用来定宽；不写就让图按自身宽度自然收缩
         const n = parseFloat(val);
@@ -217,6 +223,7 @@ function parseSource(source) {
     closing,
     maxWidth,
     float: floatMode,
+    valign,
     width,
     bg,
     roots,
