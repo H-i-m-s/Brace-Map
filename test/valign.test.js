@@ -107,33 +107,39 @@ function tOffset() {
 }
 
 function tOffsetNoRoom() {
-  // textH <= imgH：一律 0，绝不把图往下推
+  // 等高：diff = 0，三档都是 0
   for (const v of ['top', 'middle', 'bottom']) {
     eq(I.valignOffset(100, 100, v), 0, 'valign-offset: 等高时 ' + v + ' 为 0');
-    eq(I.valignOffset(80, 100, v), 0, 'valign-offset: 文字更矮时 ' + v + ' 为 0');
     eq(I.valignOffset(0, 100, v), 0, 'valign-offset: 量不到文字时 ' + v + ' 为 0');
   }
+  // 文字比图矮：依旧有定义，图往上移（负值）
+  eq(I.valignOffset(80, 100, 'top'), 0, 'valign-offset: 文字更矮时 top 仍为 0');
+  eq(I.valignOffset(80, 100, 'middle'), -10, 'valign-offset: 文字更矮时 middle 上移一半');
+  eq(I.valignOffset(80, 100, 'bottom'), -20, 'valign-offset: 文字更矮时 bottom 整段上移');
   eq(I.valignOffset(NaN, 100, 'middle'), 0, 'valign-offset: 非数字当 0');
   eq(I.valignOffset(300, NaN, 'middle'), 0, 'valign-offset: 图高非数字当 0');
   eq(I.valignOffset(300, 100, 'bogus'), 0, 'valign-offset: 非法基准当 top');
   eq(I.valignOffset(300, 100, ''), 0, 'valign-offset: 空基准当 top');
 }
 
-/* 反向对照：图比文字段高（或等高）时，三档一律不推 */
+/* 图比文字段高：不是「不推」，而是往上移，图中心/底边照样对齐文字段 */
 function tOffsetImageTaller() {
-  for (const v of ['top', 'middle', 'bottom']) {
-    eq(I.valignOffset(120, 300, v), 0, 'valign-tall: 图更高时 ' + v + ' 为 0');
-    eq(I.valignOffset(300, 300, v), 0, 'valign-tall: 等高时 ' + v + ' 为 0');
-  }
+  eq(I.valignOffset(120, 300, 'top'), 0, 'valign-tall: 图更高时 top 仍为 0');
+  eq(I.valignOffset(120, 300, 'middle'), -90, 'valign-tall: 图更高时 middle 上移一半');
+  eq(I.valignOffset(120, 300, 'bottom'), -180, 'valign-tall: 图更高时 bottom 整段上移');
+  eq(I.valignOffset(300, 300, 'middle'), 0, 'valign-tall: 等高时 middle 为 0');
+  eq(I.valignOffset(300, 300, 'bottom'), 0, 'valign-tall: 等高时 bottom 为 0');
 
-  // 应用层也要真的不写样式：图比文字高，推下去只会把图推到文字块外面
-  for (const v of ['middle', 'bottom']) {
+  // 应用层：图更高时也要真的写负 margin-top
+  for (const pair of [['middle', -30], ['bottom', -60]]) {
+    const v = pair[0];
+    const want = pair[1];
     const { host, embed } = makeHost();
     embed.nextElementSibling = fakeChain([{ cls: ['cm-line'], h: 40 }]);
-    eq(I.applyValignLayout(host, { float: 'right', valign: v }), 0,
-      'valign-tall: 应用时 ' + v + ' 不写偏移');
-    eq(host.style.marginTop, undefined, 'valign-tall: ' + v + ' 不碰 margin-top');
-    eq(host.__bmValignInfo.applied, false, 'valign-tall: ' + v + ' 诊断记未写样式');
+    eq(I.applyValignLayout(host, { float: 'right', valign: v }), want,
+      'valign-tall: 应用时 ' + v + ' 写偏移');
+    eq(host.style.marginTop, want + 'px', 'valign-tall: ' + v + ' 写进 margin-top');
+    eq(host.__bmValignInfo.applied, true, 'valign-tall: ' + v + ' 诊断记已写样式');
   }
 }
 
@@ -202,11 +208,13 @@ function tApplyTop() {
 }
 
 function tApplyNoRoom() {
+  // 图比文字段高：往上移，不是「不推」
   const { host, embed } = makeHost();
   embed.nextElementSibling = fakeChain([{ cls: ['cm-line'], h: 60 }]);
-  eq(I.applyValignLayout(host, { float: 'right', valign: 'bottom' }), 0,
-    'valign-apply: 文字比图矮时不往下推');
-  eq(host.style.marginTop, undefined, 'valign-apply: 没有可对齐空间时不写样式');
+  eq(I.applyValignLayout(host, { float: 'right', valign: 'bottom' }), -40,
+    'valign-apply: 图比文字高时 bottom 整段上移');
+  eq(host.style.marginTop, '-40px', 'valign-apply: 上移也写进 margin-top');
+  eq(host.__bmValignInfo.applied, true, 'valign-apply: 上移时诊断记已写样式');
 
   // 完全没有后续文字
   const b = makeHost();

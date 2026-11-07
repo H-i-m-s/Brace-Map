@@ -1031,9 +1031,19 @@ function valignOffset(textH, imgH, valign) {
   const t = Number(textH);
   const h = Number(imgH);
   if (!Number.isFinite(t) || !Number.isFinite(h)) return 0;
+  /*
+   * t 为 0 表示图后面压根没有可绕排的文字段（代码块在笔记末尾），
+   * 「对齐旁边那段文字」无从谈起，保持 top。
+   *
+   * 但 t > 0 且比图矮时不能返回 0：那正是图高于文字段的情形，
+   * 居中 / 靠下依旧有定义 —— 图要往上移，溢出的部分就是它在
+   * 段落上下两边均分（middle）或全堆在顶部（bottom）的结果。
+   * 早期版本在这里错写成「图比文字高就不推」，导致高图完全不吃
+   * valign，看起来像没生效。
+   */
+  if (!(t > 0)) return 0;
   if (valign !== 'middle' && valign !== 'bottom') return 0;
   const diff = t - h;
-  if (!(diff > 0)) return 0;
   return valign === 'middle' ? diff / 2 : diff;
 }
 
