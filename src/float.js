@@ -1170,7 +1170,9 @@ function measureLineHeight(host) {
   const fromAnchor = computedPx(anchor, 'lineHeight');
   if (fromAnchor > 0) return fromAnchor;
 
-  const fs = computedPx(sib, 'fontSize') || computedPx(anchor, 'fontSize');
+  const fs = computedPx(sib, 'fontSize')
+    || computedPx(anchor, 'fontSize')
+    || computedPx(host, 'fontSize');   // 浮动后前两者可能都拿不到，宿主一定有
   return fs > 0 ? fs * OPT.lineHRatio : 0;
 }
 
