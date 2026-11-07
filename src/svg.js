@@ -211,6 +211,7 @@ function buildSvg(cfg, opts) {
       brace: cfg.brace,
       box: cfg.box,
       closing: cfg.closing,
+      closingGroups: cfg.closingGroups,
       measure,
       measureBold,
       splitRuns: o.splitRuns,
@@ -258,7 +259,11 @@ function buildSvg(cfg, opts) {
   }
 
   const seqs = layout.nodes.map((n) => n.seq);
-  return { markup, layout, width, height, titleW, titleH, seqs };
+  return {
+    markup, layout, width, height, titleW, titleH, seqs,
+    // closing 点名的诊断（名字没命中之类），不参与绘制
+    warnings: (layout && layout.warnings) || [],
+  };
 }
 
 module.exports = { textPlace, buildSvg };

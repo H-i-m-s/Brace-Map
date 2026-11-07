@@ -29,6 +29,28 @@ const DIR_KEYS = ['dir', 'brace', 'box', 'closing', 'title', 'maxwidth', 'float'
 // 续行拼接用的硬换行符：原样留在 raw 里，由 text.js 的行内解析层切开
 const SOFT_BREAK = '\n';
 
+/**
+ * closing 一条声明的值 → 一组目标。
+ *
+ *   true / yes / 1 / on        → { all: true }    框住全部叶子（旧行为）
+ *   甲, 乙 / 甲，乙            → { names: ['甲','乙'] }  按节点文字点名
+ *   空（只有逗号或空白）        → { all: true }    与旧版「空值 = 关」不同，见下
+ *
+ * 空值为什么当 all：`closing:` 这一行本来就表达了「要 closing」，只是没写名字，
+ * 当成「所有叶子」比默默什么都不画更接近写的人的本意。
+ */
+function parseClosingGroup(v) {
+  const raw = String(v == null ? '' : v).trim();
+  if (!raw || /^(true|yes|1|on)$/i.test(raw)) return { all: true };
+  const names = [];
+  for (const part of raw.split(/[,，]/)) {
+    const s = part.trim();
+    if (s) names.push(s);
+  }
+  if (!names.length) return { all: true };
+  return { names };
+}
+
 function parseBox(v) {
   const s = String(v).trim().toLowerCase();
   if (!s || s === 'none' || s === 'off' || s === 'false') return [];
@@ -106,7 +128,9 @@ function parseSource(source) {
   let dir = 'lr';
   let brace = 'curly';
   let box = [];
-  let closing = false;
+  // closing 的每一条声明各占一项，按书写顺序（从内到外）排；
+  // 可以写多次，累积而不是覆盖。
+  const closingGroups = [];
   let titleDirective = '';
   let titleHash = '';
   let maxWidth = 0;              // 节点文字折行宽度上限（SVG 坐标，px）；0 = 不折行
@@ -196,7 +220,7 @@ function parseSource(source) {
       } else if (key === 'box') {
         box = parseBox(val);
       } else if (key === 'closing') {
-        closing = /^(true|yes|1|on)$/i.test(val);
+        closingGroups.push(parseClosingGroup(val));
       } else if (key === 'title') {
         titleDirective = cleanInline(val);
       } else if (key === 'maxwidth') {
@@ -254,7 +278,10 @@ function parseSource(source) {
     dir,
     brace,
     box,
-    closing,
+    // closing 保留成布尔：等于「至少有一条声明」。它只是给老调用方的一个
+    // 「这家有没有 closing」的开关，具体框谁看 closingGroups。
+    closing: closingGroups.length > 0,
+    closingGroups,
     maxWidth,
     float: floatMode,
     valign,
@@ -264,4 +291,4 @@ function parseSource(source) {
   };
 }
 
-module.exports = { parseBox, parseSource, DIRS, STYLES };
+module.exports = { parseBox, parseClosingGroup, parseSource, DIRS, STYLES };

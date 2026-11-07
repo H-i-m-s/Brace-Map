@@ -3967,6 +3967,7 @@ const { createDomMeasure, runsWidth } = require('./measure');
 const { wrapRuns } = require('./wrap');
 const { hasMathIn, maxMathHeight } = require('./math');
 const { braceGeom, geomToD } = require('./brace');
+const { dbg } = require('./debug');
 
 /* ============================================================
  * 布局
@@ -4006,6 +4007,45 @@ function childrenTotal(node, rowGap, lineH) {
     if (i > 0) sum += siblingGap(c, rowGap, lineH);
   }
   return sum;
+}
+
+/**
+ * closing 的声明列表归一化。
+ *   { closingGroups: [{all:true} | {names:[...]}] }  ← 解析层给的新形状
+ *   closing: true                                  ← 旧形状，等价于一条「全框」
+ *   closing: [ ... ]                               ← 调用方直接给数组也认
+ */
+function closingGroupList(o) {
+  // 显式关掉（closing: false）就一条都不画，哪怕调用方手里还带着 groups ——
+  // 旧调用方手里只有这一个开关，别让它失效。
+  if (o.closing === false) return [];
+  if (Array.isArray(o.closingGroups) && o.closingGroups.length) return o.closingGroups;
+  if (Array.isArray(o.closing)) return o.closing;
+  return o.closing ? [{ all: true }] : [];
+}
+
+/**
+ * closing 的点名：按节点的渲染文字（n.text）匹配。
+ *   - 精确匹配：两边 trim 后全等，大小写与内部空格都算数（不模糊、不指层级）
+ *   - 重名全中：同名节点可能在不同分支下，都框进去
+ *   - 一个都没中的名字收进 missed，交给调用方报一条诊断，不影响其他名字、其他组
+ */
+function resolveClosingTargets(nodes, names) {
+  const targets = [];
+  const missed = [];
+  for (const name of names) {
+    const want = String(name == null ? '' : name).trim();
+    if (!want) continue;
+    let hit = false;
+    for (const n of nodes) {
+      const label = String(n.text == null ? '' : n.text).trim();
+      if (label !== want) continue;
+      hit = true;
+      if (targets.indexOf(n) < 0) targets.push(n);
+    }
+    if (!hit) missed.push(want);
+  }
+  return { targets, missed };
 }
 
 /** 一段文字的宽度：与 wrap 里 append 的口径一致（逐 run 累加，量不出来按 0） */
@@ -4067,6 +4107,10 @@ function layoutTree(roots, opts) {
   const boxLayers = o.box instanceof Set
     ? o.box
     : new Set(Array.isArray(o.box) ? o.box : []);
+
+  // closing 的声明列表（可能为空、一条、多条）与本次布局攒下的诊断
+  const closingGroups = closingGroupList(o);
+  const warnings = [];
 
   let measure = o.measure;
   let tempMeasure = null;
@@ -4263,28 +4307,63 @@ function layoutTree(roots, opts) {
   };
   collect(roots);
 
-  // 4) 末端总括号：尖端在外侧、开口（首末点）贴内容。
+  // 4) 末端总括号（closing）：尖端在外侧、开口（首末点）贴内容。
   //    同样居中：内容末端 → 画布内边距之间的空间里，两侧留白相等。
+  //
+  //    一条声明 = 一个括号，按书写顺序从内往外排：第一条贴着内容，第 k 条
+  //    往右 k*(braceWidth + colGap)。每条自己决定括谁——all 括全部叶子，
+  //    names 按节点文字点名（可跨层：括号就是一条长括号穿过去，中间的行不参与）。
   const leaves = nodes.filter((n) => !n.children.length);
-  if (o.closing && leaves.length) {
+  if (closingGroups.length) {
+    // 所有 closing 共用同一条基线：内容末端（含全部节点，不只叶子）到画布内边距线
+    // 之间居中。多组时共用这条线、再逐列往外推，列间恒有一道 colGap，永远不叠。
     let mEnd = -Infinity;
-    let c1 = Infinity;
-    let c2 = -Infinity;
-    for (const l of leaves) {
-      mEnd = Math.max(mEnd, l.main + l.mSize / 2);
-      c1 = Math.min(c1, l.cross - l.selfCross / 2);
-      c2 = Math.max(c2, l.cross + l.selfCross / 2);
-    }
+    for (const n of nodes) mEnd = Math.max(mEnd, n.main + n.mSize / 2);
     // 可用空间 = 内容末端到画布内边距线（braceWidth + colGap + pad）
     const avail = braceWidth + colGap + pad;
-    const mBody = mEnd + (avail - braceWidth) / 2;
-    braces.push({
-      kind: 'closing',
-      mainTip: mBody + braceWidth,   // 尖端在外侧
-      mainBody: mBody,               // 端点贴内容
-      cross1: c1,
-      cross2: c2,
-    });
+    const base = mEnd + (avail - braceWidth) / 2;
+    let col = 0;                      // 实际画出来的列号：没命中的那条不留空列
+    for (const [i, group] of closingGroups.entries()) {
+      const all = !!(group && group.all);
+      const names = group && Array.isArray(group.names) ? group.names : [];
+      const resolved = all
+        ? { targets: leaves, missed: [] }
+        : resolveClosingTargets(nodes, names);
+      const targets = resolved.targets;
+
+      // 没命中的名字一律留痕：整条落空时它就是「为什么没画」，部分命中时它指出写错的那个
+      if (resolved.missed.length) {
+        warnings.push('closing 第 ' + (i + 1) + ' 条：'
+          + resolved.missed.join('、') + ' 没找到对应的节点');
+        dbg('closing.miss', () => ({ group: i + 1, all, names, missed: resolved.missed }));
+      }
+      if (!targets.length) {
+        // 名字一个都没匹配上：这一组跳过，不画、不抛错，也不影响别的组
+        if (all) {
+          warnings.push('closing 第 ' + (i + 1) + ' 条：没有叶子节点');
+          dbg('closing.miss', () => ({ group: i + 1, all: true, names: [], missed: [] }));
+        }
+        continue;
+      }
+      // 按目标自身的 cross 占位算括号两端的端点（不是子树尺寸）
+      let c1 = Infinity;
+      let c2 = -Infinity;
+      for (const t of targets) {
+        c1 = Math.min(c1, t.cross - t.selfCross / 2);
+        c2 = Math.max(c2, t.cross + t.selfCross / 2);
+      }
+      const mBody = base + col * (braceWidth + colGap);
+      col++;
+      braces.push({
+        kind: 'closing',
+        group: i,                     // 第几条声明（从 0 数，诊断/自测用）
+        targets,                      // 这一条括住的节点（诊断/自测用）
+        mainTip: mBody + braceWidth,  // 尖端在外侧
+        mainBody: mBody,              // 端点贴内容
+        cross1: c1,
+        cross2: c2,
+      });
+    }
   }
 
   // 5) 包围盒：按真实绘制元素算（文字/方框的自身占位 + 括号两端），
@@ -4356,7 +4435,7 @@ function layoutTree(roots, opts) {
     }
   }
 
-  return { dir, style, width: W, height: H, lineH, nodes, braces };
+  return { dir, style, width: W, height: H, lineH, nodes, braces, warnings };
 }
 
 module.exports = { layoutTree };
@@ -5428,6 +5507,28 @@ const DIR_KEYS = ['dir', 'brace', 'box', 'closing', 'title', 'maxwidth', 'float'
 // 续行拼接用的硬换行符：原样留在 raw 里，由 text.js 的行内解析层切开
 const SOFT_BREAK = '\n';
 
+/**
+ * closing 一条声明的值 → 一组目标。
+ *
+ *   true / yes / 1 / on        → { all: true }    框住全部叶子（旧行为）
+ *   甲, 乙 / 甲，乙            → { names: ['甲','乙'] }  按节点文字点名
+ *   空（只有逗号或空白）        → { all: true }    与旧版「空值 = 关」不同，见下
+ *
+ * 空值为什么当 all：`closing:` 这一行本来就表达了「要 closing」，只是没写名字，
+ * 当成「所有叶子」比默默什么都不画更接近写的人的本意。
+ */
+function parseClosingGroup(v) {
+  const raw = String(v == null ? '' : v).trim();
+  if (!raw || /^(true|yes|1|on)$/i.test(raw)) return { all: true };
+  const names = [];
+  for (const part of raw.split(/[,，]/)) {
+    const s = part.trim();
+    if (s) names.push(s);
+  }
+  if (!names.length) return { all: true };
+  return { names };
+}
+
 function parseBox(v) {
   const s = String(v).trim().toLowerCase();
   if (!s || s === 'none' || s === 'off' || s === 'false') return [];
@@ -5505,7 +5606,9 @@ function parseSource(source) {
   let dir = 'lr';
   let brace = 'curly';
   let box = [];
-  let closing = false;
+  // closing 的每一条声明各占一项，按书写顺序（从内到外）排；
+  // 可以写多次，累积而不是覆盖。
+  const closingGroups = [];
   let titleDirective = '';
   let titleHash = '';
   let maxWidth = 0;              // 节点文字折行宽度上限（SVG 坐标，px）；0 = 不折行
@@ -5595,7 +5698,7 @@ function parseSource(source) {
       } else if (key === 'box') {
         box = parseBox(val);
       } else if (key === 'closing') {
-        closing = /^(true|yes|1|on)$/i.test(val);
+        closingGroups.push(parseClosingGroup(val));
       } else if (key === 'title') {
         titleDirective = cleanInline(val);
       } else if (key === 'maxwidth') {
@@ -5653,7 +5756,10 @@ function parseSource(source) {
     dir,
     brace,
     box,
-    closing,
+    // closing 保留成布尔：等于「至少有一条声明」。它只是给老调用方的一个
+    // 「这家有没有 closing」的开关，具体框谁看 closingGroups。
+    closing: closingGroups.length > 0,
+    closingGroups,
     maxWidth,
     float: floatMode,
     valign,
@@ -5663,7 +5769,7 @@ function parseSource(source) {
   };
 }
 
-module.exports = { parseBox, parseSource, DIRS, STYLES };
+module.exports = { parseBox, parseClosingGroup, parseSource, DIRS, STYLES };
 
 };
 
@@ -5881,6 +5987,7 @@ function buildSvg(cfg, opts) {
       brace: cfg.brace,
       box: cfg.box,
       closing: cfg.closing,
+      closingGroups: cfg.closingGroups,
       measure,
       measureBold,
       splitRuns: o.splitRuns,
@@ -5928,7 +6035,11 @@ function buildSvg(cfg, opts) {
   }
 
   const seqs = layout.nodes.map((n) => n.seq);
-  return { markup, layout, width, height, titleW, titleH, seqs };
+  return {
+    markup, layout, width, height, titleW, titleH, seqs,
+    // closing 点名的诊断（名字没命中之类），不参与绘制
+    warnings: (layout && layout.warnings) || [],
+  };
 }
 
 module.exports = { textPlace, buildSvg };

@@ -37,6 +37,7 @@ require('./valoverlay.test');
 require('./floatifytrace.test');
 require('./wrapdiag.test');
 require('./debug.test');
+require('./closing.test');
 
 runAll().then(() => {
   // 路径样例，便于人工比对形状
