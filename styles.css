@@ -175,6 +175,32 @@
   height: auto;
 }
 
+/* ---------- 编辑模式：图靠溢出显示，任何一层都不许裁 ---------- */
+
+/* 宿主自己：浮动时图比盒子高，overflow 只能是 visible。 */
+.block-language-brace {
+  overflow: visible;
+}
+
+/*
+  两处内核 / 主题会把图整张切掉，图正好在「溢出到下一行」的那部分里：
+
+  1. 悬停时内核给块 widget 加 overflow: hidden（app.css：
+     .markdown-source-view.mod-cm6 .cm-embed-block:not(.cm-table-widget, .cm-lang-base):hover）
+  2. 内核给块 widget 加 contain: paint !important（app.css：
+     .markdown-source-view.mod-cm6 .cm-content > [contenteditable=false]）
+     contain: paint 下写 overflow: visible 不起作用，必须把 contain 一起抹掉。
+
+  行内 !important 只在插件接管期间存在（开关关掉、图刚重建的那一瞬都没有），
+  这里留一份不依赖 JS 的兜底，且要在 hover 状态下也成立。
+  选择器写成 .cm-content > .cm-embed-block 是为了压过内核那条规则的权重。
+*/
+.markdown-source-view.mod-cm6 .cm-content > .cm-embed-block:has(.brace-map-block),
+.markdown-source-view.mod-cm6 .cm-content > .cm-embed-block:has(.brace-map-block):hover {
+  overflow: visible !important;
+  contain: none !important;
+}
+
 /* 居中/行内模式下不需要内部横向滚动条撑高度 */
 .bm-float-center .brace-map-scroll,
 .bm-float-inline .brace-map-scroll {

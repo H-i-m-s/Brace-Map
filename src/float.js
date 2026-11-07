@@ -1274,6 +1274,272 @@ function oneLineHeightOf(content, lines) {
   return lh == null ? LP_LINE_FALLBACK : lh;
 }
 
+/* ------------------ 图为什么看不见：裁剪链体检 + 逐层放开 ------------------ */
+
+/**
+ * 「SVG 在 DOM 里、尺寸正常、就是看不见」只有三种可能：被裁了、跑偏了、被隐藏了。
+ * 前两种必须分开查，而 rect 帮不上忙 —— getBoundingClientRect 不反映裁剪，
+ * 图被切掉时 rect 依旧是完整的 256×128。
+ *
+ * 裁剪的来源也不一定是 overflow：内核给块 widget 写了
+ *   .markdown-source-view.mod-cm6 .cm-content > [contenteditable=false] {
+ *     contain: paint !important;
+ *   }
+ * contain: paint 把内容裁到 padding box，且**写 overflow: visible 也没用**。
+ * 一行高度方案里图全靠溢出显示，这一层就是「图整个消失」最直接的嫌疑。
+ *
+ * 所以体检要读五样：overflow / overflowX / overflowY / contain / clip-path，
+ * 放开时也要连 contain 一起放。
+ */
+
+/** 往上体检最多爬几层（host → .block-language-* → widget → .cm-content，十层绰绰有余） */
+const CLIP_DEPTH = 24;
+
+/**
+ * 一定不碰的层：滚动容器与编辑器根。
+ * 把 .cm-scroller 的 overflow 改成 visible 会废掉滚动条，所以它是硬边界：
+ * 只进诊断链，绝不下手。
+ */
+const CLIP_HARD_STOP = ['cm-scroller', 'cm-editor', 'markdown-source-view', 'app-container'];
+
+/** 读 computed 样式：先看注入的 getStyle（自测用），再看元素自己的 window */
+function styleOfEl(el, opts) {
+  const o = opts || {};
+  if (!el) return null;
+  try {
+    if (typeof o.getStyle === 'function') {
+      const cs = o.getStyle(el);
+      if (cs) return cs;
+    }
+  } catch (e) { /* 注入的读法坏了就往下退 */ }
+  try {
+    const doc = el.ownerDocument;
+    const view = doc && doc.defaultView;
+    if (view && typeof view.getComputedStyle === 'function') return view.getComputedStyle(el);
+  } catch (e) { /* 假 DOM / 离屏节点读不到 */ }
+  return null;
+}
+
+/** overflow 的取值里会裁掉溢出的：hidden / scroll / auto / clip / overlay */
+function overflowClips(v) {
+  const s = String(v == null ? '' : v).toLowerCase().trim();
+  if (!s || s === 'visible') return false;
+  return /hidden|scroll|auto|clip|overlay/.test(s);
+}
+
+/** contain 的取值里会裁掉溢出的：paint / content / strict（layout 本身不裁） */
+function containClips(v) {
+  const s = String(v == null ? '' : v).toLowerCase().trim();
+  if (!s || s === 'none') return false;
+  return /paint|content|strict/.test(s);
+}
+
+/** 这一层是不是绝对不许动的（滚动容器 / 编辑器根 / 页面根） */
+function isClipHardStop(el) {
+  if (!el) return true;
+  for (let i = 0; i < CLIP_HARD_STOP.length; i++) {
+    if (classHas(el, CLIP_HARD_STOP[i])) return true;
+  }
+  let tag = '';
+  try { tag = String(el.tagName || '').toLowerCase(); } catch (e) { tag = ''; }
+  return tag === 'body' || tag === 'html';
+}
+
+/**
+ * 一层的体检结果：属性原值 + 「为什么裁」。
+ * why 里的标签直接对应类名，日志里一眼能定位是哪条规则在切图。
+ * hard 为真的层只读不写（.cm-scroller 及以上）。
+ */
+function clipNodeInfo(el, opts) {
+  const cs = styleOfEl(el, opts);
+  const get = (p) => {
+    try { return cs && cs[p] != null ? String(cs[p]) : ''; } catch (e) { return ''; }
+  };
+  const info = {
+    el: dbgEl(el),
+    overflow: get('overflow'),
+    overflowX: get('overflowX'),
+    overflowY: get('overflowY'),
+    position: get('position'),
+    transform: get('transform'),
+    contain: get('contain'),
+    contentVisibility: get('contentVisibility'),
+    clipPath: get('clipPath'),
+    visibility: get('visibility'),
+    opacity: get('opacity'),
+    editable: '',
+    hard: false,
+    why: [],
+  };
+  try {
+    const raw = el && typeof el.getAttribute === 'function' ? el.getAttribute('contenteditable') : null;
+    info.editable = raw == null ? '' : String(raw);
+  } catch (e) { info.editable = ''; }
+  info.hard = isClipHardStop(el);
+  if (overflowClips(info.overflow) || overflowClips(info.overflowX) || overflowClips(info.overflowY)) {
+    info.why.push('overflow');
+  }
+  if (containClips(info.contain)) info.why.push('contain');
+  if (info.clipPath && info.clipPath !== 'none') info.why.push('clip-path');
+  if (info.contentVisibility === 'hidden') info.why.push('content-visibility');
+  /* 主题把块淡出（opacity:0）或者藏起来（visibility:hidden）也是同一个结果：图看不见 */
+  if (info.opacity !== '' && Number(info.opacity) === 0) info.why.push('opacity');
+  if (/hidden|collapse/.test(info.visibility)) info.why.push('visibility');
+  info.clips = info.why.length > 0;
+  return info;
+}
+
+/**
+ * 从 startEl 往上走到 stopEl（含端点）逐层体检。
+ * stopEl 传 null 就一路走到硬边界（.cm-scroller / .cm-editor）为止，只读不写。
+ * 顺序是从内到外，读日志时从上到下就是 DOM 的嵌套顺序。
+ *
+ * @returns {Array<{node:Element, info:object}>}
+ */
+function clipChainOf(startEl, stopEl, opts) {
+  const out = [];
+  let cur = startEl;
+  for (let i = 0; cur && i < CLIP_DEPTH; i++) {
+    const info = clipNodeInfo(cur, opts);
+    out.push({ node: cur, info });
+    if (stopEl && cur === stopEl) break;
+    if (info.hard) break;                    // 硬边界自己进链，到此为止
+    cur = cur.parentElement;
+  }
+  return out;
+}
+
+/**
+ * A + B：从内到外把裁剪逐层放开。
+ *   contain 非 none        → contain: none !important（内核的 contain: paint !important 只能这么压）
+ *   溢出不是 visible       → overflow: visible !important（连同出问题的长写属性）
+ *   clip-path 非 none      → none
+ * 只碰 startEl 到 stopEl 这一段；硬边界（.cm-scroller 及以上）一个字节都不写。
+ *
+ * 写下去的值全部走 put：施加路径里 put 就是带 !important 的记账写入，
+ * 卸载时能一次原样还回去。
+ *
+ * @returns {{chain:Array, before:Array<string>, wrote:Array, stop:string|null}}
+ */
+function openClipChain(startEl, stopEl, opts) {
+  const o = opts || {};
+  const put = typeof o.put === 'function'
+    ? o.put
+    : (el, prop, value) => setImportantStyle(el, prop, value);
+  const chain = clipChainOf(startEl, stopEl, o);
+  const wrote = [];
+  const write = (node, prop, value) => {
+    let s = null;
+    try { s = put(node, prop, value); } catch (e) { s = null; }
+    if (s) wrote.push({ el: dbgEl(node), prop: cssName(prop), value });
+    return !!s;
+  };
+
+  for (let i = 0; i < chain.length; i++) {
+    const info = chain[i].info;
+    const node = chain[i].node;
+    if (!info.clips || info.hard || !node || !node.style) continue;
+    if (containClips(info.contain)) write(node, 'contain', 'none');
+    if (overflowClips(info.overflow) || overflowClips(info.overflowX) || overflowClips(info.overflowY)) {
+      write(node, 'overflow', 'visible');
+      if (overflowClips(info.overflowX)) write(node, 'overflowX', 'visible');
+      if (overflowClips(info.overflowY)) write(node, 'overflowY', 'visible');
+    }
+    if (info.clipPath && info.clipPath !== 'none') write(node, 'clipPath', 'none');
+    if (info.contentVisibility === 'hidden') write(node, 'contentVisibility', 'visible');
+    if (info.opacity !== '' && Number(info.opacity) === 0) write(node, 'opacity', '1');
+    if (/hidden|collapse/.test(info.visibility)) write(node, 'visibility', 'visible');
+  }
+
+  const before = chain
+    .filter((x) => x.info.clips && !x.info.hard)
+    .map((x) => x.info.el + ':' + x.info.why.join('+'));
+  return { chain: chain.map((x) => x.info), before, wrote, stop: stopEl ? dbgEl(stopEl) : null };
+}
+
+/** rect 收成诊断用的四个数 */
+function rectBox(r) {
+  if (!r) return null;
+  return { top: round2(r.top), left: round2(r.left), w: round2(r.width), h: round2(r.height) };
+}
+
+/**
+ * 「图为什么看不见」的现场取证，一条记录回答三件事：
+ *   被裁了   链上有没有在裁的层（rect 看不出来）
+ *   跑偏了   host / svg 的 rect 是否落在视口外
+ *   被隐藏了 svg 的 display / visibility / opacity
+ * verdict：ok / clipped / offscreen / hidden / norect。
+ * 视口尺寸拿不到（假 DOM）时 inViewport 是 null，不误判成 offscreen。
+ */
+function visibilityReport(host, svg, content, opts) {
+  const o = opts || {};
+  const chain = clipChainOf(host, content, o);
+  const hostRect = rectOf(host);
+  const svgRect = svg ? rectOf(svg) : null;
+  const svgCs = svg ? styleOfEl(svg, o) : null;
+  const pick = (p) => {
+    try { return svgCs && svgCs[p] != null ? String(svgCs[p]) : ''; } catch (e) { return ''; }
+  };
+
+  let view = o.view || null;
+  if (!view) {
+    try {
+      const doc = host && host.ownerDocument;
+      view = doc && doc.defaultView ? doc.defaultView : null;
+    } catch (e) { view = null; }
+  }
+  const vw = view && Number(view.innerWidth) > 0 ? Number(view.innerWidth) : null;
+  const vh = view && Number(view.innerHeight) > 0 ? Number(view.innerHeight) : null;
+  const inView = (r) => {
+    if (!r || vw == null || vh == null) return null;
+    return (r.top + r.height) > 0 && r.top < vh && (r.left + r.width) > 0 && r.left < vw;
+  };
+
+  const clippers = chain.filter((x) => x.info.clips && !x.info.hard);
+  /* 链上只有「藏」没有「裁」：判决成 hidden，而不是 clipped */
+  const onlyHidden = clippers.length > 0 && clippers.every((x) => x.info.why.every(
+    (w) => w === 'opacity' || w === 'visibility'));
+  const hidden = pick('display') === 'none'
+    || /hidden|collapse/.test(pick('visibility'))
+    || Number(pick('opacity')) === 0;
+  const hostIn = inView(hostRect);
+  const svgIn = inView(svgRect);
+
+  let verdict = 'ok';
+  if (!svgRect && !hostRect) verdict = 'norect';
+  else if (hidden || onlyHidden) verdict = 'hidden';
+  else if (clippers.length) verdict = 'clipped';
+  else if (svgIn === false || (svgIn == null && hostIn === false)) verdict = 'offscreen';
+
+  const embed = climbTo(host, 'cm-embed-block', CLIP_DEPTH);
+  return {
+    verdict,
+    reason: clippers.length
+      ? clippers.map((x) => x.info.el + ':' + x.info.why.join('+')).join(' | ')
+      : '',
+    viewport: { w: vw, h: vh },
+    host: { rect: rectBox(hostRect), inViewport: hostIn },
+    svg: {
+      rect: rectBox(svgRect),
+      inViewport: svgIn,
+      display: pick('display'),
+      visibility: pick('visibility'),
+      opacity: pick('opacity'),
+    },
+    /* widget 自己的四个口径：高度 / overflow / position / contain 是否真的生效了 */
+    embed: embed ? {
+      el: dbgEl(embed),
+      rect: dbgRect(embed),
+      computed: dbgCss(embed, ['height', 'overflow', 'overflowX', 'overflowY',
+        'position', 'contain', 'clipPath']),
+      inline: dbgInlineAll(embed),
+      editable: clipNodeInfo(embed, o).editable,
+    } : null,
+    chain: chain.map((x) => x.info),
+    clipCount: clippers.length,
+  };
+}
+
 /**
  * 逐行留白：从 widget 后面第一行开始，一行一行试写 padding、量真实高度、累积，
  * 累积高度盖住图高就停。
@@ -1420,19 +1686,20 @@ function applyLivePreviewCssFloat(host, cfg, opts) {
   const before = cssFloatHeights(embed, content);     // 读 rect 会强制布局，先取一轮基线
   const styles = [];
   const put = (el, prop, value, important) => {
-    if (!el || !el.style) return;
+    if (!el || !el.style) return null;
     const s = important ? setImportantStyle(el, prop, value) : setInlineStyle(el, prop, value);
     if (s) styles.push(s);
+    return s || null;                       // 裁剪链要知道「这一条到底写进去没有」
   };
 
   /* widget 只占一行：CSS 高度 / DOM 高度 / CM6 记账三方对齐，不留偏差 */
   put(embed, 'height', lineH + 'px');
   put(embed, 'minHeight', '0');
   put(embed, 'maxHeight', lineH + 'px');
-  put(embed, 'overflow', 'visible');
+  put(embed, 'overflow', 'visible', true);      // 主题 / 内核可能写了 !important，普通行内压不住
   put(embed, 'float', 'none');
   put(embed, 'width', 'auto');
-  put(embed, 'position', 'relative');          // 内部绝对定位的包含块
+  put(embed, 'position', 'relative', true);     // 内部绝对定位的包含块（B：也不许被覆盖成 static）
   put(embed, 'margin', '0', true);             // app.css 给 .cm-content > * 写了 margin:0 !important
 
   /* 图从这一行浮出去：绝对定位贴正文列边界，父盒高度已被钉死，溢出到下方行上 */
@@ -1446,6 +1713,20 @@ function applyLivePreviewCssFloat(host, cfg, opts) {
   put(host, 'clear', 'none');
   put(host, 'margin', '0');
   put(host, 'display', 'flow-root');
+
+  /*
+   * A + B：图全靠溢出显示，从宿主往上到 .cm-content，凡是在裁的层当场放开。
+   * 内核给块 widget 写了 `contain: paint !important`（app.css：
+   * .markdown-source-view.mod-cm6 .cm-content > [contenteditable=false]），
+   * 那一层会把溢出到下一行的图整张切掉 —— 症状正是「SVG 在 DOM 里、
+   * 尺寸正常、就是看不见」。contain: paint 下写 overflow: visible 不起作用，
+   * 必须连 contain 一起写成行内 !important 才压得住。
+   * .cm-scroller 及以上一律不碰（改滚动容器的 overflow 会废掉滚动条）。
+   */
+  const clip = openClipChain(host, content, {
+    getStyle: o.getStyle,
+    put: (el, prop, value) => put(el, prop, value, true),
+  });
 
   /* 后续行留白：写一行量一行，盖住溢出部分就停 */
   const plan = planPinnedPads(candidates, overflow, {
@@ -1462,11 +1743,17 @@ function applyLivePreviewCssFloat(host, cfg, opts) {
   /* 写完再读一次：读 rect 本身会强制一次同步布局，所以这里拿到的是「施加之后」的真值 */
   const after = cssFloatHeights(embed, content);
 
+  /* 施加之后的可见性判决：裁剪链对不对、图在不在视口里、有没有被隐藏 */
+  const vis = visibilityReport(host, o.svg || null, content, {
+    getStyle: o.getStyle,
+    view: o.view || o.win,
+  });
+
   return {
     mode: parts.mode, side, width, imgH, overflow, lineH, span, gap,
     host, embed, content, svg: o.svg || null,
     pads: plan.pads, covered: plan.covered, shortfall: plan.shortfall, stopped: plan.stopped,
-    styles, diag: { before, after },
+    styles, clip, vis, diag: { before, after },
   };
 }
 
@@ -1522,6 +1809,22 @@ function cmHeightInfo(content, opts) {
 }
 
 /**
+ * 诊断：把一次可见性取证压成一行文本。
+ * 日志的 JSON 只保留浅层字段（debug.js 的 clip 有深度上限），
+ * 所以链子和矩形都先在这里拼成字符串。
+ */
+function visLine(rep) {
+  if (!rep) return '';
+  const box = (b) => (b ? b.top + ',' + b.left + ' ' + b.w + 'x' + b.h : '-');
+  const chain = rep.chain.map((n) => n.el + '[' + (n.overflow || '?') + '/' + (n.contain || '?')
+    + (n.clips && !n.hard ? ' CLIP:' + n.why.join('+') : '') + ']').join(' > ');
+  return rep.verdict + (rep.reason ? ' ' + rep.reason : '')
+    + ' host=' + box(rep.host.rect) + (rep.host.inViewport === false ? '(视口外)' : '')
+    + ' svg=' + box(rep.svg.rect) + (rep.svg.inViewport === false ? '(视口外)' : '')
+    + ' chain=' + chain;
+}
+
+/**
  * 诊断：新路径的点位记录。
  *   widget   钉成一行之后的高度（rect / offset / client）——目标 ~27，不是 190
  *   svg      图层自己的 rect——要溢出去、位置正确、宽度对
@@ -1574,6 +1877,14 @@ function cssFloatInfo(rec, applies, opts) {
     /* 施加前后的对照：差多少，就是 CM6 需要重新记账的量 */
     before: rec.diag ? rec.diag.before : null,
     after: rec.diag ? rec.diag.after : null,
+    /* 图为什么看不见：裁剪链（哪几层在裁，放开了几层）+ 可见性判决 */
+    clip: rec.clip ? {
+      stop: rec.clip.stop,
+      before: rec.clip.before.join(' | '),
+      wrote: rec.clip.wrote.map((w) => w.el + ':' + w.prop + '=' + w.value).join(' | '),
+      wroteCount: rec.clip.wrote.length,
+    } : null,
+    vis: rec.vis ? visLine(rec.vis) : null,
     embedBottom: eBottom,
     content: dbgEl(rec.content),
     contentRect: dbgRect(rec.content),
@@ -1825,6 +2136,9 @@ function createCssFloatControl(host, cfg, opts) {
         covered: record ? record.covered : 0,
         shortfall: record ? record.shortfall : 0,
         styles: record ? record.styles.length : 0,
+        /* 施加之后的可见性判决：ok / clipped / offscreen / hidden / norect */
+        vis: record && record.vis ? record.vis.verdict : null,
+        clipFixed: record && record.clip ? record.clip.wrote.length : 0,
         observer: !!observer,
         applies,
         measure: measure ? measure.state() : null,
@@ -2627,6 +2941,17 @@ module.exports = {
   computedLineHeightOf,
   oneLineHeightOf,
   planPinnedPads,
+  /* 图为什么看不见：裁剪链体检与逐层放开 */
+  CLIP_DEPTH,
+  CLIP_HARD_STOP,
+  styleOfEl,
+  overflowClips,
+  containClips,
+  isClipHardStop,
+  clipNodeInfo,
+  clipChainOf,
+  openClipChain,
+  visibilityReport,
   applyLivePreviewCssFloat,
   createCssFloatControl,
   cmHeightInfo,

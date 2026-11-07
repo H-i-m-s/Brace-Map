@@ -139,6 +139,7 @@ function cmTreeDirect(opts) {
 /** 给假元素补上 className（classHas 走 classList，放宽规则要读 className） */
 function withClass(el, names) {
   el.className = names.join(' ');
+  if (!el.tagName) el.tagName = 'div';       // dbgEl 的标签名，诊断里好认
   return el;
 }
 
@@ -1341,6 +1342,219 @@ function tDeferLogs() {
   ok(I.dbgText().indexOf('lpf.reset.flushed') >= 0, 'lp-dbg: 复位落定也记了点');
 }
 
+/* ------------------------------ 裁剪链（图为什么看不见） ------------------------------ */
+
+/**
+ * 给假元素挂一份 computed 样式。读的时候先看行内（我们写下去的值），再看基线：
+ * 这样「写 !important 之后 computed 变成 visible」这件事在假 DOM 里也能成立。
+ */
+function withComputed(el, cs) {
+  el.__cs = cs || {};
+  el.ownerDocument = {
+    defaultView: {
+      innerWidth: 1200,
+      innerHeight: 800,
+      getComputedStyle: (n) => {
+        const base = (n && n.__cs) || {};
+        const inline = (n && n.style) || {};
+        const out = {};
+        for (const k of Object.keys(base)) out[k] = base[k];
+        for (const k of Object.keys(inline)) {
+          if (typeof inline[k] === 'string' && inline[k] !== '') out[k] = inline[k];
+        }
+        return out;
+      },
+    },
+  };
+  return el;
+}
+
+/**
+ * 复刻真机上的裁剪现场（Obsidian 1.13.7 + Blue Topaz）：
+ *
+ *   .cm-scroller(overflow:auto，滚动容器)
+ *     > .cm-content(overflow:hidden —— 主题写的)
+ *       > .cm-embed-block(contain:paint —— 内核写的，!important)
+ *         > .block-language-brace(overflow:hidden —— 中间层)
+ *           > host（图，绝对定位）
+ *
+ * 这就是「SVG 在 DOM 里、尺寸正常、整张看不见」的布局证据：
+ * 任意一层都足以把溢出到下一行的图切掉，而三层同时存在是常态。
+ */
+function clippedTree() {
+  const tree = cmTreeDirect();
+  const embed = tree.embed;
+  const content = tree.content;
+
+  const wrap = fakeEl(['markdown-rendered'], 26,
+    { top: 0, left: 0, width: 820, height: 26, right: 820, bottom: 26 });
+  wrap.parentElement = embed;
+  tree.host.parentElement = wrap;
+
+  const scroller = fakeEl(['cm-scroller'], 0,
+    { top: 0, left: 0, width: 820, height: 800, right: 820, bottom: 800 });
+  content.parentElement = scroller;
+
+  withClass(wrap, ['markdown-rendered']);
+  withClass(embed, ['cm-embed-block', 'markdown-rendered']);
+  withClass(content, ['cm-content']);
+  withClass(scroller, ['cm-scroller']);
+  withClass(tree.host, ['block-language-brace']);
+
+  const clipAll = (o) => Object.assign({
+    overflow: 'hidden', overflowX: 'hidden', overflowY: 'hidden', position: 'static',
+    transform: 'none', contain: 'none', clipPath: 'none', contentVisibility: 'visible',
+  }, o);
+
+  withComputed(wrap, clipAll());
+  withComputed(embed, clipAll({ overflow: 'visible', overflowX: 'visible', overflowY: 'visible',
+    position: 'relative', contain: 'paint', height: '26px' }));
+  withComputed(content, clipAll());
+  withComputed(scroller, clipAll({ overflow: 'auto', overflowX: 'auto', overflowY: 'auto' }));
+  withComputed(tree.host, clipAll({ overflow: 'visible', overflowX: 'visible', overflowY: 'visible' }));
+  withComputed(tree.svg, { display: 'block', visibility: 'visible', opacity: '1' });
+
+  return { tree, embed, content, wrap, scroller };
+}
+
+/** 裁剪链体检：谁在裁、裁的是哪一条、链子走到哪儿停 */
+function tClipChain() {
+  ok(I.containClips('paint') && I.containClips('content') && I.containClips('strict'),
+    'lp-clip: contain 的 paint / content / strict 都算裁');
+  ok(!I.containClips('layout') && !I.containClips('none') && !I.containClips(''),
+    'lp-clip: layout / none / 空都不算裁（layout 不裁溢出）');
+  ok(I.overflowClips('hidden') && I.overflowClips('clip') && I.overflowClips('auto')
+    && I.overflowClips('scroll'), 'lp-clip: 会裁的 overflow 取值');
+  ok(!I.overflowClips('visible') && !I.overflowClips(''), 'lp-clip: visible / 读不到都不算裁');
+
+  const { tree, content, scroller } = clippedTree();
+
+  const chain = I.clipChainOf(tree.host, null, {});
+  eq(chain[0].node, tree.host, 'lp-clip: 链子第一条是宿主自己（宿主也可能被裁）');
+  eq(chain[1].info.el, 'div.markdown-rendered', 'lp-clip: 链子上有中间层');
+  eq(chain[chain.length - 1].info.el, 'div.cm-scroller', 'lp-clip: 一直走到 .cm-scroller');
+  eq(chain[chain.length - 1].info.hard, true, 'lp-clip: .cm-scroller 标成硬边界');
+  eq(chain[chain.length - 1].node, scroller, 'lp-clip: 硬边界就是那个滚动容器');
+
+  const stop = I.clipChainOf(tree.host, content, {});
+  eq(stop[stop.length - 1].node, content, 'lp-clip: 给了 stop 就停在 .cm-content');
+  ok(stop.every((x) => x.info.el.indexOf('cm-scroller') < 0), 'lp-clip: 到 .cm-content 为止，往上不进链');
+
+  const why = {};
+  for (const x of chain) why[x.info.el] = x.info.why.join('+');
+  eq(why['div.cm-embed-block.markdown-rendered'], 'contain', 'lp-clip: widget 的锅是 contain');
+  eq(why['div.cm-content'], 'overflow', 'lp-clip: .cm-content 的锅是 overflow');
+  eq(why['div.markdown-rendered'], 'overflow', 'lp-clip: 中间层的锅是 overflow');
+  eq(why['div.block-language-brace'], '', 'lp-clip: 宿主自己没在裁（浮动时它已经是 visible）');
+
+  /* 施加前的判决必须是「被裁了」——这正是真机上发生的事 */
+  const before = I.visibilityReport(tree.host, tree.svg, content, {});
+  eq(before.verdict, 'clipped', 'lp-clip: 施加前判决是 clipped');
+  ok(before.clipCount >= 3, 'lp-clip: 至少三层在裁');
+  ok(before.reason.indexOf('contain') >= 0, 'lp-clip: 责任层里点名 contain');
+  eq(before.host.inViewport, true, 'lp-clip: 宿主在视口内（不是跑偏）');
+  eq(before.svg.inViewport, true, 'lp-clip: 图也在视口内');
+  eq(before.svg.display, 'block', 'lp-clip: 图没被 display:none 藏起来');
+
+  /* 没 computed 可读（假 DOM / 读不到样式）：一个字符都不写 */
+  const blind = cmTreeDirect();
+  eq(I.openClipChain(blind.host, blind.content, {}).wrote.length, 0,
+    'lp-clip: 读不到 computed 就什么都不写（不乱动主题）');
+
+  /* 另一类「看不见」：链上没有裁，但主题把容器淡成 opacity: 0 */
+  const faded = clippedTree();
+  const open = { overflow: 'visible', overflowX: 'visible', overflowY: 'visible',
+    position: 'static', transform: 'none', contain: 'none', clipPath: 'none',
+    visibility: 'visible', opacity: '1' };
+  withComputed(faded.wrap, open);
+  withComputed(faded.embed, Object.assign({}, open, { position: 'relative' }));
+  withComputed(faded.content, Object.assign({}, open, { opacity: '0' }));
+  const fadedRep = I.visibilityReport(faded.tree.host, faded.tree.svg, faded.content, {});
+  eq(fadedRep.verdict, 'hidden', 'lp-clip: 容器被淡出 → 判决 hidden（不是 clipped）');
+  ok(fadedRep.reason.indexOf('opacity') >= 0, 'lp-clip: 责任层点名 opacity');
+  I.applyLivePreviewCssFloat(faded.tree.host, { float: 'right' }, { svg: faded.tree.svg });
+  eq(faded.content.style.opacity, '1', 'lp-clip: 被淡出的层拉回 opacity: 1');
+  eq(faded.content.style.__important.opacity, 'important', 'lp-clip: opacity 也带 !important');
+}
+
+/** 自动修正：A 逐层放开裁剪 + B 包含块保险，并且 .cm-scroller 一个字节都不碰 */
+function tClipFix() {
+  const { tree, embed, content, wrap, scroller } = clippedTree();
+
+  const rec = I.applyLivePreviewCssFloat(tree.host, { float: 'right' }, { svg: tree.svg });
+  ok(!!rec, 'lp-clip-fix: 裁剪现场下照样施加');
+
+  /* A：中间层与 .cm-content 的 overflow 被放开，且带 !important */
+  eq(wrap.style.overflow, 'visible', 'lp-clip-fix: 中间层的 overflow 放开');
+  eq(wrap.style.__important.overflow, 'important', 'lp-clip-fix: 放开带 !important（压主题）');
+  eq(content.style.overflow, 'visible', 'lp-clip-fix: .cm-content 的 overflow 也放开');
+  eq(content.style.__important.overflow, 'important', 'lp-clip-fix: .cm-content 也带 !important');
+
+  /* A：widget 的 contain 抹掉——内核写的就是 !important，只有行内 !important 压得住 */
+  eq(embed.style.contain, 'none', 'lp-clip-fix: widget 的 contain 抹成 none');
+  eq(embed.style.__important.contain, 'important', 'lp-clip-fix: contain 也是 !important');
+
+  /* B：包含块保险 */
+  eq(embed.style.position, 'relative', 'lp-clip-fix: widget 当包含块');
+  eq(embed.style.__important.position, 'important',
+    'lp-clip-fix: position 带 !important（主题写 static !important 也压得住）');
+
+  /* 悬停时的内核规则（非 !important 的 overflow: hidden）打不过行内 !important */
+  eq(embed.style.__important.overflow, 'important', 'lp-clip-fix: hover 也保不住那张图（行内 !important 压住）');
+
+  /* 硬边界：滚动容器绝不动 */
+  eq(scroller.style.overflow, undefined, 'lp-clip-fix: .cm-scroller 的 overflow 一个字不碰');
+  eq(scroller.style.__important.overflow, undefined, 'lp-clip-fix: .cm-scroller 连 !important 都没写过');
+
+  /* 放开之后图应该看得见：判决 ok、链上零裁剪 */
+  eq(rec.vis.verdict, 'ok', 'lp-clip-fix: 放开后判决是 ok（图可见）');
+  eq(rec.vis.clipCount, 0, 'lp-clip-fix: 链上不再有在裁的层');
+  ok(rec.clip.wrote.length >= 3, 'lp-clip-fix: 至少写了三条（wrapper / widget / content）');
+  eq(rec.clip.stop, 'div.cm-content', 'lp-clip-fix: 修正范围到 .cm-content 为止');
+
+  /* 回到原位：卸载时这些样式都要还回去，不能留下脏 inline */
+  I.restoreStyles(rec.styles);
+  eq(wrap.style.overflow, undefined, 'lp-clip-fix: 还原中间层（交还给主题）');
+  eq(embed.style.contain, undefined, 'lp-clip-fix: 还原 widget 的 contain');
+  eq(embed.style.position, undefined, 'lp-clip-fix: 还原 widget 的 position');
+  eq(content.style.overflow, undefined, 'lp-clip-fix: 还原 .cm-content 的 overflow');
+
+  /* 什么都不裁的结构：一条样式都不写（不能顺手改造好页面） */
+  const clean = clippedTree();
+  withComputed(clean.wrap, { overflow: 'visible', overflowX: 'visible', overflowY: 'visible',
+    position: 'static', transform: 'none', contain: 'none', clipPath: 'none' });
+  withComputed(clean.embed, { overflow: 'visible', overflowX: 'visible', overflowY: 'visible',
+    position: 'relative', transform: 'none', contain: 'none', clipPath: 'none' });
+  withComputed(clean.content, { overflow: 'visible', overflowX: 'visible', overflowY: 'visible',
+    position: 'static', transform: 'none', contain: 'none', clipPath: 'none' });
+  const rec2 = I.applyLivePreviewCssFloat(clean.tree.host, { float: 'right' }, { svg: clean.tree.svg });
+  ok(!!rec2, 'lp-clip-fix: 干净结构照样施加');
+  eq(rec2.clip.wrote, [], 'lp-clip-fix: 没有裁剪就不写任何裁剪样式');
+  ok(clean.wrap.style.overflow === undefined && clean.content.style.overflow === undefined,
+    'lp-clip-fix: 干净结构的中间层与 .cm-content 保持原样');
+  eq(rec2.vis.verdict, 'ok', 'lp-clip-fix: 干净结构判决 ok');
+
+  /*
+   * 走控制器（真机上就是这条）再验一次：日志里要能直接读出「判决 + 责任层」，
+   * 并且卸载时中间层也要原样还回去。
+   */
+  I.flushLivePreviewFloats();
+  const t3 = clippedTree();
+  const ctl = I.attachLivePreviewFloat(t3.tree.host, { float: 'right' }, { svg: t3.tree.svg });
+  ok(!!ctl, 'lp-clip-fix: 控制器挂上了');
+  const st = ctl.state();
+  eq(st.vis, 'ok', 'lp-clip-fix: state 里能看到可见性判决');
+  ok(st.clipFixed >= 3, 'lp-clip-fix: state 里能看到放开了几层');
+  const log = I.dbgText();
+  ok(log.indexOf('"vis":"ok') >= 0, 'lp-clip-fix: 日志里记了可见性判决（施加后是 ok）');
+  ok(log.indexOf(':contain') >= 0, 'lp-clip-fix: 日志点名了 contain 那一层（定罪依据）');
+  ok(log.indexOf('wrote') >= 0, 'lp-clip-fix: 日志带放开了哪几条');
+  ctl.dispose();
+  eq(t3.wrap.style.overflow, undefined, 'lp-clip-fix: 卸载后中间层的 overflow 还回去');
+  eq(t3.embed.style.contain, undefined, 'lp-clip-fix: 卸载后 contain 也还回去');
+  I.flushLivePreviewFloats();
+}
+
 suite('live-float-lines', () => { tPlanLinesGuard(); tPlanLinesBasic(); tPlanLinesEdge(); });
 suite('live-float-pads', () => { tPlanPadsBasic(); tPlanPadsMerge(); tPlanPadsGuard(); tApplyPadsWrite(); tPadSurvivesBadRect(); tLedger(); });
 suite('live-float-dom', () => { tParts(); tClassHelpers(); tApplyGeometry(); tApplyGuards(); });
@@ -1352,6 +1566,7 @@ suite('live-float-css', () => {
   tOneLineHeight(); tPinnedPads();
   tCssApply(); tCssGuards(); tCssControl(); tCssRefresh(); tCssOriginals(); tCssFlushAll(); tCssLog();
 });
+suite('live-float-clip', () => { tClipChain(); tClipFix(); });
 suite('live-float-ledger', () => {
   tLedgerDiffWrites(); tLedgerSweep(); tLedgerClaim(); tLedgerPrune(); tPadBaseUnit();
 });
