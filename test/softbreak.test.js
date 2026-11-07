@@ -4,9 +4,9 @@
  * brace-map selftest · 续行（软换行）与 <br> 硬换行
  *
  * 两件事各占一半：
- *   续行  缩进比上一个节点深的一行 = 它的续行，拼进同一节点后重新走行内解析
+ *   续行  缩进比上一个节点深的一行 = 它的续行，用换行符接进同一节点后重新走行内解析
  *   硬换行 节点文字里的 <br> / <br/> / <br />，渲染成独立行（不占字符、不留空行）
- * 两者可以叠加：先按 <br> 分段，每段内部再按 maxWidth 折行。
+ * 两者等价：续行的换行符走的是 <br> 同一条切分路径，每段内部再按 maxWidth 折行。
  * ============================================================ */
 
 const { I, ok, eq, suite } = require('./framework');
@@ -37,47 +37,58 @@ function tspanCount(markup) {
 
 function tSoftChinese() {
   const cfg = I.parseSource(['- 普通平键', '  按端部形状分'].join('\n'));
+  const n0 = cfg.roots[0];
   eq(cfg.roots.length, 1, 'soft-cn: 续行不产生新节点');
   eq(cfg.roots[0].children.length, 0, 'soft-cn: 续行不是子节点');
-  eq(cfg.roots[0].text, '普通平键按端部形状分', 'soft-cn: 中文之间不加空格');
-  eq(cfg.roots[0].segRuns.length, 1, 'soft-cn: 续行不是硬换行，仍是一段');
-  eq(cfg.roots[0].runs.length, 1, 'soft-cn: 拼完还是一段 run');
-  eq(cfg.roots[0].raw, '普通平键按端部形状分', 'soft-cn: raw 里记着拼好的原文');
+  eq(n0.text, '普通平键按端部形状分', 'soft-cn: 拍平文字不丢字');
+  eq(n0.segRuns.length, 2, 'soft-cn: 续行就是硬换行，切成两段');
+  eq(n0.segRuns.map(I.runsText), ['普通平键', '按端部形状分'], 'soft-cn: 两段各是一行');
+  eq(n0.runs.length, 2, 'soft-cn: 拍平后是两个 run');
+  eq(n0.raw, '普通平键\n按端部形状分', 'soft-cn: raw 里记着换行符');
+  const built = I.buildSvg(cfg, LAYOUT_OPTS);
+  eq(lineTexts(built.layout.nodes[0]), ['普通平键', '按端部形状分'], 'soft-cn: 出图两行');
 }
 
 function tSoftEnglish() {
   const cfg = I.parseSource(['- Type A', '  and B'].join('\n'));
-  eq(cfg.roots[0].text, 'Type A and B', 'soft-en: 英文之间补空格');
+  eq(cfg.roots[0].segRuns.map(I.runsText), ['Type A', 'and B'],
+    'soft-en: 英文续行也断行，接缝不补空格');
+  eq(cfg.roots[0].segRuns.length, 2, 'soft-en: 英文续行是两段');
 
-  // 接缝两侧只要有一侧是 ASCII 字母数字就补空格，否则不补
+  // 接缝处不再有「一侧是 ASCII 就补空格」的规则，两行本来就断开
   const tail = I.parseSource(['- 甲A', '  乙'].join('\n'));
-  eq(tail.roots[0].text, '甲A 乙', 'soft-en: 上行末尾是 ASCII → 补空格');
+  eq(tail.roots[0].segRuns.map(I.runsText), ['甲A', '乙'], 'soft-en: 上行末尾是 ASCII 也不补空格');
   const head = I.parseSource(['- 甲', '  B型'].join('\n'));
-  eq(head.roots[0].text, '甲 B型', 'soft-en: 本行开头是 ASCII → 补空格');
+  eq(head.roots[0].segRuns.map(I.runsText), ['甲', 'B型'], 'soft-en: 本行开头是 ASCII 也不补空格');
 }
 
 function tSoftStyle() {
   const cfg = I.parseSource(['- 普通平键', '  按 **端部形状** 分'].join('\n'));
   eq(cfg.roots[0].text, '普通平键按 端部形状 分', 'soft-style: 续行里的粗体标记照常剥掉');
+  eq(cfg.roots[0].segRuns.length, 2, 'soft-style: 带样式的续行照样断行');
   const bold = cfg.roots[0].runs.filter((r) => r.bold).map((r) => r.text);
   eq(bold, ['端部形状'], 'soft-style: 续行里的 **粗体** 仍解析成粗体 run');
   ok(cfg.roots[0].runs.length >= 3, 'soft-style: 粗体前后各有一段普通文字');
 
   const built = I.buildSvg(cfg, LAYOUT_OPTS);
   const n = built.layout.nodes[0];
-  eq(n.lineCount, 1, 'soft-style: 续行不带来额外行');
+  eq(n.lineCount, 2, 'soft-style: 续行带来第二行');
+  eq(lineTexts(n), ['普通平键', '按 端部形状 分'], 'soft-style: 两行文字各归各位');
   ok(built.markup.indexOf('font-weight="600"') > 0, 'soft-style: 出图里带粗体 tspan');
   ok(built.markup.indexOf('**') < 0, 'soft-style: 标记不进图');
 }
 
 function tSoftMath() {
   const cfg = I.parseSource(['- 面积', '  为 $x^2$ 平方厘米'].join('\n'));
-  eq(cfg.roots[0].text, '面积为$x^2$平方厘米', 'soft-math: 拼好后公式围栏还在原文里');
-  const maths = cfg.roots[0].runs.filter((r) => r.math).map((r) => r.math);
-  eq(maths, ['x^2'], 'soft-math: 续行里的公式解析成 math run');
+  eq(cfg.roots[0].text, '面积为$x^2$平方厘米', 'soft-math: 拍平后公式围栏还在原文里');
+  eq(cfg.roots[0].segRuns.length, 2, 'soft-math: 带公式的续行也是两段');
+  eq(cfg.roots[0].segRuns[0].filter((r) => r.math).length, 0, 'soft-math: 第一段没有公式');
+  eq(cfg.roots[0].segRuns[1].filter((r) => r.math).map((r) => r.math), ['x^2'],
+    'soft-math: 公式整块落在第二段，没被换行拆开');
 
   const cfg2 = I.parseSource(['- 见', '  [[笔记]]'].join('\n'));
   eq(cfg2.roots[0].text, '见笔记', 'soft-link: 续行里的双链照常解析');
+  eq(cfg2.roots[0].segRuns.length, 2, 'soft-link: 带链接的续行也是两段');
   eq(cfg2.roots[0].runs.filter((r) => r.href).map((r) => r.href), ['笔记'],
     'soft-link: 续行里的双链带 href');
 }
@@ -87,11 +98,12 @@ function tSoftColon() {
   const zh = I.parseSource(['- 普通平键', '  注意: 这个很重要'].join('\n'));
   eq(zh.roots.length, 1, 'soft-colon: 中文冒号行没被当成指令吃掉');
   eq(zh.roots[0].text, '普通平键注意: 这个很重要', 'soft-colon: 中文冒号行并进上一个节点');
+  eq(zh.roots[0].segRuns.length, 2, 'soft-colon: 中文冒号行是第二行');
 
   // ASCII 未知键：长得像指令，但键不在白名单 → 仍是续行
   const en = I.parseSource(['- 普通平键', '  note: 这个很重要'].join('\n'));
-  eq(en.roots[0].text, '普通平键 note: 这个很重要', 'soft-colon: 未知键的冒号行当续行');
-  eq(en.roots[0].segRuns.length, 1, 'soft-colon: 未知键没有制造新节点或新行');
+  eq(en.roots[0].text, '普通平键note: 这个很重要', 'soft-colon: 未知键的冒号行当续行');
+  eq(en.roots[0].segRuns.length, 2, 'soft-colon: 未知键没有制造新节点，但断成两行');
 }
 
 function tSoftDirWins() {
@@ -112,9 +124,30 @@ function tSoftMulti() {
     '  常用 45 钢',
   ].join('\n'));
   eq(cfg.roots.length, 1, 'soft-multi: 三条续行还是同一个节点');
+  eq(cfg.roots[0].segRuns.map(I.runsText),
+    ['普通平键', '按端部形状分', '有 A 型和 B 型', '常用 45 钢'],
+    'soft-multi: 每一条续行各自成行');
   eq(cfg.roots[0].text, '普通平键按端部形状分有 A 型和 B 型常用 45 钢',
-    'soft-multi: 连续续行按顺序拼接');
-  eq(cfg.roots[0].segRuns.length, 1, 'soft-multi: 连续续行不产生硬换行');
+    'soft-multi: 拍平文字不丢字');
+  const built = I.buildSvg(cfg, LAYOUT_OPTS);
+  const n = built.layout.nodes[0];
+  eq(n.lineCount, 4, 'soft-multi: 出图四行');
+  eq(n.bh, TEXT_H + 3 * LINE_H, 'soft-multi: 四行的节点高');
+
+  // 两条续行 → 三段（工单里的「多条续行」基本形）
+  const three = I.parseSource(['- 甲', '  乙', '    丙'].join('\n'));
+  eq(three.roots[0].segRuns.length, 3, 'soft-multi: 两条续行 = 三段');
+  eq(three.roots[0].segRuns.map(I.runsText), ['甲', '乙', '丙'], 'soft-multi: 三段顺序正确');
+}
+
+function tSoftIndent() {
+  // 列表项缩进基准之后的额外空格不能带进文字
+  const cfg = I.parseSource(['- 普通平键', '        按端部形状分'].join('\n'));
+  eq(cfg.roots[0].raw, '普通平键\n按端部形状分', 'soft-indent: 续行取的是 trim 之后的内容');
+  eq(I.runsText(cfg.roots[0].segRuns[1]), '按端部形状分', 'soft-indent: 第二行行首不带缩进');
+  const built = I.buildSvg(cfg, LAYOUT_OPTS);
+  eq(lineTexts(built.layout.nodes[0]), ['普通平键', '按端部形状分'], 'soft-indent: 出图第二行从行首起');
+  eq(lineTexts(built.layout.nodes[0])[1].length, 6, 'soft-indent: 行首空格没算进行宽');
 }
 
 function tSoftGuard() {
@@ -133,11 +166,14 @@ function tSoftGuard() {
   eq(mix.roots[0].children[0].text, 'A 型', 'soft-guard: 子节点文字正确');
   eq(mix.roots[0].children[0].children.length, 1, 'soft-guard: 更深一层没受影响');
 
-  // 续行参与折行：合并后的文字一起按 maxWidth 切
+  // 续行参与折行：每一段内部各自按 maxWidth 切，段与段之间是硬换行
   const wrap = I.buildSvg(I.parseSource(['maxWidth: 80', '- 普通平键', '  按端部形状分'].join('\n')),
     WRAP_OPTS);
   const n = wrap.layout.nodes[0];
-  ok(n.lineCount > 1, 'soft-guard: 续行拼完的长文字仍会被 maxWidth 折开', String(n.lineCount));
+  eq(lineTexts(n)[0], '普通平键', 'soft-guard: 第一段没跟续行拼成一行');
+  eq(n.lineCount, 3, 'soft-guard: 段一 1 行 + 段二按 maxWidth 折成 2 行');
+  ok(n.textLines.every((l) => l.width <= 80 + 1e-9), 'soft-guard: 每行都不超过 maxWidth',
+    JSON.stringify(n.textLines.map((l) => l.width)));
   eq(lineTexts(n).join(''), n.text, 'soft-guard: 折行不丢字');
 }
 
@@ -267,13 +303,15 @@ function tBrBox() {
 
 function tSoftBrCombo() {
   const cfg = I.parseSource(['- 普通平键', '  按端部形状分<br>再一行'].join('\n'));
-  eq(cfg.roots[0].segRuns.length, 2, 'soft-br: 续行里写 <br> 就是两段');
+  eq(cfg.roots[0].segRuns.length, 3, 'soft-br: 续行的换行符 + <br> 就是三段');
+  eq(cfg.roots[0].segRuns.map(I.runsText), ['普通平键', '按端部形状分', '再一行'],
+    'soft-br: 三种来源的硬换行排在一起');
   eq(cfg.roots[0].text, '普通平键按端部形状分再一行', 'soft-br: 段间不补空格');
   const built = I.buildSvg(cfg, LAYOUT_OPTS);
   const n = built.layout.nodes[0];
-  eq(n.lineCount, 2, 'soft-br: 出图两行');
-  eq(lineTexts(n), ['普通平键按端部形状分', '再一行'], 'soft-br: 第一行含续行内容');
-  eq(n.bh, TEXT_H + LINE_H, 'soft-br: 行高按多行节点算');
+  eq(n.lineCount, 3, 'soft-br: 出图三行');
+  eq(lineTexts(n), ['普通平键', '按端部形状分', '再一行'], 'soft-br: 三行文字各归各位');
+  eq(n.bh, TEXT_H + 2 * LINE_H, 'soft-br: 行高按多行节点算');
 }
 
 function tSoftBr() {
@@ -284,6 +322,7 @@ function tSoftBr() {
   tSoftColon();
   tSoftDirWins();
   tSoftMulti();
+  tSoftIndent();
   tSoftGuard();
   tBrParse();
   tBrRender();

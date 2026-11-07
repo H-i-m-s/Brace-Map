@@ -4241,9 +4241,8 @@ const HEAD_RE = /^#{1,6}\s+(.*)$/;
  */
 const DIR_KEYS = ['dir', 'brace', 'box', 'closing', 'title', 'maxwidth', 'float', 'width', 'bg'];
 
-// 续行拼接的空格规则：只要贴着接缝的那一侧是 ASCII 字母数字就补一个空格
-const ASCII_TAIL_RE = /[A-Za-z0-9]$/;
-const ASCII_HEAD_RE = /^[A-Za-z0-9]/;
+// 续行拼接用的硬换行符：原样留在 raw 里，由 text.js 的行内解析层切开
+const SOFT_BREAK = '\n';
 
 function parseBox(v) {
   const s = String(v).trim().toLowerCase();
@@ -4265,26 +4264,28 @@ function leadingIndent(line) {
 }
 
 /**
- * 续行拼接：把两段文字接起来，中间按接缝决定要不要空格。
- *   普通平键 + 按端部形状分 → 普通平键按端部形状分（中文之间不补，补了显松）
- *   Type A + and B          → Type A and B（英文单词之间必须补，否则粘成一个词）
+ * 续行拼接：代码块里怎么换行，图上就怎么换行。
+ *   普通平键 ⏎ 按端部形状分 → 两段，两行
+ * 拼的是换行符，不是空格：接缝处不补空格、不做词间处理，续行本身 trim 掉
+ * 行首缩进后再接。换行符走的是 <br> 同一条切分路径（<br> 本来就是硬换行）。
  */
 function joinContinuation(prev, line) {
-  const a = String(prev == null ? '' : prev);
+  const a = String(prev == null ? '' : prev).replace(/\s+$/, '');
   const b = String(line == null ? '' : line).trim();
   if (!a) return b;
   if (!b) return a;
-  return a + (ASCII_TAIL_RE.test(a) || ASCII_HEAD_RE.test(b) ? ' ' : '') + b;
+  return a + SOFT_BREAK + b;
 }
 
 /**
  * 把一段原始正文解析进节点。
  *
  * 节点同时留两份：
- *   segRuns  硬换行（<br>）之间的每一段，每一段是一组 run —— layout 先照它分段，
- *            段内再按 maxwidth 折行
+ *   segRuns  硬换行（<br> 或续行留下的换行符）之间的每一段，每一段是一组 run
+ *            —— layout 先照它分段，段内再按 maxwidth 折行
  *   runs     拍平后的全部 run（公式转换、宽度累加都按它扫）
- * 续行是在解析前就拼进 raw 的，所以行内样式、公式、双链在续行里跟正文一样解析。
+ * 续行是在解析前就拼进 raw 的（中间是换行符），所以行内样式、公式、双链在
+ * 续行里跟正文一样解析，公式与链接的原子性由切分层保证。
  */
 function fillNode(node, rawBody) {
   const raw = String(rawBody == null ? '' : rawBody);
@@ -4939,22 +4940,28 @@ function maskLinks(raw) {
 }
 
 /* ============================================================
- * 硬换行：<br> / <br/> / <br />（大小写不敏感）
+ * 硬换行：<br> / <br/> / <br />（大小写不敏感）与续行留下的换行符
+ *
+ * 两种来源走同一条切分路径，效果完全一致：
+ *   <br>                     写在节点文字里的硬换行
+ *   \n                       解析阶段拼续行时留下的换行
  *
  * 切分点放在「公式与链接都换成占位符之后、逐段解析之前」：
  *   - 公式是原子，$a<br>b$ 不会被从中间切开（占位符里没有 <br>）
  *   - 链接的可见文字是一整块，[[甲<br>乙]] 同理
  *   - <font> 允许横跨 <br>（<font color="red">甲<br>乙</font> 两行都还是红的），
  *     所以切分发生在每个 chunk 送进 push 的当下，颜色跟着 chunk 走
- * 标签本身不进任何 run，两侧也不补空格。
+ * 标记与换行符本身不进任何 run，两侧也不补空格。
  * ============================================================ */
 
-const BR_TAG_RE = /<br\s*\/?>/i;
+// <br> 与换行符都是硬换行；\r\n 一并收掉，免得 Windows 剪贴板带进来的对字节
+// 被折成两行
+const HARD_BREAK_RE = /<br\s*\/?>|\r\n?|\n/i;
 
 /**
- * 把一行原文按 <br> 切成若干行的 run。
+ * 把一行原文按硬换行（<br> 或换行符）切成若干行的 run。
  * 返回 [[run...], [run...]]：外层是行（硬换行之间的一段），内层是这一行的 run。
- * 至少返回一行；行首/行尾的 <br> 会产生空行，由调用方决定要不要留。
+ * 至少返回一行；行首/行尾的硬换行会产生空行，由调用方决定要不要留。
  */
 function parseRunsLines(raw) {
   // 公式先挖（否则 $a*b*c$ 里的星号会被当斜体），再挖链接（否则 [[笔记]] 会被剥成纯字）
@@ -5041,9 +5048,9 @@ function parseRunsLines(raw) {
     pushText(cleanRunText(s.slice(last)), color);
   };
 
-  // 一段 chunk（同一颜色下的一段原文）：按 <br> 切行，颜色跟着每一段走
+  // 一段 chunk（同一颜色下的一段原文）：按硬换行切行，颜色跟着每一段走
   const emit = (chunk, color) => {
-    const parts = String(chunk).split(BR_TAG_RE);
+    const parts = String(chunk).split(HARD_BREAK_RE);
     for (let i = 0; i < parts.length; i++) {
       if (i > 0) {
         runs = [];
@@ -5081,8 +5088,8 @@ function parseRunsLines(raw) {
  * 顺序：先挖链接 → 再按 <font color> 切段 → 每段再拆行内样式，于是
  * `<font color="red">**加粗**</font>` 得到 { color:'red', bold:true }。
  *
- * 硬换行的分行信息只有 parseRunsLines 保留；这里按行拍平（<br> 不占字符，
- * 段间不加分隔符），给「只关心这一行有哪些 run」的调用方用。
+ * 硬换行的分行信息只有 parseRunsLines 保留；这里按行拍平（<br> 与换行符
+ * 都不占字符，段间不加分隔符），给「只关心这一行有哪些 run」的调用方用。
  */
 function parseRuns(raw) {
   const out = [];

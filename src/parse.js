@@ -26,9 +26,8 @@ const HEAD_RE = /^#{1,6}\s+(.*)$/;
  */
 const DIR_KEYS = ['dir', 'brace', 'box', 'closing', 'title', 'maxwidth', 'float', 'width', 'bg'];
 
-// 续行拼接的空格规则：只要贴着接缝的那一侧是 ASCII 字母数字就补一个空格
-const ASCII_TAIL_RE = /[A-Za-z0-9]$/;
-const ASCII_HEAD_RE = /^[A-Za-z0-9]/;
+// 续行拼接用的硬换行符：原样留在 raw 里，由 text.js 的行内解析层切开
+const SOFT_BREAK = '\n';
 
 function parseBox(v) {
   const s = String(v).trim().toLowerCase();
@@ -50,26 +49,28 @@ function leadingIndent(line) {
 }
 
 /**
- * 续行拼接：把两段文字接起来，中间按接缝决定要不要空格。
- *   普通平键 + 按端部形状分 → 普通平键按端部形状分（中文之间不补，补了显松）
- *   Type A + and B          → Type A and B（英文单词之间必须补，否则粘成一个词）
+ * 续行拼接：代码块里怎么换行，图上就怎么换行。
+ *   普通平键 ⏎ 按端部形状分 → 两段，两行
+ * 拼的是换行符，不是空格：接缝处不补空格、不做词间处理，续行本身 trim 掉
+ * 行首缩进后再接。换行符走的是 <br> 同一条切分路径（<br> 本来就是硬换行）。
  */
 function joinContinuation(prev, line) {
-  const a = String(prev == null ? '' : prev);
+  const a = String(prev == null ? '' : prev).replace(/\s+$/, '');
   const b = String(line == null ? '' : line).trim();
   if (!a) return b;
   if (!b) return a;
-  return a + (ASCII_TAIL_RE.test(a) || ASCII_HEAD_RE.test(b) ? ' ' : '') + b;
+  return a + SOFT_BREAK + b;
 }
 
 /**
  * 把一段原始正文解析进节点。
  *
  * 节点同时留两份：
- *   segRuns  硬换行（<br>）之间的每一段，每一段是一组 run —— layout 先照它分段，
- *            段内再按 maxwidth 折行
+ *   segRuns  硬换行（<br> 或续行留下的换行符）之间的每一段，每一段是一组 run
+ *            —— layout 先照它分段，段内再按 maxwidth 折行
  *   runs     拍平后的全部 run（公式转换、宽度累加都按它扫）
- * 续行是在解析前就拼进 raw 的，所以行内样式、公式、双链在续行里跟正文一样解析。
+ * 续行是在解析前就拼进 raw 的（中间是换行符），所以行内样式、公式、双链在
+ * 续行里跟正文一样解析，公式与链接的原子性由切分层保证。
  */
 function fillNode(node, rawBody) {
   const raw = String(rawBody == null ? '' : rawBody);

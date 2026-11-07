@@ -239,22 +239,28 @@ function maskLinks(raw) {
 }
 
 /* ============================================================
- * 硬换行：<br> / <br/> / <br />（大小写不敏感）
+ * 硬换行：<br> / <br/> / <br />（大小写不敏感）与续行留下的换行符
+ *
+ * 两种来源走同一条切分路径，效果完全一致：
+ *   <br>                     写在节点文字里的硬换行
+ *   \n                       解析阶段拼续行时留下的换行
  *
  * 切分点放在「公式与链接都换成占位符之后、逐段解析之前」：
  *   - 公式是原子，$a<br>b$ 不会被从中间切开（占位符里没有 <br>）
  *   - 链接的可见文字是一整块，[[甲<br>乙]] 同理
  *   - <font> 允许横跨 <br>（<font color="red">甲<br>乙</font> 两行都还是红的），
  *     所以切分发生在每个 chunk 送进 push 的当下，颜色跟着 chunk 走
- * 标签本身不进任何 run，两侧也不补空格。
+ * 标记与换行符本身不进任何 run，两侧也不补空格。
  * ============================================================ */
 
-const BR_TAG_RE = /<br\s*\/?>/i;
+// <br> 与换行符都是硬换行；\r\n 一并收掉，免得 Windows 剪贴板带进来的对字节
+// 被折成两行
+const HARD_BREAK_RE = /<br\s*\/?>|\r\n?|\n/i;
 
 /**
- * 把一行原文按 <br> 切成若干行的 run。
+ * 把一行原文按硬换行（<br> 或换行符）切成若干行的 run。
  * 返回 [[run...], [run...]]：外层是行（硬换行之间的一段），内层是这一行的 run。
- * 至少返回一行；行首/行尾的 <br> 会产生空行，由调用方决定要不要留。
+ * 至少返回一行；行首/行尾的硬换行会产生空行，由调用方决定要不要留。
  */
 function parseRunsLines(raw) {
   // 公式先挖（否则 $a*b*c$ 里的星号会被当斜体），再挖链接（否则 [[笔记]] 会被剥成纯字）
@@ -341,9 +347,9 @@ function parseRunsLines(raw) {
     pushText(cleanRunText(s.slice(last)), color);
   };
 
-  // 一段 chunk（同一颜色下的一段原文）：按 <br> 切行，颜色跟着每一段走
+  // 一段 chunk（同一颜色下的一段原文）：按硬换行切行，颜色跟着每一段走
   const emit = (chunk, color) => {
-    const parts = String(chunk).split(BR_TAG_RE);
+    const parts = String(chunk).split(HARD_BREAK_RE);
     for (let i = 0; i < parts.length; i++) {
       if (i > 0) {
         runs = [];
@@ -381,8 +387,8 @@ function parseRunsLines(raw) {
  * 顺序：先挖链接 → 再按 <font color> 切段 → 每段再拆行内样式，于是
  * `<font color="red">**加粗**</font>` 得到 { color:'red', bold:true }。
  *
- * 硬换行的分行信息只有 parseRunsLines 保留；这里按行拍平（<br> 不占字符，
- * 段间不加分隔符），给「只关心这一行有哪些 run」的调用方用。
+ * 硬换行的分行信息只有 parseRunsLines 保留；这里按行拍平（<br> 与换行符
+ * 都不占字符，段间不加分隔符），给「只关心这一行有哪些 run」的调用方用。
  */
 function parseRuns(raw) {
   const out = [];
