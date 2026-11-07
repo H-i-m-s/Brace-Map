@@ -171,6 +171,88 @@ function count() {
   try { return rows.length; } catch (e) { return 0; }
 }
 
+/* ============================================================
+ * 阅读视图那条路（floatify）单独一个缓冲、单独一节
+ *
+ * 两套轨迹不能混：applyValignLayout 走的是编辑模式的 margin-top，
+ * floatify 走的是阅读视图的绝对定位 top。同一条表格里排在一起，
+ * 「哪张图走了哪条路」就看不出来了。
+ * ============================================================ */
+
+/** floatify 轨迹的上限，与 applyValignLayout 同一套规矩 */
+const MAX_FLOAT_ROWS = 400;
+
+let floatRows = [];
+let floatSeq = 0;
+let floatT0 = 0;
+
+/**
+ * 记一条 floatify 调用。
+ *
+ * @param {object} entry
+ *   exit   出口代号（见 FLOAT_EXIT_DOC）
+ *   host   宿主（只用来算身份）
+ *   block  真正被脱离流的那个块（内存里留着，对照节要拿它重测）
+ *   bH/bW  调用那一刻 block 的 rect 高/宽（bH 是关键字段）
+ *   vin    readerValignInfo 的五个值
+ *   baseTop/top  算出来的流内位置与最终写入的位置
+ *   recH   改宽之后重新量到的块高
+ *   wrote  有没有真的写 top
+ */
+function recordFloat(entry) {
+  try {
+    const host = entry ? entry.host : null;
+    floatSeq += 1;
+    const t = nowMs();
+    if (!floatT0) floatT0 = t;
+    const k = keyOf(host);
+    const vin = (entry && entry.vin) || null;
+    const row = {
+      n: floatSeq,
+      t,
+      dt: t - floatT0,
+      exit: entry && entry.exit ? String(entry.exit) : 'other',
+      tag: k.tag,
+      vid: k.vid,
+      idx: k.idx,
+      val: entry && entry.val ? String(entry.val) : '',
+      float: entry && entry.float ? String(entry.float) : '',
+      bH: entry && entry.bH !== undefined ? entry.bH : null,
+      bW: entry && entry.bW !== undefined ? entry.bW : null,
+      vin: vin
+        ? {
+          valign: vin.valign || '',
+          lineH: vin.lineH === undefined ? null : vin.lineH,
+          imgH: vin.imgH === undefined ? null : vin.imgH,
+          yTitle: vin.yTitle === undefined ? null : vin.yTitle,
+          offset: vin.offset === undefined ? null : vin.offset,
+        }
+        : null,
+      baseTop: entry && entry.baseTop !== undefined ? entry.baseTop : null,
+      top: entry && entry.top !== undefined ? entry.top : null,
+      recH: entry && entry.recH !== undefined ? entry.recH : null,
+      wrote: !!(entry && entry.wrote),
+      err: entry && entry.err ? String(entry.err) : '',
+      /* 内存引用，不落盘：对照节要靠它当场重测 */
+      host,
+      block: entry && entry.block ? entry.block : null,
+    };
+    floatRows.push(row);
+    if (floatRows.length > MAX_FLOAT_ROWS) floatRows.splice(0, floatRows.length - MAX_FLOAT_ROWS);
+    return row;
+  } catch (e) {
+    return null;
+  }
+}
+
+function floatAll() {
+  try { return floatRows.slice(); } catch (e) { return []; }
+}
+
+function floatCount() {
+  try { return floatRows.length; } catch (e) { return 0; }
+}
+
 function reset() {
   try {
     rows = [];
@@ -178,6 +260,9 @@ function reset() {
     t0 = 0;
     vids = new WeakMap();
     vidSeq = 0;
+    floatRows = [];
+    floatSeq = 0;
+    floatT0 = 0;
   } catch (e) { /* ignore */ }
 }
 
@@ -436,23 +521,179 @@ function gateVerdict(p) {
   return '能正常量到（继续算）';
 }
 
+/** floatify 的出口代号 */
+const FLOAT_EXIT_DOC = [
+  ['ok', '正常完成：绝对定位、top、留白全写下去了'],
+  ['!side', 'cfg.float 不是 left / right'],
+  ['!el', '宿主没有 style 或量不了尺寸'],
+  ['isLivePreview', '实时预览（CM6）——编辑模式那条路，不在此列'],
+  ['!ctx', 'pickContext 拿不到定位祖先或块'],
+  ['block===ancestor', '定位祖先和要脱离的块是同一个，没法动手'],
+  ['!aRect', '定位祖先量不到 rect'],
+  ['!bRect', '块量不到 rect'],
+  ['!plan.length', '后面没有可绕排的块（图高 0 时必走这里）'],
+  ['throw', '函数体抛异常'],
+];
+
+/** 表头：floatify 一张表 */
+function floatTableHead() {
+  return '| # | +ms | 宿主 | → 出口 | bH | bW | val | lineH | imgH | yTitle | off | baseTop | top | recH | 写了 |';
+}
+
+function floatTableRow(r) {
+  const v = r.vin || {};
+  return '| ' + r.n + ' | +' + r.dt + ' | ' + cell(r.tag) + ' | `' + cell(r.exit) + '`'
+    + ' | ' + f2(r.bH) + ' | ' + f2(r.bW) + ' | ' + cell(r.val || '?')
+    + ' | ' + f2(v.lineH) + ' | ' + f2(v.imgH) + ' | ' + (v.yTitle === null || v.yTitle === undefined ? '—' : f2(v.yTitle))
+    + ' | ' + f2(v.offset) + ' | ' + f2(r.baseTop) + ' | ' + f2(r.top)
+    + ' | ' + f2(r.recH) + ' | ' + (r.wrote ? '1' : '0') + ' |';
+}
+
+/**
+ * 第四节：floatify 调用轨迹。一条调用一行，按序号排。
+ *
+ * bH 是最该先看的一列：它就是调用那一刻 block 的 rect 高。
+ * bH 为 0 而同一张图现在高 169.79，那就说明这条 top 是用 0 算出来的。
+ */
+function formatFloatifyTrace() {
+  const list = floatAll();
+  const out = [];
+  out.push('## 四、floatify 调用轨迹（阅读视图）');
+  out.push('');
+  out.push('阅读视图的 valign 不走 `applyValignLayout`，而是 `floatify` 把偏移量加进绝对定位的 `top`。');
+  out.push('这一节只记后者，与上面的编辑模式轨迹完全分开。');
+  out.push('');
+  out.push('- 轨迹条数：' + list.length + '（上限 ' + MAX_FLOAT_ROWS + ' 条，超出从头截断）');
+  out.push('');
+  out.push('| 字段 | 含义 |');
+  out.push('| --- | --- |');
+  out.push('| `bH` | **调用那一刻 `block.getBoundingClientRect().height`**——图还没渲染时它是 0 |');
+  out.push('| `bW` | 同上，宽 |');
+  out.push('| `lineH` / `imgH` / `yTitle` / `off` | `readerValignInfo` 当场量出的四个值 |');
+  out.push('| `baseTop` | 块在流里的位置（= 块 rect 顶 − 祖先 rect 顶） |');
+  out.push('| `top` | 最终写下去的值 = baseTop + off |');
+  out.push('| `recH` | 写完宽度之后重新量到的块高（可能与 bH 不同） |');
+  out.push('');
+  out.push('| 出口 | 含义 |');
+  out.push('| --- | --- |');
+  for (const [k, v] of FLOAT_EXIT_DOC) out.push('| `' + k + '` | ' + v + ' |');
+  out.push('');
+  if (!list.length) {
+    out.push('（没有记录：本次加载以来 `floatify` 一次都没被调用过）');
+    return out.join('\n');
+  }
+  out.push(floatTableHead());
+  out.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+  for (const r of list) out.push(floatTableRow(r));
+  return out.join('\n');
+}
+
+/**
+ * 第五节：初值与现值对照（这节是重点）。
+ *
+ * 「初值」= floatify 当初算那个 top 时用的数；「现值」= 命令触发这一刻
+ * 用同一个 readerValignInfo 重算一遍（只读，不写样式）。两者不同就说明：
+ * top 是按一个已经过时的图高算出来的。
+ *
+ * @param {Array} items 每项 { host, tag, calls, exits, first, last, now }
+ */
+function formatFloatifyCompare(items) {
+  const out = [];
+  const list = Array.isArray(items) ? items : [];
+  out.push('## 五、floatify 的初值与现值对照');
+  out.push('');
+  out.push('对每个宿主：左边两列是 `floatify` 当初 / 最后一次记下的五个值（从轨迹里读）；');
+  out.push('右边一列是命令触发这一刻重新调一次 `readerValignInfo` 的结果（只读，不写样式）。');
+  out.push('');
+  if (!list.length) {
+    out.push('（页面上没有带浮动记录的宿主）');
+    return out.join('\n');
+  }
+  for (const it of list) {
+    const first = it.first || null;
+    const last = it.last || null;
+    const now = it.now || null;
+    const fv = (first && first.vin) || {};
+    const lv = (last && last.vin) || {};
+    out.push('### ' + (it.tag || '图?') + (it.extra ? ' · ' + cell(it.extra) : ''));
+    out.push('');
+    out.push('- floatify 调用 ' + (it.calls || 0) + ' 次' + (it.exits ? '：' + it.exits : ''));
+    out.push('');
+    out.push('| 量 | 初次记下' + (first ? '（#' + first.n + ' ' + first.exit + '）' : '') + ' | 最后一次记下'
+      + (last ? '（#' + last.n + ' ' + last.exit + '）' : '') + ' | 命令此刻重算 |');
+    out.push('| --- | --- | --- | --- |');
+    const yv = (v) => (v === null || v === undefined ? '—' : f2(v));
+    out.push('| bH（调用时的块高） | ' + (first ? f2(first.bH) : '—')
+      + ' | ' + (last ? f2(last.bH) : '—')
+      + ' | ' + (now ? f2(now.bH) : '—') + ' |');
+    out.push('| imgH | ' + yv(fv.imgH) + ' | ' + yv(lv.imgH) + ' | ' + (now ? yv(now.imgH) : '—') + ' |');
+    out.push('| lineH | ' + yv(fv.lineH) + ' | ' + yv(lv.lineH) + ' | ' + (now ? yv(now.lineH) : '—') + ' |');
+    out.push('| yTitle | ' + yv(fv.yTitle) + ' | ' + yv(lv.yTitle) + ' | ' + (now ? yv(now.yTitle) : '—') + ' |');
+    out.push('| offset | ' + yv(fv.offset) + ' | ' + yv(lv.offset) + ' | ' + (now ? yv(now.offset) : '—') + ' |');
+    out.push('| 写下的 top | ' + (first && first.top !== null ? f2(first.top) : '—')
+      + ' | ' + (last && last.top !== null ? f2(last.top) : '—') + ' | —（当前生效值看块自己的行内 top） |');
+    out.push('');
+    /* 判读：只陈述能从上面这些数直接读出的事实，不猜原因 */
+    const notes = [];
+    if (nowErrText(it)) notes.push(nowErrText(it));
+    if (first && now && Math.abs(Number(first.bH) - Number(now.bH)) > 0.5) {
+      const zeroHint = !(Number(fv.imgH) > 0) ? '（图还没渲染）' : '';
+      notes.push('调用时的块高 ' + f2(first.bH) + zeroHint + ' → 现在 ' + f2(now.bH)
+        + (first.wrote ? '：写下的 top 是按 ' + f2(first.bH) + ' 算的'
+          : '：这一拍没写 top（出口 `' + first.exit + '`）'));
+    }
+    if (first && first.vin && now && Number(fv.offset) !== Number(now.offset)) {
+      notes.push('偏移也随之不同：' + f2(fv.offset) + ' → ' + f2(now.offset));
+    }
+    if (first && last && first.n !== last.n) {
+      if (first.top === last.top) {
+        notes.push('后来重算过，但 top 没变（#' + first.n + ' 与 #' + last.n + ' 写的都是 ' + f2(last.top) + '）');
+      } else {
+        notes.push('后来重算过，top 由 ' + f2(first.top) + ' 改成 ' + f2(last.top));
+      }
+    } else if (first && last && first.n === last.n) {
+      notes.push('只有一次调用，之后没有重算');
+    }
+    if (!notes.length) notes.push('初值与现值一致，没有看出偏差');
+    out.push('判读：');
+    for (const n of notes) out.push('- ' + n);
+    out.push('');
+  }
+  return out.join('\n');
+}
+
+function nowErrText(it) {
+  return it && it.nowError ? '重算失败：' + it.nowError : '';
+}
+
 /** 完整文档：轨迹 + 现场快照 */
-function formatDoc(items) {
-  return formatTrace() + '\n\n' + formatSnapshot(items) + '\n';
+function formatDoc(items, floatItems) {
+  const parts = [formatTrace(), formatSnapshot(items)];
+  parts.push(formatFloatifyTrace());
+  if (floatItems && floatItems.length) parts.push(formatFloatifyCompare(floatItems));
+  else parts.push(formatFloatifyCompare([]));
+  return parts.join('\n\n') + '\n';
 }
 
 module.exports = {
   MAX_ROWS,
+  MAX_FLOAT_ROWS,
   EXIT_DOC,
+  FLOAT_EXIT_DOC,
   SRC_DOC,
   record,
+  recordFloat,
   all,
   count,
+  floatAll,
+  floatCount,
   reset,
   hostTag,
   keyOf,
   f2,
   formatTrace,
   formatSnapshot,
+  formatFloatifyTrace,
+  formatFloatifyCompare,
   formatDoc,
 };

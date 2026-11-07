@@ -34,6 +34,7 @@ require('./valign.test');
 require('./valignread.test');
 require('./valtrace.test');
 require('./valoverlay.test');
+require('./floatifytrace.test');
 require('./wrapdiag.test');
 require('./debug.test');
 

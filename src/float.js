@@ -404,20 +404,62 @@ function readerValignInfo(host, block, cfg, bRect) {
  */
 function floatify(el, cfg, opts) {
   const o = opts || {};
+  try {
+    return floatifyPass(el, cfg, o);
+  } catch (e) {
+    vtFloat(el, cfg, { err: (e && e.message) ? e.message : String(e) }, 'throw');
+    throw e;
+  }
+}
+
+/**
+ * 记一条 floatify 轨迹。st 里有什么就记什么：提前返回时大部分字段是空的，
+ * 但 exit 和 bH（调用那一刻的块高）一定要有——它们是判读的主线。
+ *
+ * 永远返回 null，好让每个提前返回点写成 `return vtFloat(...)`，
+ * 不靠在每个 return 前面插一行（那样漏一个就少一条）。
+ */
+function vtFloat(el, cfg, st, exit) {
+  try {
+    const s = st || {};
+    vt.recordFloat({
+      exit,
+      host: el,
+      block: s.block || null,
+      bH: s.bRect ? s.bRect.height : null,
+      bW: s.bRect ? s.bRect.width : null,
+      vin: s.vin || null,
+      baseTop: s.baseTop,
+      top: s.top,
+      recH: s.recH,
+      wrote: !!s.wrote,
+      val: (cfg && cfg.valign) || 'bottom',
+      float: (cfg && cfg.float) || '',
+      err: s.err || '',
+    });
+  } catch (e) { /* 轨迹失败绝不影响浮动 */ }
+  return null;
+}
+
+/** 真正干活的那一趟：每个 return 都经过 vtFloat，所以每条都有出口代号 */
+function floatifyPass(el, cfg, o) {
   const mode = cfg && cfg.float;
   const side = mode === 'left' ? 'left' : (mode === 'right' ? 'right' : '');
-  if (!side) return null;
-  if (!el || !el.style || typeof el.getBoundingClientRect !== 'function') return null;
-  if (isLivePreview(el)) return null;                 // CM6 里没法这么干，交给原来的 float
+  if (!side) return vtFloat(el, cfg, {}, '!side');
+  if (!el || !el.style || typeof el.getBoundingClientRect !== 'function') {
+    return vtFloat(el, cfg, {}, '!el');
+  }
+  if (isLivePreview(el)) return vtFloat(el, cfg, {}, 'isLivePreview');   // CM6 里没法这么干
   const ctx = pickContext(el);
-  if (!ctx || !ctx.ancestor || !ctx.block) return null;
+  if (!ctx || !ctx.ancestor || !ctx.block) return vtFloat(el, cfg, {}, '!ctx');
   const ancestor = ctx.ancestor;
   const block = ctx.block;
-  if (block === ancestor) return null;
+  if (block === ancestor) return vtFloat(el, cfg, { block }, 'block===ancestor');
 
   const aRect = rectOf(ancestor);
+  if (!aRect) return vtFloat(el, cfg, { block }, '!aRect');
   const bRect = rectOf(block);
-  if (!aRect || !bRect) return null;
+  if (!bRect) return vtFloat(el, cfg, { block }, '!bRect');
 
   const gap = Number(o.gap) > 0 ? Number(o.gap) : FLOAT_GAP;
   const svgRect = o.svg ? rectOf(o.svg) : null;
@@ -459,7 +501,7 @@ function floatify(el, cfg, opts) {
     limit: o.maxBlocks,
     startOffset: vin.offset,
   });
-  if (!plan.length) return null;
+  if (!plan.length) return vtFloat(el, cfg, { block, bRect, vin }, '!plan.length');
 
   // 定位祖先进程：只补 position: relative，不动 display（动 display 会改整页排版）
   const pos = computedPosition(ancestor);
@@ -532,6 +574,10 @@ function floatify(el, cfg, opts) {
     acc += elHeight(target);
     if (acc >= record.height + vin.offset) break;   // 图底 = 图高 + 垂直偏移
   }
+  vtFloat(el, cfg, {
+    block, bRect, vin, baseTop: record.valign.baseTop, top: record.valign.top,
+    recH: record.height, wrote: true,
+  }, 'ok');
   return record;
 }
 
@@ -1890,6 +1936,7 @@ module.exports = {
   valignOffset,
   measureLineHeight,
   measureReaderLineHeight,
+  readerValignInfo,
   measureTitleCenter,
   applyValignLayout,
   valignProbe,
