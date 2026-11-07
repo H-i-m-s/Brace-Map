@@ -32,6 +32,7 @@ require('./float.test');
 require('./floatwrap.test');
 require('./valign.test');
 require('./valignread.test');
+require('./valtrace.test');
 require('./wrapdiag.test');
 require('./debug.test');
 

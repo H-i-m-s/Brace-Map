@@ -53,7 +53,10 @@ let applyFloatLayout, attachFloatWrap, resetFloat, floatify, pickContext,
   readMargins, applyValignLayout, valignOffset, measureLineHeight, measureTitleCenter;
 let ensureValignObserver, disconnectValignObserver, pruneValignObservers,
   scheduleValignRetries, clearValignRetries, VALIGN_RETRY_DELAYS;
-let measureReaderLineHeight;
+let measureReaderLineHeight, valignProbe;
+/* valign 调用轨迹（只读取证）：见 src/valtrace.js */
+let VT_MAX_ROWS, vtRecord, vtRows, vtReset, vtCount, vtHostTag,
+  formatValignTrace, formatValignSnapshot, formatValignDoc, valtrace;
 let classHas, climbTo;
 /* 图为什么看不见：裁剪链体检（只读，诊断命令用） */
 let CLIP_DEPTH, CLIP_HARD_STOP, styleOfEl, overflowClips, containClips, isClipHardStop,
@@ -1744,6 +1747,8 @@ const {
 } = require('./debug.js');
 /* valign 量不到行高时的最后兜底要 fontSize × lineHRatio */
 const { OPT } = require('./opt.js');
+/* valign 调用轨迹：只读，内存里攒，诊断命令触发时才落盘。不写样式、不加定时器。 */
+const vt = require('./valtrace.js');
 
 /* ============================================================
  * ★★★ 编辑模式（Live Preview）浮动总开关 ★★★
@@ -3124,11 +3129,126 @@ function inEditorNow(host) {
   return !!climbTo(host, 'cm-content', 8);
 }
 
-function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用，行为已由补拍统一负责
-  if (!host || !host.style || !cfg) return 0;
+/* ---------------------- valign 的只读体检 ---------------------- */
+
+/**
+ * 只读体检：把 applyValignLayout 会看的每一个量单独取一次，一个字段都不写。
+ *
+ * 两处共用：
+ *   1. 每次调用的轨迹（返回那一刻量）
+ *   2. 诊断命令的现场快照（命令触发那一刻量，不经过 applyValignLayout）
+ * 共用同一套量法，所以「函数里量到的」和「现场量到的」能逐字段对账。
+ *
+ * 每一项单独 try/catch：假 DOM / 半残对象上只是少一个数，绝不抛。
+ *
+ * @returns {object} 见各字段注释（编号对应诊断清单里的项）
+ */
+function valignProbe(host) {
+  const out = {
+    conn: null,        // 4  host.isConnected（!== false）
+    closest: null,     // 5  !!host.closest('.cm-content')；null 表示这个宿主没有 closest
+    climb8: null,      // 6  !!climbTo(host, 'cm-content', 8)
+    hHost: null,       // 7  elHeight(host)
+    hSvg: null,        // 8  elHeight(pickSvg(host))
+    svg: 'none',       // 9  pickSvg 的结果：'none' 或 tagName
+    lineH: null,       // 10 measureLineHeight(host)
+    yTitle: null,      // 11 measureTitleCenter(host)（NaN 原样保留）
+    roots: null,       // 12 [data-bm-root] 个数
+    rectH: null,       // 15 host.getBoundingClientRect().height
+    floated: null,     // 有没有 bm-floated 类
+    mt: '',            // 当前行内 margin-top 原文
+    probeValign: '',   // 现场按哪个基准算（取宿主的 cfg / 旧记录）
+    probeOffset: null, // 现场用现有量算出来的 valignOffset
+  };
+  try { out.floated = host ? classHas(host, 'bm-floated') : null; } catch (e) { out.floated = null; }
+  try { out.conn = host ? host.isConnected !== false : null; } catch (e) { out.conn = null; }
+  try {
+    if (host && typeof host.closest === 'function') out.closest = !!host.closest('.cm-content');
+  } catch (e) { out.closest = null; }
+  try { out.climb8 = host ? !!climbTo(host, 'cm-content', 8) : null; } catch (e) { out.climb8 = null; }
+  try { out.hHost = host ? elHeight(host) : null; } catch (e) { out.hHost = null; }
+  let svgEl = null;
+  try { svgEl = pickSvg(host); } catch (e) { svgEl = null; }
+  try {
+    if (svgEl) {
+      out.hSvg = elHeight(svgEl);
+      out.svg = String(svgEl.tagName || svgEl.nodeName || 'svg').toLowerCase();
+    }
+  } catch (e) { out.hSvg = null; }
+  try { out.lineH = host ? round2(measureLineHeight(host)) : null; } catch (e) { out.lineH = null; }
+  try { out.yTitle = host ? measureTitleCenter(host) : null; } catch (e) { out.yTitle = NaN; }
+  try {
+    if (host && typeof host.querySelectorAll === 'function') {
+      const roots = host.querySelectorAll('[data-bm-root]');
+      out.roots = roots ? roots.length : 0;
+    }
+  } catch (e) { out.roots = null; }
+  try {
+    if (host && typeof host.getBoundingClientRect === 'function') {
+      const r = host.getBoundingClientRect();
+      if (r && Number.isFinite(r.height)) out.rectH = r.height;
+    }
+  } catch (e) { out.rectH = null; }
+  try { out.mt = host && host.style && host.style.marginTop ? String(host.style.marginTop) : ''; } catch (e) { out.mt = ''; }
+  try {
+    const hcfg = (host && host.__bmCfg) || null;
+    const hinfo = (host && host.__bmValignInfo) || null;
+    out.probeValign = (hcfg && hcfg.valign) || (hinfo && hinfo.valign) || 'bottom';
+    const imgH = out.hHost || out.hSvg || 0;
+    out.probeOffset = round2(valignOffset(out.lineH, imgH, out.yTitle, out.probeValign));
+  } catch (e) { out.probeOffset = null; }
+  return out;
+}
+
+/**
+ * 记一条轨迹。任何异常都在这里面吃掉：轨迹是取证层，不许影响布局。
+ * 量的时机 = 即将返回的那一刻（write 那一趟取于写完 margin-top 之后）。
+ */
+function vtTrace(host, cfg, src, exit, extra) {
+  try {
+    vt.record({
+      src,
+      exit,
+      host,
+      probe: valignProbe(host),
+      val: (cfg && cfg.valign) || 'bottom',
+      float: (cfg && cfg.float) || '',
+      offset: extra && extra.offset !== undefined ? extra.offset : null,
+      wrote: !!(extra && extra.wrote),
+      err: extra && extra.err ? String(extra.err) : '',
+    });
+  } catch (e) { /* 轨迹失败绝不影响布局 */ }
+}
+
+/**
+ * @param {string} [from] 入口代号：render / retry / observer / reapply。
+ *   只进轨迹，不参与任何判断（不传就是 other）。
+ */
+function applyValignLayout(host, cfg, retried, from) {   // retried：兼容旧调用，行为已由补拍统一负责
+  const src = typeof from === 'string' && from ? from : 'other';
+  try {
+    return valignPass(host, cfg, src);
+  } catch (e) {
+    vtTrace(host, cfg, src, 'throw', { err: (e && e.message) ? e.message : String(e) });
+    throw e;
+  }
+}
+
+/** 真正干活的那一趟：每个 return 前留一条轨迹，说明从哪个分支走的 */
+function valignPass(host, cfg, src) {
+  if (!host || !host.style || !cfg) {
+    vtTrace(host, cfg, src, host ? '!cfg' : '!host');
+    return 0;
+  }
   const mode = cfg.float;
-  if (mode !== 'left' && mode !== 'right') return 0;
-  if (!classHas(host, 'bm-floated')) return 0;     // float 没真写上去时不能加偏移
+  if (mode !== 'left' && mode !== 'right') {
+    vtTrace(host, cfg, src, 'float!=lr');
+    return 0;
+  }
+  if (!classHas(host, 'bm-floated')) {             // float 没真写上去时不能加偏移
+    vtTrace(host, cfg, src, '!bm-floated');
+    return 0;
+  }
 
   /*
    * 判「在不在编辑区里」用 closest 而不是 climbTo：
@@ -3144,6 +3264,7 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
   const inEditor = host.isConnected !== false && inEditorNow(host);
   if (!inEditor) {
     scheduleValignRetries(host, cfg);
+    vtTrace(host, cfg, src, '!inEditor');
     return 0;
   }
   clearValignRetries(host);                         // 连上了：补拍不用再来
@@ -3179,6 +3300,7 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
   if (info.offset && prevRec && cur === want) {
     info.applied = true;
     ensureValignObserver(host, cfg);
+    vtTrace(host, cfg, src, 'same', { offset: info.offset, wrote: true });
     return offset;
   }
 
@@ -3194,7 +3316,10 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
     host.__bmValignRec = null;
   }
 
-  if (!offset) return 0;                            // bottom 档 / 量不到：一个样式都不写
+  if (!offset) {                                    // bottom 档 / 量不到：一个样式都不写
+    vtTrace(host, cfg, src, 'offset=0', { offset: info.offset });
+    return 0;
+  }
 
   const rec = setInlineStyle(host, 'marginTop', want);
   if (rec) {
@@ -3206,6 +3331,7 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
   /* 挂上「尺寸一变就重算」：只盯宿主尺寸，不变化就永远不触发。
    * 图的自校准与窗口变化都会改宿主高度，正好被它接住。 */
   ensureValignObserver(host, cfg);
+  vtTrace(host, cfg, src, 'write', { offset: info.offset, wrote: !!rec });
   return offset;
 }
 
@@ -3296,7 +3422,7 @@ function scheduleValignApply(host) {
     if (host.isConnected === false) { disconnectValignObserver(host); return; }
     const cfg = st.cfg || host.__bmCfg;
     if (!cfg) return;
-    try { applyValignLayout(host, cfg, true); } catch (e) { /* ignore */ }
+    try { applyValignLayout(host, cfg, true, 'observer'); } catch (e) { /* ignore */ }
   };
   try { st.timer = setTimeout(fire, VALIGN_DEBOUNCE_MS); } catch (e) { st.timer = 0; }
   const win = windowOf(host);
@@ -3356,7 +3482,7 @@ function scheduleValignRetries(host, cfg) {
     try {
       st.timers.push(setTimeout(() => {
         if (!host.__bmValignRetry) return;          // 已经连上 / 已复位，这一拍作废
-        try { applyValignLayout(host, cfg, true); } catch (e) { /* ignore */ }
+        try { applyValignLayout(host, cfg, true, 'retry'); } catch (e) { /* ignore */ }
         if (last) clearValignRetries(host);         // 最后一拍：成没成都不再排
       }, VALIGN_RETRY_DELAYS[i]));
     } catch (e) { /* 排不上就算了，还有后面的拍 */ }
@@ -3394,7 +3520,7 @@ function reapplyLivePreviewFloatLayout(doc) {
     applyFloatLayout(host, host.__bmCfg);
     /* 重写 float 时旧账（含 valign 的 margin-top）已整体还原，这里补写回去；
      * 不补的话，设置页把开关关一次再开，图就永远停在 bottom 档。 */
-    if (typeof applyValignLayout === 'function') applyValignLayout(host, host.__bmCfg);
+    if (typeof applyValignLayout === 'function') applyValignLayout(host, host.__bmCfg, false, 'reapply');
     return 1;
   });
 }
@@ -3456,6 +3582,7 @@ module.exports = {
   measureReaderLineHeight,
   measureTitleCenter,
   applyValignLayout,
+  valignProbe,
   ensureValignObserver,
   disconnectValignObserver,
   pruneValignObservers,
@@ -6038,6 +6165,464 @@ module.exports = { num, clampRange };
 
 };
 
+__mods["src/valtrace.js"] = function (module, exports, require) {
+'use strict';
+
+/* ============================================================
+ * valign 调用轨迹（只读取证层）
+ *
+ * 干什么：applyValignLayout 每被调用一次，就往这里的环形缓冲追加一条记录。
+ * 记录里带「从哪个入口来 / 从哪个分支返回 / 返回那一刻现场量到的那 12 个数」。
+ * 一条命令把它和一份独立的现场快照写成 vault 根目录
+ *   brace-map-valign-trace.md
+ *
+ * 为什么是「内存里攒、命令触发才落盘」：
+ *   - 不写盘就没有异步、没有节流定时器，不占 IO，也不改变任何时序
+ *   - 轨迹要包含「命令点下去之前」发生的事（渲染那一刻的调用），所以必须
+ *     在插件加载后就开始记，而不是开日志之后才开始
+ *   - 落盘只有一处，格式改动不会散落在调用点
+ *
+ * 硬纪律（与 applyValignLayout 的「只读」约束对齐）：
+ *   - 只读 DOM：不写样式、不加类、不改属性、不挂监听
+ *   - 宿主身份用 WeakMap 记，不在宿主对象上留任何字段
+ *   - 每个出口都 try/catch：轨迹自身炸了也绝不影响布局，不抛错
+ *   - 单次运行最多 MAX_ROWS 条，超出从头截断（留最新的）
+ *
+ * 依赖：无。这个模块不 require 任何东西，也就不可能和应用里其它模块成环。
+ * ============================================================ */
+
+/** 缓冲上限：单次运行最多 400 条，超出从头截断 */
+const MAX_ROWS = 400;
+
+let rows = [];
+let seq = 0;
+let t0 = 0;
+let vids = new WeakMap();
+let vidSeq = 0;
+
+/* ------------------------------ 小工具 ------------------------------ */
+
+function nowMs() {
+  try { return Date.now(); } catch (e) { return 0; }
+}
+
+/** 两位小数；null / undefined 记 n/a；NaN 原样记出来（NaN 本身就是线索） */
+function f2(v) {
+  if (v === null || v === undefined) return 'n/a';
+  const n = Number(v);
+  if (Number.isNaN(n)) return 'NaN';
+  if (!Number.isFinite(n)) return String(n);
+  return (Math.round(n * 100) / 100).toFixed(2);
+}
+
+function b01(v) {
+  if (v === true) return '1';
+  if (v === false) return '0';
+  return '?';
+}
+
+/** 单元格：把竖线换掉，免得撑破表格 */
+function cell(v) {
+  const s = v === null || v === undefined ? '' : String(v);
+  return s.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+}
+
+/* ------------------------------ 宿主身份 ------------------------------ */
+
+/**
+ * 宿主实例编号：同一个 DOM 对象永远拿到同一个号。
+ * 用 WeakMap 而不是在宿主上挂 __bmXxx：轨迹层承诺「只读」，一个字段都不留。
+ * 编号的作用是分清「同一个元素的第二十次调用」和「换了新元素的第一百次调用」，
+ * 而后者在 DOM 重建时非常常见（上下文一改，widget 整个换掉）。
+ */
+function vidOf(host) {
+  if (!host || (typeof host !== 'object' && typeof host !== 'function')) return null;
+  try {
+    let v = vids.get(host);
+    if (v == null) {
+      vidSeq += 1;
+      v = vidSeq;
+      vids.set(host, v);
+    }
+    return v;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 宿主在页面 .block-language-brace 里的下标（拿不到返回 -1） */
+function indexOfHost(host) {
+  try {
+    const doc = host && host.ownerDocument;
+    const d = doc || (typeof document !== 'undefined' ? document : null);
+    if (!d || typeof d.querySelectorAll !== 'function') return -1;
+    const list = d.querySelectorAll('.block-language-brace') || [];
+    for (let i = 0; i < list.length; i++) {
+      if (list[i] === host) return i;
+    }
+  } catch (e) { /* ignore */ }
+  return -1;
+}
+
+/**
+ * 分组用的稳定标识：`图2#v7`。
+ * 前半截是「此刻它在页面上排第几张」（人看得懂），后半截是实例号
+ * （DOM 一重建就会变，能戳穿「你以为还是那张图」的错觉）。
+ */
+function hostTag(host) {
+  const vid = vidOf(host);
+  const idx = indexOfHost(host);
+  const head = idx >= 0 ? '图' + (idx + 1) : '图?';
+  return head + (vid == null ? '' : '#v' + vid);
+}
+
+function keyOf(host) {
+  return {
+    tag: hostTag(host),
+    vid: vidOf(host),
+    idx: indexOfHost(host),
+  };
+}
+
+/* ------------------------------ 记录 ------------------------------ */
+
+/**
+ * 追加一条。entry 由调用方组好：
+ *   src    入口（render / retry / observer / reapply / other）
+ *   exit   返回分支代号（见 EXIT_DOC）
+ *   host   宿主（只用来算身份，不写任何字段）
+ *   probe  返回那一刻量到的数（valignProbe 的返回值）
+ *   val    配置里的垂直基准
+ *   float  配置里的浮动模式
+ *   offset 这次算出来的偏移量（拿不到传 null）
+ *   wrote  这次有没有真的写 margin-top
+ *   err    异常信息（throw 分支才有）
+ * @returns {object|null} 记下来的那条（测试用）
+ */
+function record(entry) {
+  try {
+    const src = entry && entry.src ? String(entry.src) : 'other';
+    const host = entry ? entry.host : null;
+    seq += 1;
+    const t = nowMs();
+    if (!t0) t0 = t;
+    const k = keyOf(host);
+    const row = {
+      n: seq,
+      t,
+      dt: t - t0,
+      src,
+      exit: entry && entry.exit ? String(entry.exit) : 'other',
+      tag: k.tag,
+      vid: k.vid,
+      idx: k.idx,
+      val: entry && entry.val ? String(entry.val) : '',
+      float: entry && entry.float ? String(entry.float) : '',
+      offset: entry && entry.offset !== undefined ? entry.offset : null,
+      wrote: !!(entry && entry.wrote),
+      err: entry && entry.err ? String(entry.err) : '',
+      probe: (entry && entry.probe) || null,
+    };
+    rows.push(row);
+    if (rows.length > MAX_ROWS) rows.splice(0, rows.length - MAX_ROWS);   // 从头截断
+    return row;
+  } catch (e) {
+    return null;
+  }
+}
+
+function all() {
+  try { return rows.slice(); } catch (e) { return []; }
+}
+
+function count() {
+  try { return rows.length; } catch (e) { return 0; }
+}
+
+function reset() {
+  try {
+    rows = [];
+    seq = 0;
+    t0 = 0;
+    vids = new WeakMap();
+    vidSeq = 0;
+  } catch (e) { /* ignore */ }
+}
+
+/* ------------------------------ 文案 ------------------------------ */
+
+/** 退出分支代号 → 人读的说法 */
+const EXIT_DOC = [
+  ['write', '正常走完，写了 margin-top'],
+  ['same', '算出的偏移和账上那条一模一样，不重写（提前返回）'],
+  ['offset=0', '量出来算出的偏移是 0，一个样式都不写（bottom 档 / 量不到）'],
+  ['!inEditor', '宿主不在 .cm-content 里（或 isConnected 为假）→ 排补拍后返回'],
+  ['!bm-floated', '宿主没有 bm-floated 类（float 没真写上去）'],
+  ['float!=lr', 'cfg.float 不是 left / right'],
+  ['!cfg', '没拿到 cfg'],
+  ['!host', '没拿到宿主（或宿主没有 style）'],
+  ['throw', '函数体抛异常'],
+];
+
+/** 入口代号 → 说明 */
+const SRC_DOC = [
+  ['render', '渲染末尾那一次（main.js renderBraceMap）'],
+  ['retry', '首次挂载后的补拍（120 / 480 / 1200ms）'],
+  ['observer', '尺寸观察器触发（图高变了）'],
+  ['reapply', '设置页把浮动开关关一次再开'],
+];
+
+function fieldTable() {
+  return [
+    '| 字段 | 含义 |',
+    '| --- | --- |',
+    '| `#` | 自增序号，缺号说明中间被截断过 |',
+    '| `+ms` | 相对本次运行第一条记录的毫秒数 |',
+    '| `src` | 从哪个入口来的：' + SRC_DOC.map((x) => '`' + x[0] + '`').join(' / ') + ' |',
+    '| `→` | 从哪个分支返回，见下面「退出分支」 |',
+    '| `conn` | `host.isConnected`（1 / 0） |',
+    '| `closest` | `!!host.closest(\'.cm-content\')`（1 / 0 / ? 表示没 closest 可用） |',
+    '| `climb8` | `!!climbTo(host, \'cm-content\', 8)`（逐层爬的旧判定） |',
+    '| `hHost` | `elHeight(host)` |',
+    '| `hSvg` | `elHeight(pickSvg(host))` |',
+    '| `svg` | 宿主的 `<svg>`：`svg` = 有且 tagName 是 svg，`none` = 没有 |',
+    '| `lineH` | `measureLineHeight(host)` |',
+    '| `yTitle` | `measureTitleCenter(host)`（`NaN` 原样记） |',
+    '| `roots` | `host.querySelectorAll(\'[data-bm-root]\').length` |',
+    '| `off` | `valignOffset` 这次算出来的结果 |',
+    '| `wrote` | 这次有没有真的写 `margin-top`（1 / 0） |',
+    '| `rectH` | `host.getBoundingClientRect().height`（对照值） |',
+    '',
+    '所有量都是「即将返回的那一刻」现场取的：`write` 那一行取于写完 margin-top 之后。',
+  ].join('\n');
+}
+
+function exitTable() {
+  const out = ['| 退出分支 | 含义 |', '| --- | --- |'];
+  for (const [k, v] of EXIT_DOC) out.push('| `' + k + '` | ' + v + ' |');
+  return out.join('\n');
+}
+
+/* ------------------------------ 排版 ------------------------------ */
+
+/** 一行紧凑的记录：时序总览用 */
+function lineOf(r) {
+  const p = r.probe || {};
+  return '#' + String(r.n) + '  +' + String(r.dt) + 'ms  ' + r.tag.padEnd(12)
+    + r.src.padEnd(10) + '→ ' + r.exit.padEnd(12)
+    + ' conn=' + b01(p.conn)
+    + ' closest=' + b01(p.closest)
+    + ' climb8=' + b01(p.climb8)
+    + ' hHost=' + f2(p.hHost)
+    + ' hSvg=' + f2(p.hSvg)
+    + ' svg=' + (p.svg || '?')
+    + ' lineH=' + f2(p.lineH)
+    + ' yTitle=' + f2(p.yTitle)
+    + ' roots=' + (p.roots == null ? '?' : String(p.roots))
+    + ' off=' + f2(r.offset)
+    + ' wrote=' + (r.wrote ? '1' : '0')
+    + ' rectH=' + f2(p.rectH)
+    + (r.err ? ' err=' + r.err : '');
+}
+
+function tableHead() {
+  return '| # | +ms | src | → 退出 | conn | closest | climb8 | hHost | hSvg | svg '
+    + '| lineH | yTitle | roots | off | wrote | rectH |';
+}
+
+function tableSep() {
+  return '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
+}
+
+function tableRow(r) {
+  const p = r.probe || {};
+  return '| ' + r.n + ' | +' + r.dt + ' | ' + cell(r.src) + ' | `' + cell(r.exit) + '`'
+    + ' | ' + b01(p.conn) + ' | ' + b01(p.closest) + ' | ' + b01(p.climb8)
+    + ' | ' + f2(p.hHost) + ' | ' + f2(p.hSvg) + ' | ' + cell(p.svg || '?')
+    + ' | ' + f2(p.lineH) + ' | ' + f2(p.yTitle)
+    + ' | ' + (p.roots == null ? '?' : p.roots)
+    + ' | ' + f2(r.offset) + ' | ' + (r.wrote ? '1' : '0')
+    + ' | ' + f2(p.rectH) + ' |';
+}
+
+/**
+ * 轨迹正文：两张表。
+ *   1) 时序总览——全部记录按序号排（能看出 A 和 B 的调用在时间上怎么交错）
+ *   2) 按宿主分组——同一张图的所有调用摆在一起（能看出它反复在哪一步停住）
+ * 两份内容同源，只是排序不同：一份看全局顺序，一份看单张图的命运。
+ */
+function formatTrace() {
+  const list = all();
+  const out = [];
+  out.push('# Brace Map · valign 调用轨迹');
+  out.push('');
+  out.push('- 生成时间：' + new Date().toISOString());
+  out.push('- 轨迹条数：' + list.length + '（上限 ' + MAX_ROWS + ' 条，超出从头截断）');
+  out.push('- 采集范围：本插件加载以来 `applyValignLayout` 的每一次调用，含提前返回的那些');
+  out.push('');
+  out.push('## 怎么读');
+  out.push('');
+  out.push('一条记录 = 一次调用。`→` 那一列是它**从哪个分支返回**的：先看这个，');
+  out.push('它直接回答「这张图到底走到哪一步就停了」。后面一排数值是返回那一刻现场量到的量，');
+  out.push('和文末「现场快照」用同一套量法，可以直接逐字段对比。');
+  out.push('');
+  out.push('## 字段');
+  out.push('');
+  out.push(fieldTable());
+  out.push('');
+  out.push('## 退出分支');
+  out.push('');
+  out.push(exitTable());
+  out.push('');
+  out.push('## 一、时序总览（按序号，全局顺序）');
+  out.push('');
+  if (!list.length) {
+    out.push('（没有记录：`applyValignLayout` 一次都没被调用过）');
+  } else {
+    out.push('```');
+    for (const r of list) out.push(lineOf(r));
+    out.push('```');
+  }
+  out.push('');
+  out.push('## 二、按宿主分组');
+  out.push('');
+  if (!list.length) {
+    out.push('（没有记录）');
+  } else {
+    /* 分组顺序按首次出现的先后，组内按序号 */
+    const order = [];
+    const groups = Object.create(null);
+    for (const r of list) {
+      const k = r.tag;
+      if (!groups[k]) { groups[k] = []; order.push(k); }
+      groups[k].push(r);
+    }
+    for (const k of order) {
+      const g = groups[k];
+      const first = g[0];
+      out.push('### ' + k + ' · 共 ' + g.length + ' 条');
+      out.push('');
+      out.push('- 实例号：`v' + (first.vid == null ? '?' : first.vid) + '`'
+        + '｜页面下标：' + (first.idx >= 0 ? '`[' + first.idx + ']`' : '拿不到')
+        + '｜valign：`' + (first.val || '') + '`｜float：`' + (first.float || '') + '`');
+      out.push('- 各分支出现次数：' + summarize(g));
+      out.push('');
+      out.push(tableHead());
+      out.push(tableSep());
+      for (const r of g) out.push(tableRow(r));
+      out.push('');
+    }
+  }
+  return out.join('\n');
+}
+
+/** 「各分支出现次数」一小段：write×3 · !inEditor×7 */
+function summarize(g) {
+  const cnt = Object.create(null);
+  const order = [];
+  for (const r of g) {
+    if (!cnt[r.exit]) { cnt[r.exit] = 0; order.push(r.exit); }
+    cnt[r.exit] += 1;
+  }
+  return order.map((k) => '`' + k + '`×' + cnt[k]).join(' · ');
+}
+
+/**
+ * 现场快照：命令触发那一刻，对每个 .block-language-brace 独立量一遍。
+ *
+ * 与轨迹的关键区别：这里不经过 applyValignLayout，不管它有没有跑过、停在哪一步，
+ * 都照同一套量法量一次。所以「函数里量到的」和「同一时刻现场量到的」能直接对账。
+ *
+ * @param {Array<{host:object, probe:object, state:object}>} items
+ */
+function formatSnapshot(items) {
+  const out = [];
+  const list = Array.isArray(items) ? items : [];
+  out.push('## 三、现场快照（命令触发时独立量，不经过 applyValignLayout）');
+  out.push('');
+  out.push('这一节的每个数都由诊断命令当场重新取，和 `applyValignLayout` 无关：');
+  out.push('哪怕这张图一次都没被调用过、或者上次调用停在某个分支，这一节照样有值。');
+  out.push('和上文同一个宿主的记录逐字段对比，差值就是「函数里量到的」与「现场量到的」的区别。');
+  out.push('');
+  if (!list.length) {
+    out.push('（页面上没有 `.block-language-brace`）');
+    return out.join('\n');
+  }
+  for (const it of list) {
+    const host = it && it.host;
+    const p = (it && it.probe) || {};
+    const st = (it && it.state) || {};
+    /* 分组标识优先用构建快照那一刻取好的（格式生成时机可能已经不在同一个 DOM 上下文） */
+    const tag = (it && it.tag) || hostTag(host);
+    out.push('### ' + tag + (it && it.where ? ' · ' + cell(it.where) : ''));
+    out.push('');
+    out.push('| 项 | 现场值 |');
+    out.push('| --- | --- |');
+    out.push('| 4 宿主 isConnected | ' + b01(p.conn) + ' |');
+    out.push('| 5 `closest(\'.cm-content\')` | ' + (p.closest === null ? '拿不到 closest' : b01(p.closest)) + ' |');
+    out.push('| 6 `climbTo(host,\'cm-content\',8)` | ' + b01(p.climb8) + ' |');
+    out.push('| 7 `elHeight(host)` | ' + f2(p.hHost) + ' |');
+    out.push('| 8 `elHeight(pickSvg(host))` | ' + f2(p.hSvg) + ' |');
+    out.push('| 9 `pickSvg(host)` | ' + (p.svg && p.svg !== 'none' ? '有，tagName `' + cell(p.svg) + '`' : '没有') + ' |');
+    out.push('| 10 `measureLineHeight(host)` | ' + f2(p.lineH) + ' |');
+    out.push('| 11 `measureTitleCenter(host)` | ' + (Number.isNaN(Number(p.yTitle)) ? 'NaN' : f2(p.yTitle)) + ' |');
+    out.push('| 12 `[data-bm-root]` 个数 | ' + (p.roots == null ? '拿不到' : p.roots) + ' |');
+    out.push('| 13 现在算 `valignOffset` | ' + f2(p.probeOffset)
+      + '（基准 `' + cell(p.probeValign || '') + '`） |');
+    out.push('| 14 现在有没有写 `margin-top` | ' + (p.mt ? '有：`' + cell(p.mt) + '`' : '没有') + ' |');
+    out.push('| 15 `getBoundingClientRect().height` | ' + f2(p.rectH) + ' |');
+    out.push('');
+    out.push('宿主现状（判断它到底走没走过渲染链）：');
+    out.push('');
+    out.push('| 项 | 值 |');
+    out.push('| --- | --- |');
+    out.push('| `bm-floated` 类 | ' + (p.floated === true ? '有' : (p.floated === false ? '没有' : '拿不到')) + ' |');
+    out.push('| `__bmCfg`（applyFloatLayout 写过） | ' + (st.hasCfg ? '有' : '没有') + ' |');
+    out.push('| `__bmFloat`（浮动控件挂过） | ' + (st.hasFloat ? '有' : '没有') + ' |');
+    out.push('| `__bmValignInfo`（valign 记录） | ' + (st.hasInfo ? '有：' + cell(st.infoText) : '没有') + ' |');
+    out.push('| `__bmValignObs` 观察器 | ' + (st.obs ? '已挂，已触发 ' + (st.fired || 0) + ' 次' : '未挂') + ' |');
+    out.push('| 首次补拍 | ' + (st.retry ? '排队中' : '无') + ' |');
+    out.push('| 若此刻调用 applyValignLayout | ' + gateVerdict(p) + ' |');
+    out.push('');
+  }
+  return out.join('\n');
+}
+
+/**
+ * 用现场的三个门槛推一遍「现在调用会走哪个分支」。
+ * 纯由上面的量推出，不含猜测：就是函数开头那几个 if 的同一套判据。
+ */
+function gateVerdict(p) {
+  if (p.floated === false) return '→ `!bm-floated`（float 没写上去）';
+  if (p.conn === false) return '→ `!inEditor`（isConnected 为假）';
+  if (p.closest === false && p.climb8 === false) return '→ `!inEditor`（两个判定都找不到 .cm-content）';
+  if (!(p.hHost > 0) && !(p.hSvg > 0)) return '量到图高 0（继续算，但偏移会是 0）';
+  return '能正常量到（继续算）';
+}
+
+/** 完整文档：轨迹 + 现场快照 */
+function formatDoc(items) {
+  return formatTrace() + '\n\n' + formatSnapshot(items) + '\n';
+}
+
+module.exports = {
+  MAX_ROWS,
+  EXIT_DOC,
+  SRC_DOC,
+  record,
+  all,
+  count,
+  reset,
+  hostTag,
+  keyOf,
+  f2,
+  formatTrace,
+  formatSnapshot,
+  formatDoc,
+};
+
+};
+
 __mods["src/wrap.js"] = function (module, exports, require) {
 'use strict';
 
@@ -6277,7 +6862,7 @@ function loadModules() {
      setInlineStyle, restoreStyles, applyWrapMargins, restoreWrapMargins, readMargins,
      isLivePreview, pickContext, floatify, resetFloat, attachFloatWrap,
      applyFloatLayout, classHas, climbTo, applyValignLayout, valignOffset,
-     measureLineHeight, measureReaderLineHeight, measureTitleCenter,
+     measureLineHeight, measureReaderLineHeight, measureTitleCenter, valignProbe,
      ensureValignObserver, disconnectValignObserver, pruneValignObservers,
      scheduleValignRetries, clearValignRetries, VALIGN_RETRY_DELAYS,
      CLIP_DEPTH, CLIP_HARD_STOP, styleOfEl, overflowClips, containClips, isClipHardStop,
@@ -6289,6 +6874,13 @@ function loadModules() {
   ({ DEBUG_LP, DEBUG_FILE, LINE_MAX: DEBUG_LINE_MAX, FIELD_MAX: DEBUG_FIELD_MAX, dbg, dbgNull,
      dbgConfigure, dbgSetEnabled, dbgEnabled, dbgEl, dbgRect, dbgCss, dbgInline, dbgInlineAll, dbgChildCount,
      dbgFirstChild, dbgChain, dbgText, dbgCount, dbgReset, dbgFlush } = req('src/debug.js'));
+
+  // valign 调用轨迹：内存里攒，诊断命令触发时才写文件（见 src/valtrace.js）
+  const vtmod = req('src/valtrace.js');
+  valtrace = vtmod;
+  ({ MAX_ROWS: VT_MAX_ROWS, record: vtRecord, all: vtRows, reset: vtReset, count: vtCount,
+     hostTag: vtHostTag, formatTrace: formatValignTrace, formatSnapshot: formatValignSnapshot,
+     formatDoc: formatValignDoc } = vtmod);
 
   loadDirOk();
 }
@@ -6464,6 +7056,40 @@ function dbgFloatState(host, where) {
   });
 }
 
+/**
+ * 一个宿主当前挂着的四份记问（只读）：
+ *   hasCfg / hasFloat  走没走过渲染链（applyFloatLayout / attachFloatWrap）
+ *   hasInfo            applyValignLayout 有没有留下过测量记录
+ *   obs / fired        尺寸观察器状态
+ * 现场快照靠它们判断「这张图到底走到过哪里」，不靠猜。
+ */
+function hostValignState(host) {
+  const st = {
+    hasCfg: false, hasFloat: false, hasInfo: false, infoText: '',
+    obs: false, fired: 0, retry: false,
+  };
+  const r2 = (v) => (Number.isFinite(Number(v)) ? (Math.round(Number(v) * 100) / 100).toFixed(2) : 'NaN');
+  try { st.hasCfg = !!(host && host.__bmCfg); } catch (e) { st.hasCfg = false; }
+  try { st.hasFloat = !!(host && host.__bmFloat); } catch (e) { st.hasFloat = false; }
+  try {
+    const info = host && host.__bmValignInfo;
+    if (info) {
+      st.hasInfo = true;
+      st.infoText = '基准 ' + (info.valign || '?') + '｜lineH ' + r2(info.lineH)
+        + '｜imgH ' + r2(info.imgH)
+        + '｜yTitle ' + (info.yTitle == null ? '未取到' : r2(info.yTitle))
+        + '｜offset ' + r2(info.offset);
+    }
+  } catch (e) { st.hasInfo = false; st.infoText = ''; }
+  try {
+    const obs = host && host.__bmValignObs;
+    st.obs = !!obs;
+    st.fired = obs ? (obs.fired || 0) : 0;
+  } catch (e) { st.obs = false; st.fired = 0; }
+  try { st.retry = !!(host && host.__bmValignRetry); } catch (e) { st.retry = false; }
+  return st;
+}
+
 async function renderBraceMap(source, host, opts) {
   const o = opts || {};
   const cfg = parseSource(source);
@@ -6542,7 +7168,7 @@ async function renderBraceMap(source, host, opts) {
    * 长属性，长属性覆盖简写，顺序反了就会被简写里的 margin-top: 0 吃掉。
    * 宿主还没挂进文档时自己补一帧，量不到行高就按 bottom（默认）。
    */
-  applyValignLayout(host, cfg);
+  applyValignLayout(host, cfg, false, 'render');
   dbgFloatState(host, 'render.valign');
 
   // 工具条
@@ -6711,6 +7337,14 @@ class BraceMapPlugin extends Plugin {
       id: 'brace-map-lp-debug',
       name: 'Brace Map: 切换实时预览布局诊断日志',
       callback: () => this.toggleLpDebug(),
+    });
+
+    // valign 调用轨迹：applyValignLayout 每一次调用的完整轨迹 + 现场快照。
+    // 写到 vault 根目录的 brace-map-valign-trace.md，只读，不动布局。
+    this.addCommand({
+      id: 'brace-map-valign-trace',
+      name: 'Brace Map: 输出 valign 调用轨迹',
+      callback: () => { try { this.writeValignTrace(); } catch (e) { /* ignore */ } },
     });
   }
 
@@ -7089,6 +7723,13 @@ class BraceMapPlugin extends Plugin {
     }
 
     const text = out.join('\n');
+    /*
+     * 同一时刻再落一份 valign 轨迹（只读）：这份快照里的「（记录）」「现场量」两列
+     * 都是从一个瞬间的读数，而轨迹文件回答的是另一个问题——applyValignLayout
+     * 每次调用到底走到了哪个分支。两份放在一起才看得出「函数里量到的」和
+     * 「同一时刻现场量到的」差在哪里。
+     */
+    try { this.writeValignTrace(); } catch (e) { /* 轨迹写不出来不影响这份诊断 */ }
     const file = 'brace-map-光标诊断.md';
     try {
       const w = this.app.vault.adapter.write(file, text);
@@ -7098,6 +7739,52 @@ class BraceMapPlugin extends Plugin {
         }).catch(() => { /* ignore */ });
       }
     } catch (e) { /* ignore */ }
+    return text;
+  }
+
+  /**
+   * 把 valign 调用轨迹 + 现场快照写成 vault 根目录 brace-map-valign-trace.md。
+   *
+   * 只读：量一遍、写一个文件，不碰任何布局、不排定时器、不重试。
+   * 轨迹本体是 applyValignLayout 每次调用往内存环形缓冲里追加的（最多 400 条，
+   * 超出从头截断），所以这份文件里包含「命令点下去之前」发生的事；
+   * 现场快照是命令触发这一刻另外独立量的一遍。
+   *
+   * @returns {Promise<string>} 写进去的正文（拿不到 adapter 时也返回正文）
+   */
+  async writeValignTrace() {
+    const items = [];
+    let hosts = [];
+    try { hosts = document.querySelectorAll('.block-language-brace') || []; } catch (e) { hosts = []; }
+    for (let i = 0; i < hosts.length; i++) {
+      const host = hosts[i];
+      let probe = null;
+      try { probe = typeof valignProbe === 'function' ? valignProbe(host) : null; } catch (e) { probe = null; }
+      items.push({
+        host,
+        probe,
+        tag: typeof vtHostTag === 'function' ? vtHostTag(host) : '',
+        where: '页面第 ' + (i + 1) + ' 个 .block-language-brace',
+        state: hostValignState(host),
+      });
+    }
+
+    let text = '';
+    try {
+      text = typeof formatValignDoc === 'function'
+        ? formatValignDoc(items)
+        : '# valign 轨迹\n\n（轨迹模板没装配上）';
+    } catch (e) {
+      text = '# valign 轨迹生成失败\n\n' + (e && e.message ? e.message : String(e));
+    }
+
+    const path = 'brace-map-valign-trace.md';
+    try {
+      await this.app.vault.adapter.write(path, text);
+      try { new Notice('Brace Map valign 轨迹已写入 vault 根目录的 ' + path); } catch (e) { /* ignore */ }
+    } catch (e) {
+      try { new Notice('valign 轨迹写入失败：' + (e && e.message ? e.message : String(e))); } catch (er) { /* ignore */ }
+    }
     return text;
   }
 
@@ -7384,12 +8071,24 @@ function buildInternals() {
   measureReaderLineHeight,
   measureTitleCenter,
   applyValignLayout,
+  valignProbe,
   ensureValignObserver,
   disconnectValignObserver,
   pruneValignObservers,
   scheduleValignRetries,
   clearValignRetries,
   VALIGN_RETRY_DELAYS,
+  // valign 调用轨迹（只读取证，自测用）
+  VT_MAX_ROWS,
+  vtRecord,
+  vtRows,
+  vtReset,
+  vtCount,
+  vtHostTag,
+  formatValignTrace,
+  formatValignSnapshot,
+  formatValignDoc,
+  valtrace,
   DEFAULT_SETTINGS,
   // 临时诊断（Live Preview 图文混排）：默认关闭；自测用 dbgSetEnabled(true) 打开
   DEBUG_LP,

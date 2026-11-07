@@ -10,6 +10,8 @@ const {
 } = require('./debug.js');
 /* valign 量不到行高时的最后兜底要 fontSize × lineHRatio */
 const { OPT } = require('./opt.js');
+/* valign 调用轨迹：只读，内存里攒，诊断命令触发时才落盘。不写样式、不加定时器。 */
+const vt = require('./valtrace.js');
 
 /* ============================================================
  * ★★★ 编辑模式（Live Preview）浮动总开关 ★★★
@@ -1390,11 +1392,126 @@ function inEditorNow(host) {
   return !!climbTo(host, 'cm-content', 8);
 }
 
-function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用，行为已由补拍统一负责
-  if (!host || !host.style || !cfg) return 0;
+/* ---------------------- valign 的只读体检 ---------------------- */
+
+/**
+ * 只读体检：把 applyValignLayout 会看的每一个量单独取一次，一个字段都不写。
+ *
+ * 两处共用：
+ *   1. 每次调用的轨迹（返回那一刻量）
+ *   2. 诊断命令的现场快照（命令触发那一刻量，不经过 applyValignLayout）
+ * 共用同一套量法，所以「函数里量到的」和「现场量到的」能逐字段对账。
+ *
+ * 每一项单独 try/catch：假 DOM / 半残对象上只是少一个数，绝不抛。
+ *
+ * @returns {object} 见各字段注释（编号对应诊断清单里的项）
+ */
+function valignProbe(host) {
+  const out = {
+    conn: null,        // 4  host.isConnected（!== false）
+    closest: null,     // 5  !!host.closest('.cm-content')；null 表示这个宿主没有 closest
+    climb8: null,      // 6  !!climbTo(host, 'cm-content', 8)
+    hHost: null,       // 7  elHeight(host)
+    hSvg: null,        // 8  elHeight(pickSvg(host))
+    svg: 'none',       // 9  pickSvg 的结果：'none' 或 tagName
+    lineH: null,       // 10 measureLineHeight(host)
+    yTitle: null,      // 11 measureTitleCenter(host)（NaN 原样保留）
+    roots: null,       // 12 [data-bm-root] 个数
+    rectH: null,       // 15 host.getBoundingClientRect().height
+    floated: null,     // 有没有 bm-floated 类
+    mt: '',            // 当前行内 margin-top 原文
+    probeValign: '',   // 现场按哪个基准算（取宿主的 cfg / 旧记录）
+    probeOffset: null, // 现场用现有量算出来的 valignOffset
+  };
+  try { out.floated = host ? classHas(host, 'bm-floated') : null; } catch (e) { out.floated = null; }
+  try { out.conn = host ? host.isConnected !== false : null; } catch (e) { out.conn = null; }
+  try {
+    if (host && typeof host.closest === 'function') out.closest = !!host.closest('.cm-content');
+  } catch (e) { out.closest = null; }
+  try { out.climb8 = host ? !!climbTo(host, 'cm-content', 8) : null; } catch (e) { out.climb8 = null; }
+  try { out.hHost = host ? elHeight(host) : null; } catch (e) { out.hHost = null; }
+  let svgEl = null;
+  try { svgEl = pickSvg(host); } catch (e) { svgEl = null; }
+  try {
+    if (svgEl) {
+      out.hSvg = elHeight(svgEl);
+      out.svg = String(svgEl.tagName || svgEl.nodeName || 'svg').toLowerCase();
+    }
+  } catch (e) { out.hSvg = null; }
+  try { out.lineH = host ? round2(measureLineHeight(host)) : null; } catch (e) { out.lineH = null; }
+  try { out.yTitle = host ? measureTitleCenter(host) : null; } catch (e) { out.yTitle = NaN; }
+  try {
+    if (host && typeof host.querySelectorAll === 'function') {
+      const roots = host.querySelectorAll('[data-bm-root]');
+      out.roots = roots ? roots.length : 0;
+    }
+  } catch (e) { out.roots = null; }
+  try {
+    if (host && typeof host.getBoundingClientRect === 'function') {
+      const r = host.getBoundingClientRect();
+      if (r && Number.isFinite(r.height)) out.rectH = r.height;
+    }
+  } catch (e) { out.rectH = null; }
+  try { out.mt = host && host.style && host.style.marginTop ? String(host.style.marginTop) : ''; } catch (e) { out.mt = ''; }
+  try {
+    const hcfg = (host && host.__bmCfg) || null;
+    const hinfo = (host && host.__bmValignInfo) || null;
+    out.probeValign = (hcfg && hcfg.valign) || (hinfo && hinfo.valign) || 'bottom';
+    const imgH = out.hHost || out.hSvg || 0;
+    out.probeOffset = round2(valignOffset(out.lineH, imgH, out.yTitle, out.probeValign));
+  } catch (e) { out.probeOffset = null; }
+  return out;
+}
+
+/**
+ * 记一条轨迹。任何异常都在这里面吃掉：轨迹是取证层，不许影响布局。
+ * 量的时机 = 即将返回的那一刻（write 那一趟取于写完 margin-top 之后）。
+ */
+function vtTrace(host, cfg, src, exit, extra) {
+  try {
+    vt.record({
+      src,
+      exit,
+      host,
+      probe: valignProbe(host),
+      val: (cfg && cfg.valign) || 'bottom',
+      float: (cfg && cfg.float) || '',
+      offset: extra && extra.offset !== undefined ? extra.offset : null,
+      wrote: !!(extra && extra.wrote),
+      err: extra && extra.err ? String(extra.err) : '',
+    });
+  } catch (e) { /* 轨迹失败绝不影响布局 */ }
+}
+
+/**
+ * @param {string} [from] 入口代号：render / retry / observer / reapply。
+ *   只进轨迹，不参与任何判断（不传就是 other）。
+ */
+function applyValignLayout(host, cfg, retried, from) {   // retried：兼容旧调用，行为已由补拍统一负责
+  const src = typeof from === 'string' && from ? from : 'other';
+  try {
+    return valignPass(host, cfg, src);
+  } catch (e) {
+    vtTrace(host, cfg, src, 'throw', { err: (e && e.message) ? e.message : String(e) });
+    throw e;
+  }
+}
+
+/** 真正干活的那一趟：每个 return 前留一条轨迹，说明从哪个分支走的 */
+function valignPass(host, cfg, src) {
+  if (!host || !host.style || !cfg) {
+    vtTrace(host, cfg, src, host ? '!cfg' : '!host');
+    return 0;
+  }
   const mode = cfg.float;
-  if (mode !== 'left' && mode !== 'right') return 0;
-  if (!classHas(host, 'bm-floated')) return 0;     // float 没真写上去时不能加偏移
+  if (mode !== 'left' && mode !== 'right') {
+    vtTrace(host, cfg, src, 'float!=lr');
+    return 0;
+  }
+  if (!classHas(host, 'bm-floated')) {             // float 没真写上去时不能加偏移
+    vtTrace(host, cfg, src, '!bm-floated');
+    return 0;
+  }
 
   /*
    * 判「在不在编辑区里」用 closest 而不是 climbTo：
@@ -1410,6 +1527,7 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
   const inEditor = host.isConnected !== false && inEditorNow(host);
   if (!inEditor) {
     scheduleValignRetries(host, cfg);
+    vtTrace(host, cfg, src, '!inEditor');
     return 0;
   }
   clearValignRetries(host);                         // 连上了：补拍不用再来
@@ -1445,6 +1563,7 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
   if (info.offset && prevRec && cur === want) {
     info.applied = true;
     ensureValignObserver(host, cfg);
+    vtTrace(host, cfg, src, 'same', { offset: info.offset, wrote: true });
     return offset;
   }
 
@@ -1460,7 +1579,10 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
     host.__bmValignRec = null;
   }
 
-  if (!offset) return 0;                            // bottom 档 / 量不到：一个样式都不写
+  if (!offset) {                                    // bottom 档 / 量不到：一个样式都不写
+    vtTrace(host, cfg, src, 'offset=0', { offset: info.offset });
+    return 0;
+  }
 
   const rec = setInlineStyle(host, 'marginTop', want);
   if (rec) {
@@ -1472,6 +1594,7 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
   /* 挂上「尺寸一变就重算」：只盯宿主尺寸，不变化就永远不触发。
    * 图的自校准与窗口变化都会改宿主高度，正好被它接住。 */
   ensureValignObserver(host, cfg);
+  vtTrace(host, cfg, src, 'write', { offset: info.offset, wrote: !!rec });
   return offset;
 }
 
@@ -1562,7 +1685,7 @@ function scheduleValignApply(host) {
     if (host.isConnected === false) { disconnectValignObserver(host); return; }
     const cfg = st.cfg || host.__bmCfg;
     if (!cfg) return;
-    try { applyValignLayout(host, cfg, true); } catch (e) { /* ignore */ }
+    try { applyValignLayout(host, cfg, true, 'observer'); } catch (e) { /* ignore */ }
   };
   try { st.timer = setTimeout(fire, VALIGN_DEBOUNCE_MS); } catch (e) { st.timer = 0; }
   const win = windowOf(host);
@@ -1622,7 +1745,7 @@ function scheduleValignRetries(host, cfg) {
     try {
       st.timers.push(setTimeout(() => {
         if (!host.__bmValignRetry) return;          // 已经连上 / 已复位，这一拍作废
-        try { applyValignLayout(host, cfg, true); } catch (e) { /* ignore */ }
+        try { applyValignLayout(host, cfg, true, 'retry'); } catch (e) { /* ignore */ }
         if (last) clearValignRetries(host);         // 最后一拍：成没成都不再排
       }, VALIGN_RETRY_DELAYS[i]));
     } catch (e) { /* 排不上就算了，还有后面的拍 */ }
@@ -1660,7 +1783,7 @@ function reapplyLivePreviewFloatLayout(doc) {
     applyFloatLayout(host, host.__bmCfg);
     /* 重写 float 时旧账（含 valign 的 margin-top）已整体还原，这里补写回去；
      * 不补的话，设置页把开关关一次再开，图就永远停在 bottom 档。 */
-    if (typeof applyValignLayout === 'function') applyValignLayout(host, host.__bmCfg);
+    if (typeof applyValignLayout === 'function') applyValignLayout(host, host.__bmCfg, false, 'reapply');
     return 1;
   });
 }
@@ -1722,6 +1845,7 @@ module.exports = {
   measureReaderLineHeight,
   measureTitleCenter,
   applyValignLayout,
+  valignProbe,
   ensureValignObserver,
   disconnectValignObserver,
   pruneValignObservers,
