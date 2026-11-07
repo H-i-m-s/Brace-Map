@@ -187,7 +187,8 @@ function reset() {
 const EXIT_DOC = [
   ['write', '正常走完，写了 margin-top'],
   ['same', '算出的偏移和账上那条一模一样，不重写（提前返回）'],
-  ['offset=0', '量出来算出的偏移是 0，一个样式都不写（bottom 档 / 量不到）'],
+  ['not-ready', '图还没准备好（图高 0 或根节点 0 个）：不算偏移、不还原、不改编记录，保留上一次结果'],
+  ['offset=0', '量到了，但算出的偏移是 0，一个样式都不写（bottom 档）'],
   ['!inEditor', '宿主不在 .cm-content 里（或 isConnected 为假）→ 排补拍后返回'],
   ['!bm-floated', '宿主没有 bm-floated 类（float 没真写上去）'],
   ['float!=lr', 'cfg.float 不是 left / right'],
@@ -217,6 +218,7 @@ function fieldTable() {
     '| `climb8` | `!!climbTo(host, \'cm-content\', 8)`（逐层爬的旧判定） |',
     '| `hHost` | `elHeight(host)` |',
     '| `hSvg` | `elHeight(pickSvg(host))` |',
+    '| `imgH` | 图高，取法与函数里一致：`elHeight(host) || elHeight(pickSvg(host))` |',
     '| `svg` | 宿主的 `<svg>`：`svg` = 有且 tagName 是 svg，`none` = 没有 |',
     '| `lineH` | `measureLineHeight(host)` |',
     '| `yTitle` | `measureTitleCenter(host)`（`NaN` 原样记） |',
@@ -247,6 +249,7 @@ function lineOf(r) {
     + ' climb8=' + b01(p.climb8)
     + ' hHost=' + f2(p.hHost)
     + ' hSvg=' + f2(p.hSvg)
+    + ' imgH=' + f2(p.imgH)
     + ' svg=' + (p.svg || '?')
     + ' lineH=' + f2(p.lineH)
     + ' yTitle=' + f2(p.yTitle)
@@ -258,19 +261,19 @@ function lineOf(r) {
 }
 
 function tableHead() {
-  return '| # | +ms | src | → 退出 | conn | closest | climb8 | hHost | hSvg | svg '
+  return '| # | +ms | src | → 退出 | conn | closest | climb8 | hHost | hSvg | imgH | svg '
     + '| lineH | yTitle | roots | off | wrote | rectH |';
 }
 
 function tableSep() {
-  return '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
+  return '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
 }
 
 function tableRow(r) {
   const p = r.probe || {};
   return '| ' + r.n + ' | +' + r.dt + ' | ' + cell(r.src) + ' | `' + cell(r.exit) + '`'
     + ' | ' + b01(p.conn) + ' | ' + b01(p.closest) + ' | ' + b01(p.climb8)
-    + ' | ' + f2(p.hHost) + ' | ' + f2(p.hSvg) + ' | ' + cell(p.svg || '?')
+    + ' | ' + f2(p.hHost) + ' | ' + f2(p.hSvg) + ' | ' + f2(p.imgH) + ' | ' + cell(p.svg || '?')
     + ' | ' + f2(p.lineH) + ' | ' + f2(p.yTitle)
     + ' | ' + (p.roots == null ? '?' : p.roots)
     + ' | ' + f2(r.offset) + ' | ' + (r.wrote ? '1' : '0')
@@ -428,7 +431,8 @@ function gateVerdict(p) {
   if (p.floated === false) return '→ `!bm-floated`（float 没写上去）';
   if (p.conn === false) return '→ `!inEditor`（isConnected 为假）';
   if (p.closest === false && p.climb8 === false) return '→ `!inEditor`（两个判定都找不到 .cm-content）';
-  if (!(p.hHost > 0) && !(p.hSvg > 0)) return '量到图高 0（继续算，但偏移会是 0）';
+  if (!(p.hHost > 0) && !(p.hSvg > 0)) return '→ `not-ready`（图高量到 0，保留上一次结果）';
+  if (p.roots === 0) return '→ `not-ready`（一个 `[data-bm-root]` 都没有，保留上一次结果）';
   return '能正常量到（继续算）';
 }
 

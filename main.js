@@ -3096,6 +3096,9 @@ function measureTitleCenter(host, origin) {
  *   - 宿主已经带上 bm-floated（说明那一行 float 真的写上了）
  *   - 宿主连在文档上（否则按 120/480/1200ms 补拍三次，量不到就按 bottom）
  *
+ * 再加一条「量到了才算」：图高为 0 或根节点一个都没有时算「没准备好」，
+ * 直接返回，保留上一次的结果（见函数体里的注释）。
+ *
  * 写样式走 setInlineStyle 并记进 host.__bmFloatLayout：那份账归
  * resetFloatLayout 统一还原，复位后不会留下写死的 margin-top。
  * 顺序上 applyFloatLayout 先写 margin 简写（margin-top: 0），这里再写
@@ -3119,6 +3122,19 @@ function measureTitleCenter(host, origin) {
 function pickSvg(host) {
   if (!host || typeof host.querySelector !== 'function') return null;
   try { return host.querySelector('svg'); } catch (e) { return null; }
+}
+
+/**
+ * 宿主里有几个根节点文字（`[data-bm-root]`）。无 DOM 能力 / 不是宿主时返回 0。
+ *
+ * 它就是「图真的画出来了」的第二个证据：宿主高量得到、根节点也在，才算准备好了。
+ */
+function rootNodeCount(host) {
+  if (!host || typeof host.querySelectorAll !== 'function') return 0;
+  try {
+    const roots = host.querySelectorAll('[data-bm-root]');
+    return roots && roots.length ? roots.length : 0;
+  } catch (e) { return 0; }
 }
 
 function inEditorNow(host) {
@@ -3150,6 +3166,7 @@ function valignProbe(host) {
     climb8: null,      // 6  !!climbTo(host, 'cm-content', 8)
     hHost: null,       // 7  elHeight(host)
     hSvg: null,        // 8  elHeight(pickSvg(host))
+    imgH: null,        // 图高：elHeight(host) || elHeight(pickSvg(host))，与函数里的取法一致
     svg: 'none',       // 9  pickSvg 的结果：'none' 或 tagName
     lineH: null,       // 10 measureLineHeight(host)
     yTitle: null,      // 11 measureTitleCenter(host)（NaN 原样保留）
@@ -3177,12 +3194,12 @@ function valignProbe(host) {
   } catch (e) { out.hSvg = null; }
   try { out.lineH = host ? round2(measureLineHeight(host)) : null; } catch (e) { out.lineH = null; }
   try { out.yTitle = host ? measureTitleCenter(host) : null; } catch (e) { out.yTitle = NaN; }
+  /* 图高取法与函数里一致：先宿主，宿主量不到再退到 SVG */
   try {
-    if (host && typeof host.querySelectorAll === 'function') {
-      const roots = host.querySelectorAll('[data-bm-root]');
-      out.roots = roots ? roots.length : 0;
-    }
-  } catch (e) { out.roots = null; }
+    const img = (out.hHost > 0) ? out.hHost : ((out.hSvg > 0) ? out.hSvg : 0);
+    out.imgH = round2(img);
+  } catch (e) { out.imgH = null; }
+  try { out.roots = host ? rootNodeCount(host) : null; } catch (e) { out.roots = null; }
   try {
     if (host && typeof host.getBoundingClientRect === 'function') {
       const r = host.getBoundingClientRect();
@@ -3269,6 +3286,24 @@ function valignPass(host, cfg, src) {
   }
   clearValignRetries(host);                         // 连上了：补拍不用再来
 
+  /*
+   * 图还没准备好：不在文档里 / 还没渲染 / 正在重建。
+   *
+   * 这种时刻量到的图高是 0、根节点也是 0，算出来的偏移必然是 0。以前让它照样
+   * 往下走，就会把上一次写好的 margin-top（以及 __bmValignInfo）一起撤掉，
+   * 于是「生效过又被一次失败的量撤回」，之后再也没恢复。
+   *
+   * 所以这里直接返回：不算偏移、不还原、不写样式、不碰 __bmValignInfo。
+   * 时机交给已有的补拍和尺寸观察器，这里不排任何新东西。
+   *
+   * 判据只认 0：图小不是错，只有完全量不到才算没准备好。
+   */
+  const imgH = elHeight(host) || elHeight(pickSvg(host));
+  if (!(imgH > 0) || !(rootNodeCount(host) > 0)) {
+    vtTrace(host, cfg, src, 'not-ready');
+    return 0;
+  }
+
   const info = {
     valign: cfg.valign || 'bottom',
     lineH: 0, imgH: 0, yTitle: null, offset: 0, applied: false,
@@ -3282,7 +3317,7 @@ function valignPass(host, cfg, src) {
    * imgH 优先宿主自身，拿不到再退到 SVG：浮动刚生效、或宿主还没排出高度时，
    * 宿主 rect 可能是 0，而图已经在 SVG 里画好了。
    */
-  info.imgH = round2(elHeight(host) || elHeight(pickSvg(host)));
+  info.imgH = round2(imgH);
   info.lineH = round2(measureLineHeight(host));
   const y = measureTitleCenter(host);
   info.yTitle = Number.isFinite(y) ? round2(y) : null;
@@ -3583,6 +3618,7 @@ module.exports = {
   measureTitleCenter,
   applyValignLayout,
   valignProbe,
+  rootNodeCount,
   ensureValignObserver,
   disconnectValignObserver,
   pruneValignObservers,
@@ -6355,7 +6391,8 @@ function reset() {
 const EXIT_DOC = [
   ['write', '正常走完，写了 margin-top'],
   ['same', '算出的偏移和账上那条一模一样，不重写（提前返回）'],
-  ['offset=0', '量出来算出的偏移是 0，一个样式都不写（bottom 档 / 量不到）'],
+  ['not-ready', '图还没准备好（图高 0 或根节点 0 个）：不算偏移、不还原、不改编记录，保留上一次结果'],
+  ['offset=0', '量到了，但算出的偏移是 0，一个样式都不写（bottom 档）'],
   ['!inEditor', '宿主不在 .cm-content 里（或 isConnected 为假）→ 排补拍后返回'],
   ['!bm-floated', '宿主没有 bm-floated 类（float 没真写上去）'],
   ['float!=lr', 'cfg.float 不是 left / right'],
@@ -6385,6 +6422,7 @@ function fieldTable() {
     '| `climb8` | `!!climbTo(host, \'cm-content\', 8)`（逐层爬的旧判定） |',
     '| `hHost` | `elHeight(host)` |',
     '| `hSvg` | `elHeight(pickSvg(host))` |',
+    '| `imgH` | 图高，取法与函数里一致：`elHeight(host) || elHeight(pickSvg(host))` |',
     '| `svg` | 宿主的 `<svg>`：`svg` = 有且 tagName 是 svg，`none` = 没有 |',
     '| `lineH` | `measureLineHeight(host)` |',
     '| `yTitle` | `measureTitleCenter(host)`（`NaN` 原样记） |',
@@ -6415,6 +6453,7 @@ function lineOf(r) {
     + ' climb8=' + b01(p.climb8)
     + ' hHost=' + f2(p.hHost)
     + ' hSvg=' + f2(p.hSvg)
+    + ' imgH=' + f2(p.imgH)
     + ' svg=' + (p.svg || '?')
     + ' lineH=' + f2(p.lineH)
     + ' yTitle=' + f2(p.yTitle)
@@ -6426,19 +6465,19 @@ function lineOf(r) {
 }
 
 function tableHead() {
-  return '| # | +ms | src | → 退出 | conn | closest | climb8 | hHost | hSvg | svg '
+  return '| # | +ms | src | → 退出 | conn | closest | climb8 | hHost | hSvg | imgH | svg '
     + '| lineH | yTitle | roots | off | wrote | rectH |';
 }
 
 function tableSep() {
-  return '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
+  return '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
 }
 
 function tableRow(r) {
   const p = r.probe || {};
   return '| ' + r.n + ' | +' + r.dt + ' | ' + cell(r.src) + ' | `' + cell(r.exit) + '`'
     + ' | ' + b01(p.conn) + ' | ' + b01(p.closest) + ' | ' + b01(p.climb8)
-    + ' | ' + f2(p.hHost) + ' | ' + f2(p.hSvg) + ' | ' + cell(p.svg || '?')
+    + ' | ' + f2(p.hHost) + ' | ' + f2(p.hSvg) + ' | ' + f2(p.imgH) + ' | ' + cell(p.svg || '?')
     + ' | ' + f2(p.lineH) + ' | ' + f2(p.yTitle)
     + ' | ' + (p.roots == null ? '?' : p.roots)
     + ' | ' + f2(r.offset) + ' | ' + (r.wrote ? '1' : '0')
@@ -6596,7 +6635,8 @@ function gateVerdict(p) {
   if (p.floated === false) return '→ `!bm-floated`（float 没写上去）';
   if (p.conn === false) return '→ `!inEditor`（isConnected 为假）';
   if (p.closest === false && p.climb8 === false) return '→ `!inEditor`（两个判定都找不到 .cm-content）';
-  if (!(p.hHost > 0) && !(p.hSvg > 0)) return '量到图高 0（继续算，但偏移会是 0）';
+  if (!(p.hHost > 0) && !(p.hSvg > 0)) return '→ `not-ready`（图高量到 0，保留上一次结果）';
+  if (p.roots === 0) return '→ `not-ready`（一个 `[data-bm-root]` 都没有，保留上一次结果）';
   return '能正常量到（继续算）';
 }
 

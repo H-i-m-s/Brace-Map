@@ -165,15 +165,16 @@ function tTwoCallsRecorded() {
   eq(r.rows.length, 2, 'valtrace: 图变高后的第二次调用又留一条，不覆盖');
   eq([r.rows[0].n, r.rows[1].n], [1, 2], 'valtrace: 序号自增');
 
-  eq(r.rows[0].exit, 'offset=0', 'valtrace: 第一次从「偏移为 0」分支返回');
+  eq(r.rows[0].exit, 'not-ready', 'valtrace: 第一次从「图没准备好」分支返回（图高 0 且无根节点）');
   eq(r.rows[0].src, 'render', 'valtrace: 第一次记下入口 render');
   eq(r.rows[0].probe.hHost, 0, 'valtrace: 第一次现场量到宿主高 0');
   eq(r.rows[0].probe.hSvg, null, 'valtrace: 第一次没有 svg 可量');
+  eq(r.rows[0].probe.imgH, 0, 'valtrace: 第一次记下图高 0');
   eq(r.rows[0].probe.svg, 'none', 'valtrace: 第一次 pickSvg 为空');
   eq(r.rows[0].probe.roots, 0, 'valtrace: 第一次根节点 0 个');
   ok(Number.isNaN(r.rows[0].probe.yTitle), 'valtrace: 第一次 yTitle 记成 NaN 而不是漏掉');
   eq(r.rows[0].probe.lineH, 48.29, 'valtrace: 第一次行高照样量得到（与真机 31.50 同形）');
-  eq(r.rows[0].offset, 0, 'valtrace: 第一次 offset 记 0');
+  eq(r.rows[0].offset, null, 'valtrace: 第一次没算偏移，记 null 而不是谎报 0');
   eq(r.rows[0].wrote, false, 'valtrace: 第一次没写 margin-top');
   eq(r.off1, 0, 'valtrace: 第一次真的没写样式（返回值 0）');
 
@@ -198,7 +199,8 @@ function tTraceTextDistinguishesCalls() {
   ok(text.indexOf('hHost=0.00') >= 0, 'valtrace-text: 轨迹里能看到第一次的 0');
   ok(text.indexOf('hHost=169.79') >= 0, 'valtrace-text: 轨迹里也能看到第二次的真值');
   ok(text.indexOf('yTitle=NaN') >= 0, 'valtrace-text: NaN 原样写在文本里');
-  ok(text.indexOf('→ offset=0') >= 0, 'valtrace-text: 退出分支写在每行里');
+  ok(text.indexOf('→ not-ready') >= 0, 'valtrace-text: 退出分支写在每行里');
+  ok(text.indexOf('imgH=0.00') >= 0, 'valtrace-text: not-ready 那条带上了 imgH');
   ok(text.indexOf('→ write') >= 0, 'valtrace-text: 第二次的退出分支也在');
   ok(text.indexOf('render') >= 0 && text.indexOf('observer') >= 0, 'valtrace-text: 两个入口都记了');
   ok(text.indexOf('## 一、时序总览') >= 0, 'valtrace-text: 有按序号排的时序总览');
@@ -315,7 +317,7 @@ function tGroupAndSnapshot() {
     'valtrace-snap: 图 2 现场量到的宿主高是 169.79');
   ok(snapText.indexOf('| 11 `measureTitleCenter(host)` | NaN |') >= 0,
     'valtrace-snap: 图 1 的 yTitle 现场也是 NaN');
-  ok(snapText.indexOf('量到图高 0') >= 0, 'valtrace-snap: 图 1 的现场结论是「量到图高 0」');
+  ok(snapText.indexOf('`not-ready`') >= 0, 'valtrace-snap: 图 1 的现场结论是 not-ready');
   ok(snapText.indexOf('__bmValignInfo') >= 0, 'valtrace-snap: 快照列出 valign 记录状态');
   ok(snapText.indexOf('已挂，已触发 2 次') >= 0, 'valtrace-snap: 快照记下观察器触发次数');
   eq(items.length, 2, 'valtrace-snap: 两图各一条快照');

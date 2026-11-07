@@ -370,11 +370,11 @@ function tApplyDegenerate() {
     eq(r.info.lineH, 0, 'valign-apply-degenerate: h=0 时诊断记 0');
     eq(r.host.style.marginTop, undefined, 'valign-apply-degenerate: h=0 时 ' + v + ' 不动样式');
   }
-  // yTitle 拿不到：middle 退化为 bottom，top 照旧
-  const mid = applyCase('middle', { rootTexts: [] });
+  // yTitle 量不到（根节点在，但文字框高 0）：middle 退化为 bottom，top 照旧
+  const mid = applyCase('middle', { rootTexts: [rootText(140, 0)] });
   eq(mid.off, 0, 'valign-apply-degenerate: yTitle 缺失时 middle 退化为 bottom');
   eq(mid.info.yTitle, null, 'valign-apply-degenerate: 诊断记 yTitle 为 null');
-  const top = applyCase('top', { rootTexts: [] });
+  const top = applyCase('top', { rootTexts: [rootText(140, 0)] });
   near(top.off, -102.71, 'valign-apply-degenerate: yTitle 缺失不影响 top');
   eq(top.info.yTitle, null, 'valign-apply-degenerate: top 也记 yTitle 为 null');
 }
@@ -733,6 +733,113 @@ function tRootMarkup() {
   eq((one.markup.match(/data-bm-root="1"/g) || []).length, 1, 'valign-markup: 单根一条标记');
 }
 
+/* ------------------------------ 没准备好时保留上一次的结果 ------------------------------ */
+
+/**
+ * 真机上「生效过又被撤回」的那条路：观察器回调里量到图高 0 / 无根节点，
+ * 以前会把已经写好的 margin-top 还原掉、并用一条全 0 的记录盖掉 __bmValignInfo。
+ * 现在这种时刻直接返回（not-ready）：不记账、不还原、不写样式。
+ */
+function tNotReadyKeepsPrevious() {
+  I.vtReset();
+  const k = observerCase(150.89);      // 图高 150.89，根文字中心 60+15=75
+  const host = k.ctx.host;
+  const cfg = { float: 'right', valign: 'top' };
+  I.applyFloatLayout(host, cfg);
+
+  /* 1) 准备好了：正常写 */
+  const off1 = I.applyValignLayout(host, cfg, false, 'render');
+  near(off1, 48.29 - 150.89, 'valign-ready: 第一次算出 h − H');
+  eq(host.style.marginTop, '-102.6px', 'valign-ready: 第一次写下 -102.6px');
+  eq(k.counts.set, 1, 'valign-ready: 只写了一次');
+  const info1 = host.__bmValignInfo;
+  ok(info1 && info1.imgH === 150.89, 'valign-ready: 记下了真实的图高');
+  eq(info1.offset, -102.6, 'valign-ready: 记录里的偏移也对');
+
+  /* 2) 图那一刻不在文档里 / 还没重建好：图高 0、无根节点 */
+  k.opts.imgH = 0;
+  k.opts.rootTexts = [];
+  eq(I.applyValignLayout(host, cfg, true, 'observer'), 0, 'valign-not-ready: 返回 0');
+  eq(host.style.marginTop, '-102.6px', 'valign-not-ready: 已写好的 margin-top 被保住');
+  eq(k.counts.set, 1, 'valign-not-ready: 一个字节都没重写（没有先还原再写）');
+  ok(host.__bmValignInfo === info1, 'valign-not-ready: __bmValignInfo 仍是上一次那份（同一个对象）');
+  eq(host.__bmValignInfo.imgH, 150.89, 'valign-not-ready: 记录里的图高没被 0 盖掉');
+  eq(host.__bmValignInfo.yTitle, 75, 'valign-not-ready: 记录里的 yTitle 也没被 NaN 盖掉');
+  ok(host.__bmValignRec, 'valign-not-ready: margin-top 的账还挂着，没被摘掉');
+
+  /* 3) 图回来了，几何和上次一模一样：值没变就不重写 */
+  k.opts.imgH = 150.89;
+  k.opts.rootTexts = [rootText(60, 30)];
+  const off3 = I.applyValignLayout(host, cfg, true, 'observer');
+  near(off3, -102.6, 'valign-restored: 恢复后的偏移与上次相同');
+  eq(host.style.marginTop, '-102.6px', 'valign-restored: 仍然是 -102.6px');
+  eq(k.counts.set, 1, 'valign-restored: 值没变，没有重写');
+
+  /* 4) 图真的变高了：重新算，写入新值 */
+  k.opts.imgH = 300;
+  const off4 = I.applyValignLayout(host, cfg, true, 'observer');
+  near(off4, 48.29 - 300, 'valign-grow: 图高 300 后重新算');
+  eq(host.style.marginTop, '-251.71px', 'valign-grow: 写入新值 -251.71px');
+  eq(k.counts.set, 3, 'valign-grow: 先还原旧值再写新值（两次赋值）');
+  eq(host.__bmValignInfo.imgH, 300, 'valign-grow: 记录跟着更新');
+
+  const exits = I.vtRows().map((r) => r.exit);
+  eq(exits, ['write', 'not-ready', 'same', 'write'], 'valign-not-ready: 轨迹里四个分支依次出现');
+  const nr = I.vtRows()[1];
+  eq(nr.probe.imgH, 0, 'valign-not-ready: 轨迹里 not-ready 那条 imgH 记 0');
+  eq(nr.probe.roots, 0, 'valign-not-ready: 轨迹里 not-ready 那条 roots 记 0');
+  eq(nr.src, 'observer', 'valign-not-ready: 入口是 observer');
+  eq(nr.wrote, false, 'valign-not-ready: 它没有写样式');
+}
+
+/**
+ * middle 档的同一条路：用真机轨迹里的那组数（图高 150.89、yTitle 73 → -57.25）。
+ * middle 不看图高，所以保留的是标题中心那个量，被 not-ready 刮掉的后果一样明显。
+ */
+function tNotReadyMiddle() {
+  I.vtReset();
+  const opts = { imgH: 150.89, rootTexts: [rootText(58, 30)] };   // 文字中心 73
+  const b = makeHost(opts);
+  withComputed(b.content, { lineHeight: '31.5px', fontSize: '30px' });
+  b.embed.nextElementSibling = fakeChain([{ cls: ['cm-line'], h: 31.5, lh: '31.5px' }]);
+  const cfg = { float: 'right', valign: 'middle' };
+  I.applyFloatLayout(b.host, cfg);
+
+  near(I.applyValignLayout(b.host, cfg, false, 'render'), 15.75 - 73, 'valign-middle: 三档里 middle 写 −57.25');
+  eq(b.host.style.marginTop, '-57.25px', 'valign-middle: 写进 margin-top 的就是 -57.25px');
+  const info1 = b.host.__bmValignInfo;
+
+  opts.imgH = 0;
+  opts.rootTexts = [];
+  eq(I.applyValignLayout(b.host, cfg, true, 'observer'), 0, 'valign-middle: not-ready 时返回 0');
+  eq(b.host.style.marginTop, '-57.25px', 'valign-middle: -57.25px 被保住');
+  ok(b.host.__bmValignInfo === info1, 'valign-middle: 记录没被覆盖');
+  eq(I.vtRows()[1].exit, 'not-ready', 'valign-middle: 轨迹记 not-ready');
+}
+
+/** bottom 档在新判据下行为不变：准备好了照样不写样式，没准备好也不动任何东西 */
+function tNotReadyBottom() {
+  I.vtReset();
+  const k = observerCase(150);
+  const host = k.ctx.host;
+  const cfg = { float: 'right', valign: 'bottom' };
+  I.applyFloatLayout(host, cfg);
+
+  eq(I.applyValignLayout(host, cfg, false, 'render'), 0, 'valign-bottom: bottom 档偏移恒为 0');
+  eq(k.counts.set, 0, 'valign-bottom: 一个样式都不写');
+  eq(host.__bmValignInfo.imgH, 150, 'valign-bottom: 照样记账（图高量到了）');
+  eq(host.__bmValignInfo.offset, 0, 'valign-bottom: 偏移记 0');
+  eq(I.vtRows()[0].exit, 'offset=0', 'valign-bottom: 准备好了记 offset=0');
+  const info1 = host.__bmValignInfo;
+
+  k.opts.imgH = 0;
+  k.opts.rootTexts = [];
+  eq(I.applyValignLayout(host, cfg, true, 'observer'), 0, 'valign-bottom: not-ready 也返回 0');
+  eq(k.counts.set, 0, 'valign-bottom: not-ready 时也没写样式');
+  ok(host.__bmValignInfo === info1, 'valign-bottom: not-ready 不覆盖记录');
+  eq(I.vtRows()[1].exit, 'not-ready', 'valign-bottom: 轨迹记 not-ready');
+}
+
 suite('valign-parse', tParseValign);
 suite('valign-offset', tOffsetFormula);
 suite('valign-offset-degenerate', tOffsetDegenerate);
@@ -753,3 +860,6 @@ suite('valign-observer-reset', tResetDisconnects);
 suite('valign-mount', tDelayedMount);
 suite('valign-noapi', tObserverNoApi);
 suite('valign-markup', tRootMarkup);
+suite('valign-not-ready', tNotReadyKeepsPrevious);
+suite('valign-not-ready-middle', tNotReadyMiddle);
+suite('valign-not-ready-bottom', tNotReadyBottom);

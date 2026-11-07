@@ -1359,6 +1359,9 @@ function measureTitleCenter(host, origin) {
  *   - 宿主已经带上 bm-floated（说明那一行 float 真的写上了）
  *   - 宿主连在文档上（否则按 120/480/1200ms 补拍三次，量不到就按 bottom）
  *
+ * 再加一条「量到了才算」：图高为 0 或根节点一个都没有时算「没准备好」，
+ * 直接返回，保留上一次的结果（见函数体里的注释）。
+ *
  * 写样式走 setInlineStyle 并记进 host.__bmFloatLayout：那份账归
  * resetFloatLayout 统一还原，复位后不会留下写死的 margin-top。
  * 顺序上 applyFloatLayout 先写 margin 简写（margin-top: 0），这里再写
@@ -1382,6 +1385,19 @@ function measureTitleCenter(host, origin) {
 function pickSvg(host) {
   if (!host || typeof host.querySelector !== 'function') return null;
   try { return host.querySelector('svg'); } catch (e) { return null; }
+}
+
+/**
+ * 宿主里有几个根节点文字（`[data-bm-root]`）。无 DOM 能力 / 不是宿主时返回 0。
+ *
+ * 它就是「图真的画出来了」的第二个证据：宿主高量得到、根节点也在，才算准备好了。
+ */
+function rootNodeCount(host) {
+  if (!host || typeof host.querySelectorAll !== 'function') return 0;
+  try {
+    const roots = host.querySelectorAll('[data-bm-root]');
+    return roots && roots.length ? roots.length : 0;
+  } catch (e) { return 0; }
 }
 
 function inEditorNow(host) {
@@ -1413,6 +1429,7 @@ function valignProbe(host) {
     climb8: null,      // 6  !!climbTo(host, 'cm-content', 8)
     hHost: null,       // 7  elHeight(host)
     hSvg: null,        // 8  elHeight(pickSvg(host))
+    imgH: null,        // 图高：elHeight(host) || elHeight(pickSvg(host))，与函数里的取法一致
     svg: 'none',       // 9  pickSvg 的结果：'none' 或 tagName
     lineH: null,       // 10 measureLineHeight(host)
     yTitle: null,      // 11 measureTitleCenter(host)（NaN 原样保留）
@@ -1440,12 +1457,12 @@ function valignProbe(host) {
   } catch (e) { out.hSvg = null; }
   try { out.lineH = host ? round2(measureLineHeight(host)) : null; } catch (e) { out.lineH = null; }
   try { out.yTitle = host ? measureTitleCenter(host) : null; } catch (e) { out.yTitle = NaN; }
+  /* 图高取法与函数里一致：先宿主，宿主量不到再退到 SVG */
   try {
-    if (host && typeof host.querySelectorAll === 'function') {
-      const roots = host.querySelectorAll('[data-bm-root]');
-      out.roots = roots ? roots.length : 0;
-    }
-  } catch (e) { out.roots = null; }
+    const img = (out.hHost > 0) ? out.hHost : ((out.hSvg > 0) ? out.hSvg : 0);
+    out.imgH = round2(img);
+  } catch (e) { out.imgH = null; }
+  try { out.roots = host ? rootNodeCount(host) : null; } catch (e) { out.roots = null; }
   try {
     if (host && typeof host.getBoundingClientRect === 'function') {
       const r = host.getBoundingClientRect();
@@ -1532,6 +1549,24 @@ function valignPass(host, cfg, src) {
   }
   clearValignRetries(host);                         // 连上了：补拍不用再来
 
+  /*
+   * 图还没准备好：不在文档里 / 还没渲染 / 正在重建。
+   *
+   * 这种时刻量到的图高是 0、根节点也是 0，算出来的偏移必然是 0。以前让它照样
+   * 往下走，就会把上一次写好的 margin-top（以及 __bmValignInfo）一起撤掉，
+   * 于是「生效过又被一次失败的量撤回」，之后再也没恢复。
+   *
+   * 所以这里直接返回：不算偏移、不还原、不写样式、不碰 __bmValignInfo。
+   * 时机交给已有的补拍和尺寸观察器，这里不排任何新东西。
+   *
+   * 判据只认 0：图小不是错，只有完全量不到才算没准备好。
+   */
+  const imgH = elHeight(host) || elHeight(pickSvg(host));
+  if (!(imgH > 0) || !(rootNodeCount(host) > 0)) {
+    vtTrace(host, cfg, src, 'not-ready');
+    return 0;
+  }
+
   const info = {
     valign: cfg.valign || 'bottom',
     lineH: 0, imgH: 0, yTitle: null, offset: 0, applied: false,
@@ -1545,7 +1580,7 @@ function valignPass(host, cfg, src) {
    * imgH 优先宿主自身，拿不到再退到 SVG：浮动刚生效、或宿主还没排出高度时，
    * 宿主 rect 可能是 0，而图已经在 SVG 里画好了。
    */
-  info.imgH = round2(elHeight(host) || elHeight(pickSvg(host)));
+  info.imgH = round2(imgH);
   info.lineH = round2(measureLineHeight(host));
   const y = measureTitleCenter(host);
   info.yTitle = Number.isFinite(y) ? round2(y) : null;
@@ -1846,6 +1881,7 @@ module.exports = {
   measureTitleCenter,
   applyValignLayout,
   valignProbe,
+  rootNodeCount,
   ensureValignObserver,
   disconnectValignObserver,
   pruneValignObservers,
