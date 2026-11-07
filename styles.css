@@ -219,3 +219,39 @@
 .bm-float-inline .brace-map-scroll {
   overflow-x: visible;
 }
+
+/* ---------- 编辑模式：widget 的 rect 必须等于它实际占的高度 ---------- */
+
+/*
+  Obsidian 给编辑区立了一条契约（app.css）：
+
+    .markdown-source-view.mod-cm6 .cm-content > * { margin: 0 !important; display: block; }
+
+  直接子元素之间没有外边距，于是「子元素 rect 高之和」正好等于 .cm-content 的高。
+  CM6 就是照这个记账的：它只量元素自己的 rect（getBoundingClientRect 不含外边距），
+  然后把纵坐标反推成行号。
+
+  插件里 .brace-map-block 有 0.9em 上下外边距，而宿主 .block-language-brace 和
+  .cm-embed-block 都没有 border / padding，也不是 BFC，这条外边距会一路塌陷到
+  widget 外面：
+
+    widget rect        312.00                 ← CM6 量的就是它
+    实际占位           312.00 + 2×18.89 = 349.78
+
+  账实之间那 37.8px 没有主人，点哪儿偏哪儿。widget 内部没有溢出，所以从宿主上
+  看不出任何异常。
+
+  让 widget 自成 BFC 就行：flow-root 不裁剪、不改盒模型，只把外边距关在盒子里，
+  rect 于是等于实际占位。真机 Chromium 实测：flow-root 后 embed rect 312 → 349.78，
+  子元素间隙 37.78 → 0，.cm-content 总高一个像素都不变（间距只是从盒外挪到盒内）。
+*/
+.markdown-source-view.mod-cm6 .cm-content > .cm-embed-block:has(.brace-map-block):not(:has(.bm-float-left)):not(:has(.bm-float-right)) {
+  display: flow-root;
+}
+
+/*
+  float: left / right 那两档必须留在 BFC 外面：它们靠 float 穿透 .cm-embed-block
+  到 .cm-content（flex item，天然是 BFC）才能绕排，BFC 会把 float 关在盒子里。
+  那两档本来就走「widget 高度塌成 0、账实都是 0」那条路，不需要这条。
+  居中 / 行内不是 float，同样受益于上面这条。
+*/

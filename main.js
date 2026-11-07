@@ -6004,8 +6004,13 @@ class BraceMapPlugin extends Plugin {
    * 实际高度差多少。CM6 按账上的高度把纵坐标反推成行号，两者不一致，
    * 就会出现「点这里、光标落在那里」。差值就是错位的像素数。
    *
-   * 同时把每个括号图宿主的内联样式、rect、以及它后面那段文字的高度
-   * 一并记下来，用来判断错位是不是来自某个 widget。
+   * 光有差值不够，还要知道差的那截是谁的。所以这一份分三层：
+   *   1. 逐个量 .cm-content 的直接子元素（rect 高、offset 高、与上一个的间隙），
+   *      并借 CM6 自己的账本（posAtDOM + lineBlockAt）记每个块的「账上高度」
+   *   2. 对账：子元素高总和 + 间隙总和 vs .cm-content rect vs contentHeight，
+   *      给出 A / C 两个差，区分「账外间隙」和「某元素尺寸没跟上」
+   *   3. 括号图宿主逐层：host / embed / .brace-map-block 的 rect、computed
+   *      外边距，以及 embed 上下两段空隙（外边距塌陷出去的那部分就在这两段里）
    */
   snapshotLayout() {
     const out = [];
@@ -6025,23 +6030,55 @@ class BraceMapPlugin extends Plugin {
       }
     } catch (e) { cm = null; }
 
-    const contentEl = document.querySelector('.markdown-source-view .cm-content');
+    let contentEl = null;
+    try { contentEl = (cm && cm.contentDOM) ? cm.contentDOM : null; } catch (e) { contentEl = null; }
+    if (!contentEl) contentEl = document.querySelector('.markdown-source-view .cm-content');
+
     const rect = (el) => {
       if (!el || typeof el.getBoundingClientRect !== 'function') return null;
       const r = el.getBoundingClientRect();
-      return { top: r.top, left: r.left, w: r.width, h: r.height };
+      return { top: r.top, left: r.left, w: r.width, h: r.height, bottom: r.bottom };
     };
     const box = (r) => (r
       ? 'top ' + num(r.top) + ' / 高 ' + num(r.h) + ' / 宽 ' + num(r.w)
       : '（量不到）');
+    const cssOf = (el, props) => {
+      if (!el || typeof getComputedStyle !== 'function') return null;
+      let cs = null;
+      try { cs = getComputedStyle(el); } catch (e) { return null; }
+      const o = {};
+      for (let i = 0; i < props.length; i++) o[props[i]] = cs[props[i]];
+      return o;
+    };
+    const signed = (v) => (typeof v === 'number' && isFinite(v)
+      ? (v > 0 ? '+' : '') + v.toFixed(2)
+      : String(v));
+    const labelOf = (el) => {
+      const c = String(el.className == null ? '' : el.className).trim();
+      return el.tagName + (c ? '.' + c.split(/\s+/).slice(0, 3).join('.') : '');
+    };
     const contentRect = rect(contentEl);
 
     push('');
     push('## CM6 账本 vs 实际');
     push('- contentHeight（CM6 记账）：' + (cm ? num(cm.contentHeight) : '拿不到'));
     push('- .cm-content 实际 rect：' + box(contentRect));
+    push('- .cm-content offsetHeight（不含 transform）：'
+      + (contentEl ? num(contentEl.offsetHeight) : '拿不到'));
+    const contentCs = cssOf(contentEl, ['paddingTop', 'paddingBottom', 'marginTop', 'marginBottom',
+      'transform', 'boxSizing']);
+    if (contentCs) {
+      push('- .cm-content computed：padding ' + contentCs.paddingTop + ' / ' + contentCs.paddingBottom
+        + '｜margin ' + contentCs.marginTop + ' / ' + contentCs.marginBottom
+        + '｜transform ' + contentCs.transform + '｜box-sizing ' + contentCs.boxSizing);
+    }
     if (cm && contentRect) {
-      push('- **差值**：' + num(contentRect.h - cm.contentHeight) + ' px（正数=实际比账高）');
+      push('- **B = rect − 记账**：' + signed(contentRect.h - cm.contentHeight)
+        + ' px（正数=实际比账高）');
+      if (contentEl) {
+        push('- rect − offsetHeight：' + signed(contentRect.h - contentEl.offsetHeight)
+          + ' px（offsetHeight 取整，差 < 1 是取整；再大说明 .cm-content 上有 transform / 缩放）');
+      }
     }
     if (cm) {
       let dh = null;
@@ -6052,22 +6089,160 @@ class BraceMapPlugin extends Plugin {
       push('- viewportHeight：' + (vh == null ? '拿不到' : num(vh)));
     }
 
+    /* ---------- 容器层：内容多出来的高度可能挂在祖先身上 ---------- */
+
+    push('');
+    push('## 容器层');
+    const near = (sel) => {
+      try { return contentEl ? contentEl.closest(sel) : null; } catch (e) { return null; }
+    };
+    const layer = (el, label) => {
+      if (!el) { push('- ' + label + '：（找不到）'); return; }
+      push('- ' + label + '：' + box(rect(el)) + '｜offsetHeight ' + num(el.offsetHeight));
+    };
+    layer(near('.cm-contentContainer'), '.cm-contentContainer');
+    layer(near('.cm-sizer'), '.cm-sizer');
+    layer(near('.cm-scroller'), '.cm-scroller');
+
+    /*
+     * 逐子元素清单：这是「37.79 到底是谁贡献的」的直接答案。
+     *
+     * rect 高总和只覆盖元素的边框盒，**外边距不在里面**；所以还要记「相邻两
+     * 个元素的间隙」（上一个的 bottom 到下一个的 top）。两者相加才是 .cm-content
+     * 里真实占掉的纵向空间。
+     *
+     * 再借 CM6 自己的账本对每个块：posAtDOM 拿到块的位置，lineBlockAt 读它记的
+     * 高度。账高 == rect 高 说明 CM6 记的是「这个元素」，那差值就只能来自元素之外。
+     */
+
+    const kids = [];
+    if (contentEl && contentEl.children) {
+      for (let i = 0; i < contentEl.children.length; i++) kids.push(contentEl.children[i]);
+    }
+
+    const blockOf = (el) => {
+      if (!cm || !el || typeof cm.posAtDOM !== 'function') return null;
+      let pos = null;
+      try { pos = cm.posAtDOM(el); } catch (e) { return null; }
+      if (!Number.isFinite(pos)) return null;
+      try { return cm.lineBlockAt(pos) || null; } catch (e) { return null; }
+    };
+
+    push('');
+    push('## .cm-content 直接子元素（' + kids.length + ' 个）');
+    push('');
+    push('| # | 元素 | rect 高 | offset 高 | 与上一元素的间隙 | CM6 账上块高 | 块类型 | 账 − 实 |');
+    push('| --- | --- | --- | --- | --- | --- | --- | --- |');
+
+    let sumH = 0;
+    let sumGap = 0;
+    let sumNeg = 0;
+    let prevBottom = null;
+    for (let i = 0; i < kids.length; i++) {
+      const el = kids[i];
+      const r = rect(el);
+      const h = r ? r.h : 0;
+      sumH += h;
+      let gapTxt = '';
+      if (r && prevBottom != null) {
+        const g = r.top - prevBottom;
+        if (g > 0.005) sumGap += g;
+        else if (g < -0.005) sumNeg += g;
+        gapTxt = g.toFixed(2);
+      }
+      if (r) prevBottom = r.bottom;
+      const b = blockOf(el);
+      const bh = b && Number.isFinite(b.height) ? b.height : null;
+      // 行数很多的页面只列前 120 行，合计仍按全部子元素算
+      if (i < 120) {
+        push('| ' + (i + 1) + ' | ' + labelOf(el) + ' | ' + h.toFixed(2)
+          + ' | ' + (el.offsetHeight == null ? '-' : num(el.offsetHeight)) + ' | ' + gapTxt
+          + ' | ' + (bh == null ? '拿不到' : bh.toFixed(2))
+          + ' | ' + (b && b.type != null ? String(b.type) : '-')
+          + ' | ' + (bh == null ? '-' : (h - bh).toFixed(2)) + ' |');
+      }
+    }
+    if (kids.length > 120) push('| … | 共 ' + kids.length + ' 个，只列前 120 个 | | | | | | |');
+
+    push('');
+    push('## 高度对账');
+    push('- 子元素 rect 高总和：' + num(sumH));
+    push('- 子元素之间的间隙总和：' + num(sumGap)
+      + (sumNeg < -0.005 ? '（另有重叠 ' + num(sumNeg) + '）' : ''));
+    push('- 合计（高 + 间隙）：' + num(sumH + sumGap));
+    if (contentRect) push('- .cm-content 实际 rect 高：' + num(contentRect.h));
+    if (cm) push('- CM6 记账 contentHeight：' + num(cm.contentHeight));
+    if (contentRect) {
+      push('- **A = rect − 合计**：' + signed(contentRect.h - (sumH + sumGap)));
+    }
+    if (cm) {
+      push('- **C = 合计 − 记账**：' + signed((sumH + sumGap) - cm.contentHeight));
+    }
+    push('');
+    push('怎么读：');
+    push('- A≈0 而 C≈B：账上少的不是某个元素，是元素之外的高度（外边距 / 间隙没进账）；');
+    push('- C≈0 而 A≈B：有元素的真实高度和账上不一致，CM6 没跟上它的尺寸变化；');
+    push('- A、C 都不为 0：两件事同时存在，按 A / C 分开看。');
+
     const hosts = document.querySelectorAll('.block-language-brace');
     push('');
     push('## 括号图宿主（' + hosts.length + ' 个）');
     for (let i = 0; i < hosts.length; i++) {
       const host = hosts[i];
       const embed = host.parentElement;
+      const wrap = host.querySelector('.brace-map-block');
       push('');
       push('### 图 ' + (i + 1));
       push('- 类名：' + host.className);
       push('- 行内样式：' + (host.style && host.style.cssText ? host.style.cssText : '（空）'));
-      push('- host rect：' + box(rect(host)));
-      push('- embed rect：' + box(rect(embed)));
+      push('- host rect：' + box(rect(host)) + '｜offsetHeight ' + num(host.offsetHeight));
+      push('- embed rect：' + box(rect(embed)) + '｜offsetHeight '
+        + (embed ? num(embed.offsetHeight) : '拿不到'));
+      push('- .brace-map-block rect：' + box(rect(wrap)) + '｜offsetHeight '
+        + (wrap ? num(wrap.offsetHeight) : '拿不到'));
+      const wrapCs = cssOf(wrap, ['marginTop', 'marginBottom', 'paddingTop', 'paddingBottom']);
+      if (wrapCs) {
+        push('- .brace-map-block computed：margin ' + wrapCs.marginTop + ' / ' + wrapCs.marginBottom
+          + '｜padding ' + wrapCs.paddingTop + ' / ' + wrapCs.paddingBottom);
+      }
+      const hostCs = cssOf(host, ['marginTop', 'marginBottom', 'paddingTop', 'paddingBottom',
+        'borderTopWidth', 'borderBottomWidth', 'float', 'display']);
+      if (hostCs) {
+        push('- host computed：margin ' + hostCs.marginTop + ' / ' + hostCs.marginBottom
+          + '｜padding ' + hostCs.paddingTop + ' / ' + hostCs.paddingBottom
+          + '｜border ' + hostCs.borderTopWidth + ' / ' + hostCs.borderBottomWidth
+          + '｜float ' + hostCs.float + '｜display ' + hostCs.display);
+      }
       if (embed && typeof getComputedStyle === 'function') {
         const cs = getComputedStyle(embed);
         push('- embed computed：height ' + cs.height + ' / position ' + cs.position
-          + ' / contain ' + cs.contain + ' / overflow ' + cs.overflow);
+          + ' / contain ' + cs.contain + ' / overflow ' + cs.overflow
+          + ' / display ' + cs.display
+          + ' / margin ' + cs.marginTop + ' / ' + cs.marginBottom);
+      }
+      /* widget 的 rect 之外还占了多少：上下两段空隙分开记，它们才是账外的部分 */
+      const er = rect(embed);
+      if (er && embed) {
+        const pv = embed.previousElementSibling;
+        const nx = embed.nextElementSibling;
+        const pr = rect(pv);
+        const nr = rect(nx);
+        push('- embed 上方空隙：' + (pr
+          ? signed(er.top - pr.bottom) + ' px（上一个兄弟 ' + labelOf(pv) + '）'
+          : '（没有上一个兄弟）'));
+        push('- embed 下方空隙：' + (nr
+          ? signed(nr.top - er.bottom) + ' px（下一个兄弟 ' + labelOf(nx) + '）'
+          : '（没有下一个兄弟）'));
+      }
+      if (embed) {
+        const b = blockOf(embed);
+        if (b) {
+          push('- CM6 账上 embed 块：高 ' + num(b.height) + ' / 类型 ' + String(b.type)
+            + ' / from ' + num(b.from) + ' / to ' + num(b.to)
+            + '｜rect 高 − 账高 ' + signed(er ? er.h - b.height : null));
+        } else {
+          push('- CM6 账上 embed 块：拿不到（posAtDOM / lineBlockAt 不可用）');
+        }
       }
       let el = embed && embed.nextElementSibling;
       let acc = 0;
