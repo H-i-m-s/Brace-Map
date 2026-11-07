@@ -3078,6 +3078,24 @@ function measureTitleCenter(host, origin) {
  *
  * @returns {number} 偏移量（0 表示没写样式；值没变时照旧返回，但不重写）
  */
+/**
+ * 宿主现在是不是在编辑区（.cm-content）里。
+ *
+ * 优先用 closest：走选择器引擎，没有层数上限，也不会被中间多包的壳打断。
+ * climbTo 靠 classList.contains 逐层爬，上限 4 层，而真实链路是
+ *   host → .cm-embed-block → .cm-content → ...
+ * 真机上它在某个环节拿不到，功能就会永远落到「未挂载」分支。
+ *
+ * 没有 closest 的环境（测试里的假 DOM）退回 climbTo，限于明显够用的深度。
+ */
+function inEditorNow(host) {
+  if (!host) return false;
+  if (typeof host.closest === 'function') {
+    try { return !!host.closest('.cm-content'); } catch (e) { /* 退回下一档 */ }
+  }
+  return !!climbTo(host, 'cm-content', 8);
+}
+
 function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用，行为已由补拍统一负责
   if (!host || !host.style || !cfg) return 0;
   const mode = cfg.float;
@@ -3085,23 +3103,18 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
   if (!classHas(host, 'bm-floated')) return 0;     // float 没真写上去时不能加偏移
 
   /*
-   * 要不要在编辑模式里、宿主有没有挂进文档，这两件事在渲染那一刻都
-   * 常常还是 false：代码块处理器拿到元素时，它还没被插进 .cm-content。
-   * 量不到几何量就只能按 bottom 处理，但那样功能在真机上永远不生效。
-   *
-   * 这里判 .cm-content 而不是 .cm-editor：climbTo 最多爬 CLIMB_LIMIT(4) 层，
-   * 而真实链路是
+   * 判「在不在编辑区里」用 closest 而不是 climbTo：
+   * climbTo 靠 classList.contains 逐层爬，上限 4 层，而真实链路是
    *   host → .cm-embed-block → .cm-content → .cm-contentContainer → .cm-sizer
    *   → .cm-scroller → .cm-editor
-   * 第 5 层只到 .cm-sizer，.cm-editor 还在上面两层，永远够不着。
-   * 之前写 .cm-editor 就是这个功能在真机上一次都没生效的真因。
-   * .cm-content 在第 3 层，既够得着，又同样能区分「在编辑区里」和阅读视图。
+   * 真机上它拿不到 .cm-content，于是永远落到「未挂载」分支，功能一次都不生效。
+   * closest 走选择器引擎，没有层数上限，也不会被中间多包一层壳打断。
    *
-   * 补拍 120/480/1200ms 各一次（与 attachFloatWrap 同一套节奏，覆盖自校准的
-   * 0/60/250/1000ms），每个宿主只排一轮，连上就把剩下的撤掉。之后交给尺寸
-   * 观察器，不再有任何定时器。
+   * 未挂载时补拍 120/480/1200ms 各一次（与 attachFloatWrap 同一套节奏，
+   * 覆盖自校准的 0/60/250/1000ms），每个宿主只排一轮，连上就把剩下的撤掉。
    */
-  if (!host.isConnected || !climbTo(host, 'cm-content')) {
+  const inEditor = host.isConnected !== false && inEditorNow(host);
+  if (!inEditor) {
     scheduleValignRetries(host, cfg);
     return 0;
   }
