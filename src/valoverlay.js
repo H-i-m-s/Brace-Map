@@ -81,6 +81,26 @@ function clampX(x, viewW, width) {
   return Math.max(4, Math.min(x, max));
 }
 
+/**
+ * 宿主此刻在不在编辑区（.cm-content 里）。
+ *
+ * 跟 float.js 的 inEditorNow 同一套判据：先 closest，没有再逐层往上爬 8 层。
+ * 这一步不能省：阅读视图里的宿主也是 connected 的，只查 isConnected 会把它
+ * 当成编辑区，画出来的绿线就是在骗人。
+ */
+function inEditorNow(host) {
+  if (!host) return false;
+  try {
+    if (typeof host.closest === 'function') return !!host.closest('.cm-content');
+  } catch (e) { /* 退回逐层爬 */ }
+  let cur = host;
+  for (let i = 0; cur && i <= 8; i++) {
+    if (classHas(cur, 'cm-content')) return true;
+    cur = cur.parentElement;
+  }
+  return false;
+}
+
 /* ------------------------------ 判据（只读镜像） ------------------------------ */
 
 /**
@@ -98,6 +118,7 @@ function gateOf(host, probe, floatMode, valign) {
   if (floatMode !== 'left' && floatMode !== 'right') return 'float!=lr';
   if (!classHas(host, 'bm-floated')) return '!bm-floated';
   if (host.isConnected === false) return '!inEditor';
+  if (!inEditorNow(host)) return '!inEditor';
   if (!(probe.imgH > 0) || !(probe.roots > 0)) return 'not-ready';
   /* 第二扇门：只有 middle 依赖 yTitle（top 只看行高和图高） */
   const raw = probe.yTitle;
@@ -249,9 +270,7 @@ function renderOnce(s, remeasure) {
     let floatLR = 0;
     for (const host of hosts) {
       try {
-        const inEd = (host.isConnected !== false)
-          && ((typeof host.closest === 'function' && host.closest('.cm-content')) || false);
-        if (inEd) inEditor += 1;
+        if (host.isConnected !== false && inEditorNow(host)) inEditor += 1;
       } catch (e) { /* ignore */ }
       const cfg = cfgOf(host);
       if (cfg.float === 'left' || cfg.float === 'right') floatLR += 1;

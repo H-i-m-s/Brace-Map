@@ -252,6 +252,17 @@ function tLinesAndLabel() {
   eq(labelB[2], '→ not-ready', 'overlay-label: not-ready 时第三行换成分支名');
   eq(labelB[1], 'imgH=0.00 yT=NaN lineH=31.50', 'overlay-label: NaN 原样写出来');
 
+  /* 阅读视图那种：量得到、但不在编辑区 */
+  const reader = fakeHost({ inEditor: false, top: 700 });
+  const doc2 = fakeDoc([reader]);
+  VO.hide();
+  VO.show(doc2, makeApi([]));
+  const item = itemsOf(findById(doc2.body, VO.OVERLAY_ID))[0];
+  eq(item.children[2].textContent.split('\n')[2], '→ !inEditor',
+    'overlay-label: 阅读视图的图标签写 !inEditor');
+  ok(/dashed/.test(item.children[1].style.borderTop), 'overlay-label: 阅读视图的绿线也是虚线');
+  VO.hide();
+
   /* 标签贴宿主右上角 */
   eq(a.children[2].style.left, '326px', 'overlay-label: 标签在宿主右边 6px 处（right 320 + 6）');
   eq(a.children[2].style.top, '100px', 'overlay-label: 标签顶对齐宿主顶边');
@@ -378,6 +389,9 @@ function tGateMirror() {
   const gone = fakeHost({ connected: false });
   eq(VO.gateOf(gone, { imgH: 100, roots: 1, yTitle: 20 }, 'right', 'top'), '!inEditor',
     'overlay-gate: 未连进文档');
+  const reader = fakeHost({ inEditor: false });
+  eq(VO.gateOf(reader, { imgH: 100, roots: 1, yTitle: 20 }, 'right', 'top'), '!inEditor',
+    'overlay-gate: 连在文档里但不在 .cm-content（阅读视图）也算不在编辑区');
 
   /* 第二扇门：middle 量不到标题中心时也算没准备好；top 不看 yTitle */
   eq(VO.gateOf(h, { imgH: 100, roots: 1, yTitle: NaN }, 'right', 'middle'), 'not-ready',
