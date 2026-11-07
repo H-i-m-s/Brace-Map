@@ -238,20 +238,33 @@ function maskLinks(raw) {
   return { masked, links };
 }
 
+/* ============================================================
+ * 硬换行：<br> / <br/> / <br />（大小写不敏感）
+ *
+ * 切分点放在「公式与链接都换成占位符之后、逐段解析之前」：
+ *   - 公式是原子，$a<br>b$ 不会被从中间切开（占位符里没有 <br>）
+ *   - 链接的可见文字是一整块，[[甲<br>乙]] 同理
+ *   - <font> 允许横跨 <br>（<font color="red">甲<br>乙</font> 两行都还是红的），
+ *     所以切分发生在每个 chunk 送进 push 的当下，颜色跟着 chunk 走
+ * 标签本身不进任何 run，两侧也不补空格。
+ * ============================================================ */
+
+const BR_TAG_RE = /<br\s*\/?>/i;
+
 /**
- * 把一行原文拆成 [{ text, color, bold, italic, strike, href }]。
- * color / href 为 null 表示「用主题色」/「不是链接」；三个样式位默认 false。
- * 顺序：先挖链接 → 再按 <font color> 切段 → 每段再拆行内样式，于是
- * `<font color="red">**加粗**</font>` 得到 { color:'red', bold:true }。
+ * 把一行原文按 <br> 切成若干行的 run。
+ * 返回 [[run...], [run...]]：外层是行（硬换行之间的一段），内层是这一行的 run。
+ * 至少返回一行；行首/行尾的 <br> 会产生空行，由调用方决定要不要留。
  */
-function parseRuns(raw) {
+function parseRunsLines(raw) {
   // 公式先挖（否则 $a*b*c$ 里的星号会被当斜体），再挖链接（否则 [[笔记]] 会被剥成纯字）
   const mathSplit = maskMath(raw);
   const split = maskLinks(mathSplit.masked);
   const src = split.masked;
   const links = split.links;
   const maths = mathSplit.maths;
-  const runs = [];
+  const lines = [[]];
+  let runs = lines[0];      // 当前这一行；碰到 <br> 就换到新的一行
 
   // 一段纯文本 → 若干带样式的 run；空片段（样式标记之间没字）直接丢掉
   const pushText = (text, color) => {
@@ -328,25 +341,55 @@ function parseRuns(raw) {
     pushText(cleanRunText(s.slice(last)), color);
   };
 
+  // 一段 chunk（同一颜色下的一段原文）：按 <br> 切行，颜色跟着每一段走
+  const emit = (chunk, color) => {
+    const parts = String(chunk).split(BR_TAG_RE);
+    for (let i = 0; i < parts.length; i++) {
+      if (i > 0) {
+        runs = [];
+        lines.push(runs);
+      }
+      push(parts[i], color);
+    }
+  };
+
   let last = 0;
   let m;
   FONT_TAG_RE.lastIndex = 0;
 
   while ((m = FONT_TAG_RE.exec(src)) !== null) {
-    if (m.index > last) push(src.slice(last, m.index), null);
-    push(m[3], safeColor(m[2]));
+    if (m.index > last) emit(src.slice(last, m.index), null);
+    emit(m[3], safeColor(m[2]));
     last = m.index + m[0].length;
   }
-  if (last < src.length) push(src.slice(last), null);
-  if (!runs.length) push(src, null);
+  if (last < src.length) emit(src.slice(last), null);
 
   // 转义的 \$ 到这里才还原成字面量；公式 run 的 text 本来就是 $-围栏，不动
-  for (const r of runs) {
-    if (!r.math && r.text.indexOf(DOLLAR_SLOT) >= 0) {
-      r.text = r.text.split(DOLLAR_SLOT).join('$');
+  for (const line of lines) {
+    for (const r of line) {
+      if (!r.math && r.text.indexOf(DOLLAR_SLOT) >= 0) {
+        r.text = r.text.split(DOLLAR_SLOT).join('$');
+      }
     }
   }
-  return runs;
+  return lines;
+}
+
+/**
+ * 把一行原文拆成 [{ text, color, bold, italic, strike, href }]。
+ * color / href 为 null 表示「用主题色」/「不是链接」；三个样式位默认 false。
+ * 顺序：先挖链接 → 再按 <font color> 切段 → 每段再拆行内样式，于是
+ * `<font color="red">**加粗**</font>` 得到 { color:'red', bold:true }。
+ *
+ * 硬换行的分行信息只有 parseRunsLines 保留；这里按行拍平（<br> 不占字符，
+ * 段间不加分隔符），给「只关心这一行有哪些 run」的调用方用。
+ */
+function parseRuns(raw) {
+  const out = [];
+  for (const line of parseRunsLines(raw)) {
+    for (const r of line) out.push(r);
+  }
+  return out;
 }
 
 /* ============================================================
@@ -512,6 +555,7 @@ module.exports = {
   maskMath,
   validMathTex,
   parseRuns,
+  parseRunsLines,
   runsText,
   renderRuns,
   esc,

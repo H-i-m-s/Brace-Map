@@ -23,6 +23,7 @@ require('./math.test');
 require('./geometry.test');
 require('./calib.test');
 require('./wrap.test');
+require('./softbreak.test');
 require('./export.test');
 require('./link.test');
 require('./boxnode.test');

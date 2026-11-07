@@ -31,7 +31,7 @@ const PluginSettingTabBase = ObsidianNS.PluginSettingTab || class {
  * 本文件（见下面的 INLINE MODULES 区）。 */
 let OPT = null;
 let cleanInline, safeColor, isExternalHref, wikiDisplay, linkPieces,
-  maskLinks, parseRuns, runsText, renderRuns;
+  maskLinks, parseRuns, parseRunsLines, runsText, renderRuns;
 let parseSource, parseBox;
 let measureContext, readLiveFont;
 let wrapRuns, wrapAtoms;
@@ -2828,6 +2828,44 @@ function childrenTotal(node, rowGap) {
   return sum + rowGap * (node.children.length - 1);
 }
 
+/** 一段文字的宽度：与 wrap 里 append 的口径一致（逐 run 累加，量不出来按 0） */
+function runsLineWidth(runs, measure, measureBold) {
+  let w = 0;
+  for (const r of runs || []) {
+    if (!r) continue;
+    // 公式不可拆，宽度取转换阶段算好的 px
+    if (r.math && Number.isFinite(r.mathWidth)) {
+      w += Math.max(0, r.mathWidth);
+      continue;
+    }
+    if (!r.text) continue;
+    const t = r.text;
+    const v = r.bold ? measureBold(t) : measure(t);
+    if (Number.isFinite(v) && v > 0) w += v;
+  }
+  return w;
+}
+
+/**
+ * 节点文字 → 文本行。
+ *
+ * 先按硬换行（<br>）分段（解析阶段已切好，segs 就是段），每段内部再按 maxWidth
+ * 折行，所以两种断行可以叠加：`甲<br>乙` 恒为两行，`甲很长<br>乙` 则先把「甲很长」
+ * 折开、再换到「乙」。不折行时一段就是一行。
+ */
+function nodeTextLines(segs, maxWidth, measure, measureBold) {
+  const out = [];
+  for (const seg of segs) {
+    const wrapped = maxWidth ? wrapRuns(seg, maxWidth, measure, measureBold) : [];
+    if (wrapped.length) {
+      for (const l of wrapped) out.push(l);
+      continue;
+    }
+    out.push({ pieces: seg, width: runsLineWidth(seg, measure, measureBold) });
+  }
+  return out;
+}
+
 function layoutTree(roots, opts) {
   const o = opts || {};
   const dir = DIRS.indexOf(o.dir) >= 0 ? o.dir : 'lr';
@@ -2899,8 +2937,12 @@ function layoutTree(roots, opts) {
       // text 的字符推进里），所以不走实测纠正。
       const mathNode = hasMathIn(n.runs);
 
-      // 折行：先按 maxWidth 切行，再定宽度与高度
-      const wrapped = maxWidth ? wrapRuns(n.runs, maxWidth, measureRaw, measureBoldRaw) : [];
+      // 行：<br> 先分段（解析阶段已切好），每段内部再按 maxWidth 折行
+      const segs = (n.segRuns && n.segRuns.length) ? n.segRuns : [n.runs];
+      const hardBreak = segs.length > 1;
+      const wrapped = (maxWidth || hardBreak)
+        ? nodeTextLines(segs, maxWidth, measureRaw, measureBoldRaw)
+        : [];
       // 上一轮的折行结果（cfg.roots 跨轮复用，进到这里时 n.lineCount 还是上一轮的）
       const prevCount = n.lineCount || 0;
       if (wrapped.length > 1) {
@@ -4175,7 +4217,7 @@ __mods["src/parse.js"] = function (module, exports, require) {
 
 /* 解析：指令区 + 列表区 */
 
-const { cleanInline, parseRuns, runsText } = require('./text');
+const { cleanInline, parseRunsLines, runsText } = require('./text');
 
 // 方向与括号样式白名单
 const DIRS = ['lr', 'rl', 'tb', 'bt'];
@@ -4190,6 +4232,19 @@ const LIST_RE = /^([ \t]*)(?:[-*+]|\d+[.)])(?:\s+(.*))?$/;
 const DIR_RE = /^\s*(\w+)\s*:\s*(.+)$/;
 const HEAD_RE = /^#{1,6}\s+(.*)$/;
 
+/*
+ * 认得这些键的 `键: 值` 才是指令。
+ *
+ * 只在「续行判定」里用到：缩进比上一个节点深的行本来该并进上一个节点，
+ * 但它同时长得像指令（`注意: 这个很重要`）。这时看键——白名单里的还是指令
+ * （`float: left` 不会被续行吞掉），不认识的当正文（不会被指令分支吃掉）。
+ */
+const DIR_KEYS = ['dir', 'brace', 'box', 'closing', 'title', 'maxwidth', 'float', 'width', 'bg'];
+
+// 续行拼接的空格规则：只要贴着接缝的那一侧是 ASCII 字母数字就补一个空格
+const ASCII_TAIL_RE = /[A-Za-z0-9]$/;
+const ASCII_HEAD_RE = /^[A-Za-z0-9]/;
+
 function parseBox(v) {
   const s = String(v).trim().toLowerCase();
   if (!s || s === 'none' || s === 'off' || s === 'false') return [];
@@ -4201,6 +4256,57 @@ function parseBox(v) {
   }
   out.sort((a, b) => a - b);
   return out;
+}
+
+/** 行首缩进宽度；tab 按 4 空格算，和列表项的缩进判定同一口径 */
+function leadingIndent(line) {
+  const m = String(line).match(/^[ \t]*/);
+  return m ? m[0].replace(/\t/g, '    ').length : 0;
+}
+
+/**
+ * 续行拼接：把两段文字接起来，中间按接缝决定要不要空格。
+ *   普通平键 + 按端部形状分 → 普通平键按端部形状分（中文之间不补，补了显松）
+ *   Type A + and B          → Type A and B（英文单词之间必须补，否则粘成一个词）
+ */
+function joinContinuation(prev, line) {
+  const a = String(prev == null ? '' : prev);
+  const b = String(line == null ? '' : line).trim();
+  if (!a) return b;
+  if (!b) return a;
+  return a + (ASCII_TAIL_RE.test(a) || ASCII_HEAD_RE.test(b) ? ' ' : '') + b;
+}
+
+/**
+ * 把一段原始正文解析进节点。
+ *
+ * 节点同时留两份：
+ *   segRuns  硬换行（<br>）之间的每一段，每一段是一组 run —— layout 先照它分段，
+ *            段内再按 maxwidth 折行
+ *   runs     拍平后的全部 run（公式转换、宽度累加都按它扫）
+ * 续行是在解析前就拼进 raw 的，所以行内样式、公式、双链在续行里跟正文一样解析。
+ */
+function fillNode(node, rawBody) {
+  const raw = String(rawBody == null ? '' : rawBody);
+  node.raw = raw;
+  const segs = [];
+  for (const line of parseRunsLines(raw)) {
+    if (!runsText(line)) continue;     // <br> 在行首/行尾/连写时不留空行
+    segs.push(line);
+  }
+  node.segRuns = segs.length ? segs : [[]];
+  const flat = [];
+  for (const line of node.segRuns) for (const r of line) flat.push(r);
+  node.runs = flat;
+  node.text = runsText(flat);
+  return node;
+}
+
+function makeNode(rawBody, forceBox) {
+  return fillNode({
+    text: '', runs: [], segRuns: [[]], raw: '',
+    children: [], forceBox: !!forceBox,
+  }, rawBody);
 }
 
 function parseSource(source) {
@@ -4224,11 +4330,11 @@ function parseSource(source) {
     if (!raw.trim()) continue;
     const isFirst = !firstContentSeen;
     firstContentSeen = true;
+    const indent = leadingIndent(raw);
 
     // 1) 列表项
     const lm = raw.match(LIST_RE);
     if (lm) {
-      const indent = lm[1].replace(/\t/g, '    ').length;
       let body = lm[2] == null ? '' : lm[2];
       /*
        * 行尾 {box}：只给这一个节点画框，不看层。
@@ -4239,12 +4345,10 @@ function parseSource(source) {
       let forceBox = false;
       const bx = body.match(/^(.*?)\s*\{box\}$/i);
       if (bx) { body = bx[1]; forceBox = true; }
-      const runs = parseRuns(body);
-      const text = runsText(runs);
+      const node = makeNode(body, forceBox);
       // 行内本来就没内容 → 空节点（纯分叉点）；
       // 有内容但被清洗空了（例如只有 ** ）→ 当作无效行跳过
-      if (!text && body.trim() !== '') continue;
-      const node = { text, runs, children: [], forceBox };
+      if (!node.text && body.trim() !== '') continue;
       while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
       if (stack.length) stack[stack.length - 1].node.children.push(node);
       else roots.push(node);
@@ -4261,9 +4365,19 @@ function parseSource(source) {
       }
     }
 
-    // 3) 指令
+    /*
+     * 3) 指令 / 续行
+     *
+     * 缩进比「上一个节点」深 = 续行的候选。指令优先于续行（续行里写
+     * `float: left` 仍然是指令），但只有白名单里的键才算指令，否则
+     * `注意: 这个很重要` 这种会被指令分支吞掉，用户写了却看不见。
+     */
+    const prev = stack.length ? stack[stack.length - 1] : null;
+    const deeper = !!prev && indent > prev.indent;
     const dm = raw.match(DIR_RE);
-    if (dm) {
+    const known = !!dm && DIR_KEYS.indexOf(dm[1].toLowerCase()) >= 0;
+
+    if (dm && (!deeper || known)) {
       const key = dm[1].toLowerCase();
       const val = dm[2].trim();
       if (key === 'dir') {
@@ -4297,7 +4411,15 @@ function parseSource(source) {
         // PNG 导出底色：不写 = 透明（默认）；theme = 取主题底色；其余当颜色值
         bg = val;
       }
+      continue;
     }
+
+    // 续行（软换行）：并进上一个节点，重新走一遍行内解析
+    if (deeper) {
+      fillNode(prev.node, joinContinuation(prev.node.raw, raw));
+      continue;
+    }
+
     // 4) 其余忽略
   }
 
@@ -4816,20 +4938,33 @@ function maskLinks(raw) {
   return { masked, links };
 }
 
+/* ============================================================
+ * 硬换行：<br> / <br/> / <br />（大小写不敏感）
+ *
+ * 切分点放在「公式与链接都换成占位符之后、逐段解析之前」：
+ *   - 公式是原子，$a<br>b$ 不会被从中间切开（占位符里没有 <br>）
+ *   - 链接的可见文字是一整块，[[甲<br>乙]] 同理
+ *   - <font> 允许横跨 <br>（<font color="red">甲<br>乙</font> 两行都还是红的），
+ *     所以切分发生在每个 chunk 送进 push 的当下，颜色跟着 chunk 走
+ * 标签本身不进任何 run，两侧也不补空格。
+ * ============================================================ */
+
+const BR_TAG_RE = /<br\s*\/?>/i;
+
 /**
- * 把一行原文拆成 [{ text, color, bold, italic, strike, href }]。
- * color / href 为 null 表示「用主题色」/「不是链接」；三个样式位默认 false。
- * 顺序：先挖链接 → 再按 <font color> 切段 → 每段再拆行内样式，于是
- * `<font color="red">**加粗**</font>` 得到 { color:'red', bold:true }。
+ * 把一行原文按 <br> 切成若干行的 run。
+ * 返回 [[run...], [run...]]：外层是行（硬换行之间的一段），内层是这一行的 run。
+ * 至少返回一行；行首/行尾的 <br> 会产生空行，由调用方决定要不要留。
  */
-function parseRuns(raw) {
+function parseRunsLines(raw) {
   // 公式先挖（否则 $a*b*c$ 里的星号会被当斜体），再挖链接（否则 [[笔记]] 会被剥成纯字）
   const mathSplit = maskMath(raw);
   const split = maskLinks(mathSplit.masked);
   const src = split.masked;
   const links = split.links;
   const maths = mathSplit.maths;
-  const runs = [];
+  const lines = [[]];
+  let runs = lines[0];      // 当前这一行；碰到 <br> 就换到新的一行
 
   // 一段纯文本 → 若干带样式的 run；空片段（样式标记之间没字）直接丢掉
   const pushText = (text, color) => {
@@ -4906,25 +5041,55 @@ function parseRuns(raw) {
     pushText(cleanRunText(s.slice(last)), color);
   };
 
+  // 一段 chunk（同一颜色下的一段原文）：按 <br> 切行，颜色跟着每一段走
+  const emit = (chunk, color) => {
+    const parts = String(chunk).split(BR_TAG_RE);
+    for (let i = 0; i < parts.length; i++) {
+      if (i > 0) {
+        runs = [];
+        lines.push(runs);
+      }
+      push(parts[i], color);
+    }
+  };
+
   let last = 0;
   let m;
   FONT_TAG_RE.lastIndex = 0;
 
   while ((m = FONT_TAG_RE.exec(src)) !== null) {
-    if (m.index > last) push(src.slice(last, m.index), null);
-    push(m[3], safeColor(m[2]));
+    if (m.index > last) emit(src.slice(last, m.index), null);
+    emit(m[3], safeColor(m[2]));
     last = m.index + m[0].length;
   }
-  if (last < src.length) push(src.slice(last), null);
-  if (!runs.length) push(src, null);
+  if (last < src.length) emit(src.slice(last), null);
 
   // 转义的 \$ 到这里才还原成字面量；公式 run 的 text 本来就是 $-围栏，不动
-  for (const r of runs) {
-    if (!r.math && r.text.indexOf(DOLLAR_SLOT) >= 0) {
-      r.text = r.text.split(DOLLAR_SLOT).join('$');
+  for (const line of lines) {
+    for (const r of line) {
+      if (!r.math && r.text.indexOf(DOLLAR_SLOT) >= 0) {
+        r.text = r.text.split(DOLLAR_SLOT).join('$');
+      }
     }
   }
-  return runs;
+  return lines;
+}
+
+/**
+ * 把一行原文拆成 [{ text, color, bold, italic, strike, href }]。
+ * color / href 为 null 表示「用主题色」/「不是链接」；三个样式位默认 false。
+ * 顺序：先挖链接 → 再按 <font color> 切段 → 每段再拆行内样式，于是
+ * `<font color="red">**加粗**</font>` 得到 { color:'red', bold:true }。
+ *
+ * 硬换行的分行信息只有 parseRunsLines 保留；这里按行拍平（<br> 不占字符，
+ * 段间不加分隔符），给「只关心这一行有哪些 run」的调用方用。
+ */
+function parseRuns(raw) {
+  const out = [];
+  for (const line of parseRunsLines(raw)) {
+    for (const r of line) out.push(r);
+  }
+  return out;
 }
 
 /* ============================================================
@@ -5090,6 +5255,7 @@ module.exports = {
   maskMath,
   validMathTex,
   parseRuns,
+  parseRunsLines,
   runsText,
   renderRuns,
   esc,
@@ -5336,7 +5502,7 @@ function loadModules() {
 
   ({ OPT } = req('src/opt.js'));
   ({ cleanInline, safeColor, isExternalHref, wikiDisplay, linkPieces,
-     maskLinks, parseRuns, runsText, renderRuns } = req('src/text.js'));
+     maskLinks, parseRuns, parseRunsLines, runsText, renderRuns } = req('src/text.js'));
   ({ parseSource, parseBox } = req('src/parse.js'));
   ({ measureContext, readLiveFont } = req('src/measure.js'));
   ({ wrapRuns, wrapAtoms } = req('src/wrap.js'));
@@ -6058,6 +6224,7 @@ function buildInternals() {
   parseBox,
   cleanInline,
   parseRuns,
+  parseRunsLines,
   runsText,
   renderRuns,
   safeColor,

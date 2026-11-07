@@ -28,6 +28,44 @@ function childrenTotal(node, rowGap) {
   return sum + rowGap * (node.children.length - 1);
 }
 
+/** 一段文字的宽度：与 wrap 里 append 的口径一致（逐 run 累加，量不出来按 0） */
+function runsLineWidth(runs, measure, measureBold) {
+  let w = 0;
+  for (const r of runs || []) {
+    if (!r) continue;
+    // 公式不可拆，宽度取转换阶段算好的 px
+    if (r.math && Number.isFinite(r.mathWidth)) {
+      w += Math.max(0, r.mathWidth);
+      continue;
+    }
+    if (!r.text) continue;
+    const t = r.text;
+    const v = r.bold ? measureBold(t) : measure(t);
+    if (Number.isFinite(v) && v > 0) w += v;
+  }
+  return w;
+}
+
+/**
+ * 节点文字 → 文本行。
+ *
+ * 先按硬换行（<br>）分段（解析阶段已切好，segs 就是段），每段内部再按 maxWidth
+ * 折行，所以两种断行可以叠加：`甲<br>乙` 恒为两行，`甲很长<br>乙` 则先把「甲很长」
+ * 折开、再换到「乙」。不折行时一段就是一行。
+ */
+function nodeTextLines(segs, maxWidth, measure, measureBold) {
+  const out = [];
+  for (const seg of segs) {
+    const wrapped = maxWidth ? wrapRuns(seg, maxWidth, measure, measureBold) : [];
+    if (wrapped.length) {
+      for (const l of wrapped) out.push(l);
+      continue;
+    }
+    out.push({ pieces: seg, width: runsLineWidth(seg, measure, measureBold) });
+  }
+  return out;
+}
+
 function layoutTree(roots, opts) {
   const o = opts || {};
   const dir = DIRS.indexOf(o.dir) >= 0 ? o.dir : 'lr';
@@ -99,8 +137,12 @@ function layoutTree(roots, opts) {
       // text 的字符推进里），所以不走实测纠正。
       const mathNode = hasMathIn(n.runs);
 
-      // 折行：先按 maxWidth 切行，再定宽度与高度
-      const wrapped = maxWidth ? wrapRuns(n.runs, maxWidth, measureRaw, measureBoldRaw) : [];
+      // 行：<br> 先分段（解析阶段已切好），每段内部再按 maxWidth 折行
+      const segs = (n.segRuns && n.segRuns.length) ? n.segRuns : [n.runs];
+      const hardBreak = segs.length > 1;
+      const wrapped = (maxWidth || hardBreak)
+        ? nodeTextLines(segs, maxWidth, measureRaw, measureBoldRaw)
+        : [];
       // 上一轮的折行结果（cfg.roots 跨轮复用，进到这里时 n.lineCount 还是上一轮的）
       const prevCount = n.lineCount || 0;
       if (wrapped.length > 1) {

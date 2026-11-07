@@ -2,7 +2,7 @@
 
 /* 解析：指令区 + 列表区 */
 
-const { cleanInline, parseRuns, runsText } = require('./text');
+const { cleanInline, parseRunsLines, runsText } = require('./text');
 
 // 方向与括号样式白名单
 const DIRS = ['lr', 'rl', 'tb', 'bt'];
@@ -17,6 +17,19 @@ const LIST_RE = /^([ \t]*)(?:[-*+]|\d+[.)])(?:\s+(.*))?$/;
 const DIR_RE = /^\s*(\w+)\s*:\s*(.+)$/;
 const HEAD_RE = /^#{1,6}\s+(.*)$/;
 
+/*
+ * 认得这些键的 `键: 值` 才是指令。
+ *
+ * 只在「续行判定」里用到：缩进比上一个节点深的行本来该并进上一个节点，
+ * 但它同时长得像指令（`注意: 这个很重要`）。这时看键——白名单里的还是指令
+ * （`float: left` 不会被续行吞掉），不认识的当正文（不会被指令分支吃掉）。
+ */
+const DIR_KEYS = ['dir', 'brace', 'box', 'closing', 'title', 'maxwidth', 'float', 'width', 'bg'];
+
+// 续行拼接的空格规则：只要贴着接缝的那一侧是 ASCII 字母数字就补一个空格
+const ASCII_TAIL_RE = /[A-Za-z0-9]$/;
+const ASCII_HEAD_RE = /^[A-Za-z0-9]/;
+
 function parseBox(v) {
   const s = String(v).trim().toLowerCase();
   if (!s || s === 'none' || s === 'off' || s === 'false') return [];
@@ -28,6 +41,57 @@ function parseBox(v) {
   }
   out.sort((a, b) => a - b);
   return out;
+}
+
+/** 行首缩进宽度；tab 按 4 空格算，和列表项的缩进判定同一口径 */
+function leadingIndent(line) {
+  const m = String(line).match(/^[ \t]*/);
+  return m ? m[0].replace(/\t/g, '    ').length : 0;
+}
+
+/**
+ * 续行拼接：把两段文字接起来，中间按接缝决定要不要空格。
+ *   普通平键 + 按端部形状分 → 普通平键按端部形状分（中文之间不补，补了显松）
+ *   Type A + and B          → Type A and B（英文单词之间必须补，否则粘成一个词）
+ */
+function joinContinuation(prev, line) {
+  const a = String(prev == null ? '' : prev);
+  const b = String(line == null ? '' : line).trim();
+  if (!a) return b;
+  if (!b) return a;
+  return a + (ASCII_TAIL_RE.test(a) || ASCII_HEAD_RE.test(b) ? ' ' : '') + b;
+}
+
+/**
+ * 把一段原始正文解析进节点。
+ *
+ * 节点同时留两份：
+ *   segRuns  硬换行（<br>）之间的每一段，每一段是一组 run —— layout 先照它分段，
+ *            段内再按 maxwidth 折行
+ *   runs     拍平后的全部 run（公式转换、宽度累加都按它扫）
+ * 续行是在解析前就拼进 raw 的，所以行内样式、公式、双链在续行里跟正文一样解析。
+ */
+function fillNode(node, rawBody) {
+  const raw = String(rawBody == null ? '' : rawBody);
+  node.raw = raw;
+  const segs = [];
+  for (const line of parseRunsLines(raw)) {
+    if (!runsText(line)) continue;     // <br> 在行首/行尾/连写时不留空行
+    segs.push(line);
+  }
+  node.segRuns = segs.length ? segs : [[]];
+  const flat = [];
+  for (const line of node.segRuns) for (const r of line) flat.push(r);
+  node.runs = flat;
+  node.text = runsText(flat);
+  return node;
+}
+
+function makeNode(rawBody, forceBox) {
+  return fillNode({
+    text: '', runs: [], segRuns: [[]], raw: '',
+    children: [], forceBox: !!forceBox,
+  }, rawBody);
 }
 
 function parseSource(source) {
@@ -51,11 +115,11 @@ function parseSource(source) {
     if (!raw.trim()) continue;
     const isFirst = !firstContentSeen;
     firstContentSeen = true;
+    const indent = leadingIndent(raw);
 
     // 1) 列表项
     const lm = raw.match(LIST_RE);
     if (lm) {
-      const indent = lm[1].replace(/\t/g, '    ').length;
       let body = lm[2] == null ? '' : lm[2];
       /*
        * 行尾 {box}：只给这一个节点画框，不看层。
@@ -66,12 +130,10 @@ function parseSource(source) {
       let forceBox = false;
       const bx = body.match(/^(.*?)\s*\{box\}$/i);
       if (bx) { body = bx[1]; forceBox = true; }
-      const runs = parseRuns(body);
-      const text = runsText(runs);
+      const node = makeNode(body, forceBox);
       // 行内本来就没内容 → 空节点（纯分叉点）；
       // 有内容但被清洗空了（例如只有 ** ）→ 当作无效行跳过
-      if (!text && body.trim() !== '') continue;
-      const node = { text, runs, children: [], forceBox };
+      if (!node.text && body.trim() !== '') continue;
       while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
       if (stack.length) stack[stack.length - 1].node.children.push(node);
       else roots.push(node);
@@ -88,9 +150,19 @@ function parseSource(source) {
       }
     }
 
-    // 3) 指令
+    /*
+     * 3) 指令 / 续行
+     *
+     * 缩进比「上一个节点」深 = 续行的候选。指令优先于续行（续行里写
+     * `float: left` 仍然是指令），但只有白名单里的键才算指令，否则
+     * `注意: 这个很重要` 这种会被指令分支吞掉，用户写了却看不见。
+     */
+    const prev = stack.length ? stack[stack.length - 1] : null;
+    const deeper = !!prev && indent > prev.indent;
     const dm = raw.match(DIR_RE);
-    if (dm) {
+    const known = !!dm && DIR_KEYS.indexOf(dm[1].toLowerCase()) >= 0;
+
+    if (dm && (!deeper || known)) {
       const key = dm[1].toLowerCase();
       const val = dm[2].trim();
       if (key === 'dir') {
@@ -124,7 +196,15 @@ function parseSource(source) {
         // PNG 导出底色：不写 = 透明（默认）；theme = 取主题底色；其余当颜色值
         bg = val;
       }
+      continue;
     }
+
+    // 续行（软换行）：并进上一个节点，重新走一遍行内解析
+    if (deeper) {
+      fillNode(prev.node, joinContinuation(prev.node.raw, raw));
+      continue;
+    }
+
     // 4) 其余忽略
   }
 
