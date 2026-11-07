@@ -280,6 +280,23 @@ function tLabelClampedAtRightEdge() {
   VO.hide();
 }
 
+function tTargetAccountsForAppliedMargin() {
+  VO.hide();
+  /* rect.top 里已经含了已生效的 margin-top。写同一个 margin 是幂等的，
+   * 所以目标 = 当前顶 − 现有 margin + 偏移；当前 margin 为空时就退化成「当前顶 + 偏移」。 */
+  const aligned = fakeHost({ top: 300, marginTop: '-57.25px' });   // 偏移就是 -57.25
+  const partial = fakeHost({ top: 600, marginTop: '-30px' });      // 只移了 30
+  const none = fakeHost({ top: 900, marginTop: '' });              // 一点没移
+  const doc = fakeDoc([aligned, partial, none]);
+  VO.show(doc, makeApi([]));
+  const items = itemsOf(findById(doc.body, VO.OVERLAY_ID));
+
+  eq(items[0].children[1].style.top, '300px', 'overlay-target: 已生效时绿线与红线重合（差 0）');
+  eq(items[1].children[1].style.top, '572.75px', 'overlay-target: 只移了 30px，目标在 572.75（还差 27.25）');
+  eq(items[2].children[1].style.top, '842.75px', 'overlay-target: 没移时就是「当前顶 + 偏移」');
+  VO.hide();
+}
+
 function tMarginShown() {
   VO.hide();
   const host = fakeHost({ marginTop: '-57.25px' });
@@ -411,6 +428,7 @@ suite('overlay-esc', tEscapeCloses);
 suite('overlay-lines', tLinesAndLabel);
 suite('overlay-label-edge', tLabelClampedAtRightEdge);
 suite('overlay-label-margin', tMarginShown);
+suite('overlay-target-margin', tTargetAccountsForAppliedMargin);
 suite('overlay-panel', tPanelCounts);
 suite('overlay-panel-empty', tPanelEmptyTrace);
 suite('overlay-frame', tFramesFollowMoves);

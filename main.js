@@ -6300,6 +6300,18 @@ function clampX(x, viewW, width) {
 }
 
 /**
+ * 读行内 margin-top 的像素值。
+ *
+ * 只认 px：主题给的 em / % 读不出来就当 0（不猜），标签里的「当前margin」
+ * 会把原文照抄出来，对不上时人能看见。
+ */
+function pxOf(v) {
+  const s = String(v == null ? '' : v).trim();
+  const m = /^(-?\d+(?:\.\d+)?)px$/.exec(s);
+  return m ? Number(m[1]) : 0;
+}
+
+/**
  * 宿主此刻在不在编辑区（.cm-content 里）。
  *
  * 跟 float.js 的 inEditorNow 同一套判据：先 closest，没有再逐层往上爬 8 层。
@@ -6453,8 +6465,16 @@ function renderOnce(s, remeasure) {
     /* 红：现在在哪 */
     paintLine(it.lineNow, r.left, r.top, '#e11d48', false);
 
-    /* 绿：该在哪。位置每帧更新，数值（偏移）只有在 remeasure 时才重算，
-     * 两次测量之间沿用上一次的偏移，视觉上不会跳。 */
+    /* 绿：该在哪。
+     *
+     * 注意不能写成「当前顶 + 偏移」：rect.top 里已经含了当前已经生效的
+     * margin-top，而写同一个 margin-top 是幂等的（写两次不会移两次）。
+     * 所以目标 = 把现有位移减掉（回到未偏移的位置）+ 算出的偏移。
+     * 当前 margin 为空时，它就等于「当前顶 + 偏移」。
+     *
+     * 没准备好 / 走不到这一步时不给目标位置：绿线画成虚线、与红线同位，
+     * 因为这时算出来的 0 是「没法算」，不是「不用挪」。
+     */
     if (remeasure) {
       const cfg = cfgOf(host);
       let probe = null;
@@ -6473,7 +6493,10 @@ function renderOnce(s, remeasure) {
       /* 量一下标签宽度，靠右边缘时好用得上（4 次/秒，不在每帧里） */
       if (it.label.offsetWidth > 0) it.labelW = it.label.offsetWidth;
     }
-    const targetY = r.top + (Number.isFinite(it.off) ? it.off : 0);
+    const marginPx = pxOf(host.style && host.style.marginTop);
+    const targetY = it.gate === 'ready'
+      ? (r.top - marginPx + (Number.isFinite(it.off) ? it.off : 0))
+      : r.top;
     paintLine(it.lineTarget, r.left, targetY, '#16a34a', it.gate !== 'ready');
 
     /* 标签贴右上角；贴着窗口右边缘时往左让，免得被裁掉 */
