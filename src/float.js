@@ -356,6 +356,35 @@ function pickContext(el) {
 /* --------------------------- 浮动本体 --------------------------- */
 
 /**
+ * 阅读视图的垂直基准（valign）：算一个偏移量，只加在 floatify 写下的 top 上。
+ *
+ * 三个量与编辑模式完全同义，公式也直接共用 valignOffset：
+ *   h      图原来那一行的行高 → 紧邻段落的行高（measureReaderLineHeight）
+ *   H      图高 → 被绝对定位的那个块的 rect 高
+ *   yTitle 一级标题中心相对图顶边 → 根节点文字 bbox 中心减块顶边
+ * 量不到就退化为 0（bottom 的行为），不硬编。
+ *
+ * 为什么只动 top：阅读视图里图已经靠绝对定位脱流，垂直位置只由 top 决定；
+ * 浮动、留白、环绕全是横向量法，一个字节都不参与。
+ *
+ * @returns {{valign:string, lineH:number, imgH:number, yTitle:number|null, offset:number}}
+ */
+function readerValignInfo(host, block, cfg, bRect) {
+  const valign = (cfg && cfg.valign) || 'bottom';
+  const imgH = bRect ? bRect.height : 0;
+  const lineH = measureReaderLineHeight(block);
+  const y = measureTitleCenter(host, block);
+  const yTitle = Number.isFinite(y) ? round2(y) : null;
+  return {
+    valign,
+    lineH: round2(lineH),
+    imgH: round2(imgH),
+    yTitle,
+    offset: round2(valignOffset(lineH, imgH, yTitle, valign)),
+  };
+}
+
+/**
  * 让 el 真正「浮动」：脱离流 + 后续兄弟留白。
  * 返回复位记录；不能浮动时返回 null（调用方保持原状）。
  */
@@ -414,9 +443,26 @@ function floatify(el, cfg, opts) {
     if (e) record.styles.push(e);
   }
 
-  // 记下流里的位置再脱离流：top 沿用记下来的位置，横向贴住正文列左/右边界
-  // （不能沿用图原来的横向位置，否则「右浮动」只在 400px 宽的小盒里贴了个左）
-  const top = bRect.top - originY;
+  /*
+   * 记下流里的位置再脱离流：top 沿用记下来的位置，横向贴住正文列左/右边界
+   * （不能沿用图原来的横向位置，否则「右浮动」只在 400px 宽的小盒里贴了个左）
+   *
+   * 垂直基准（valign）就加在这个 top 上：bottom 恒为 0，top / middle 把图
+   * 上推或下推若干像素，别的什么都不碰。量不到任何几何量时偏移就是 0，
+   * 写出来的 top 与没写 valign 时逐位相同。
+   */
+  const baseTop = bRect.top - originY;
+  const vin = readerValignInfo(el, block, cfg, bRect);
+  const top = baseTop + vin.offset;
+  record.valign = {
+    valign: vin.valign,
+    lineH: vin.lineH,
+    imgH: vin.imgH,
+    yTitle: vin.yTitle,
+    baseTop: round2(baseTop),
+    top: round2(top),
+    offset: vin.offset,
+  };
   record.styles.push(setInlineStyle(block, 'position', 'absolute'));
   record.styles.push(setInlineStyle(block, 'float', 'none'));
   record.styles.push(setInlineStyle(block, 'margin', '0'));
@@ -435,6 +481,9 @@ function floatify(el, cfg, opts) {
   /*
    * 宽度写下去之后图可能整体缩放（.bm-floated .brace-map-svg 是 max-width: 100%），
    * 高度会跟着变。留白必须按「此刻的真实渲染高度」算，不能信改宽之前那个值。
+   *
+   * 这里只读 after.left / after.right：valign 改的是 top，横向量法不受它影响，
+   * 别让垂直偏移串进来变成间距。
    */
   const after = rectOf(block) || bRect;
   record.height = elHeight(block);
@@ -639,7 +688,14 @@ function attachFloatWrap(host, cfg, opts) {
     update: schedule,
     dispose,
     state: () => (record
-      ? { side: record.side, width: record.width, margin: record.margin, targets: record.wrap.length, applies }
+      ? {
+        side: record.side,
+        width: record.width,
+        margin: record.margin,
+        targets: record.wrap.length,
+        valign: record.valign || null,
+        applies,
+      }
       : { applies }),
   };
 }
@@ -1026,6 +1082,10 @@ function resetFloatLayout(host) {
  * 所以「valign 只对 float: left / right 生效」不是妥协，是唯一安全的路径。
  * position: absolute 那条也不行：脱了浮动流，后面的文字立刻不绕排。
  *
+ * 阅读视图是另一套（floatify 把图绝对定位，垂直位置只由 top 决定），语义与
+ * 公式完全一致，但偏移量是加到那个 top 上，见 readerValignInfo。
+ * 下面这一整套（margin-top / cm-content 守卫 / 尺寸观察器）只服务编辑模式。
+ *
  * 什么时候重算：只跟尺寸走。挂上一个 ResizeObserver 盯宿主自己，尺寸一变就
  * 重算一次（16ms 防抖）；尺寸不变就永远不触发，没有轮到定时器。
  *   - 图的自校准（mountBraceSvg 在 0/60/250/1000ms 与字体就绪后重排）会改图高，
@@ -1121,10 +1181,13 @@ function measureLineHeight(host) {
  * 元素高 = 行数 × 行高（headless 实测：折两行那段 rect 是 63px，行高 31.5px）。
  * 做法：用 Range 数它内部有几个视觉行（按顶边去重），再用块高除以行数。
  * 没 Range（假 DOM / 旧环境）或数不出行数时退回整块高。
+ * opts.strict 为真时改成「数不出来就报 NaN」：阅读视图里那个段落可能已经折成
+ * 好几行，拿段落总高当行高会把图推得过远，宁可退化为不偏移。
  */
-function rowHeightOf(el) {
+function rowHeightOf(el, opts) {
+  const strict = !!(opts && opts.strict);
   const blockH = elHeight(el);
-  if (!(blockH > 0)) return 0;
+  if (!(blockH > 0)) return strict ? NaN : 0;
   try {
     const doc = el && el.ownerDocument;
     if (doc && typeof doc.createRange === 'function') {
@@ -1140,10 +1203,71 @@ function rowHeightOf(el) {
           if (tops.indexOf(t) < 0) tops.push(t);
         }
         if (tops.length > 1) return blockH / tops.length;
+        if (tops.length === 1) return blockH;      // 只排了一行：块高本身就是行高
+        if (strict) return NaN;                     // 一个有效行盒都没有：数不出来
       }
     }
   } catch (e) { /* 数不出行数就退回整块高 */ }
-  return blockH;
+  /* strict：读不到就报「量不到」（NaN），让调用方退化为不偏移，
+   * 而不是拿一个折了行的段落总高当行高（那会把图推得过远）。 */
+  return strict ? NaN : blockH;
+}
+
+/* ---------------------- 阅读视图：图原来的流位置 ---------------------- */
+
+/** 这元素算不算「一段正文」：<p> / Obsidian 的 .el-p / CM6 的 .cm-line / 里面包着 <p> 的壳 */
+function isParagraphEl(el) {
+  if (!el) return false;
+  let tag = '';
+  try { tag = String(el.tagName || '').toUpperCase(); } catch (e) { tag = ''; }
+  if (tag === 'P') return true;
+  if (classHas(el, 'el-p') || classHas(el, 'el-paragraph') || classHas(el, 'cm-line')) return true;
+  try { return !!(el.querySelector && el.querySelector('p')); } catch (e) { return false; }
+}
+
+/**
+ * 阅读视图里「图所在那一行」的替身：紧邻的正文段落。
+ *
+ * 阅读视图没有 .cm-line，正文是 <p>（或 Obsidian 包一层的 .el-p）。图的块在
+ * sizer 里就是一个普通兄弟，所以「那一行」只剩紧邻段落这一个可读的东西。
+ * 先往后找（图下方那段就是它原来的下一行），到文末再往前找。
+ */
+function readerParagraph(block) {
+  if (!block) return null;
+  let el = block.nextElementSibling;
+  for (let i = 0; el && i < WRAP_LIMIT; i++) {
+    if (isParagraphEl(el)) return el;
+    el = el.nextElementSibling;
+  }
+  el = block.previousElementSibling;
+  for (let i = 0; el && i < WRAP_LIMIT; i++) {
+    if (isParagraphEl(el)) return el;
+    el = el.previousElementSibling;
+  }
+  return null;
+}
+
+/**
+ * 量阅读视图里「图所在那一行」的行高。
+ *
+ * computed line-height 优先（正文行高就写在段落上），读不到（normal / 假 DOM）
+ * 再用「块高 ÷ Range 数出的视觉行数」。两个都拿不到返回 0，调用方按「不偏移」处理。
+ * 与编辑模式共用同一套判据，只是「那一行」换成了段落，所以单独一个入口。
+ */
+function measureReaderLineHeight(block) {
+  const para = readerParagraph(block);
+  if (!para) return 0;
+  const fromCss = computedPx(para, 'lineHeight');
+  if (fromCss > 0) return fromCss;
+  /* .el-p 这种壳自己可能是 normal，真正的行高落在里面的 <p> 上 */
+  let core = para;
+  try { core = (para.querySelector && para.querySelector('p')) || para; } catch (e) { core = para; }
+  if (core !== para) {
+    const fromCore = computedPx(core, 'lineHeight');
+    if (fromCore > 0) return fromCore;
+  }
+  const row = rowHeightOf(core, { strict: true });
+  return Number.isFinite(row) && row > 0 ? row : 0;
 }
 
 /**
@@ -1177,13 +1301,16 @@ function siblingLine(host) {
  * 所以缩放、题图 <g transform> 的偏移、方向映射全都自动含进去了，
  * 不需要再把 layout 的 SVG 坐标换算回宿主坐标。
  * 多行根节点取整块文字的 bbox 中心；多个根取平均；一个都量不到返回 NaN。
+ *
+ * origin 是「图的顶边」参照物，默认宿主自己；阅读视图里传的是真正被绝对定位
+ * 的那个块（可能是包了一层的壳），那样量出来的 yTitle 才和写进 top 的坐标系一致。
  */
-function measureTitleCenter(host) {
+function measureTitleCenter(host, origin) {
   if (!host || typeof host.querySelectorAll !== 'function') return NaN;
   let roots = null;
   try { roots = host.querySelectorAll('[data-bm-root]'); } catch (e) { return NaN; }
   if (!roots || !roots.length) return NaN;
-  const hr = rectOf(host);
+  const hr = rectOf(origin || host);
   if (!hr) return NaN;
 
   let sum = 0;
@@ -1544,6 +1671,7 @@ module.exports = {
   applyFloatLayout,
   valignOffset,
   measureLineHeight,
+  measureReaderLineHeight,
   measureTitleCenter,
   applyValignLayout,
   ensureValignObserver,
