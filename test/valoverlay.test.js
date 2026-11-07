@@ -362,16 +362,30 @@ function tHostUntouched() {
 /* ------------------------------ 判据镜像 ------------------------------ */
 
 function tGateMirror() {
-  ok(VO.gateOf(null, {}, 'right') === '!host', 'overlay-gate: 没宿主');
+  ok(VO.gateOf(null, {}, 'right', 'top') === '!host', 'overlay-gate: 没宿主');
   const h = fakeHost();
-  eq(VO.gateOf(h, { imgH: 100, roots: 1 }, 'center'), 'float!=lr', 'overlay-gate: 非浮动');
-  eq(VO.gateOf(h, { imgH: 100, roots: 1 }, 'right'), 'ready', 'overlay-gate: 都满足');
-  eq(VO.gateOf(h, { imgH: 0, roots: 1 }, 'right'), 'not-ready', 'overlay-gate: 图高 0');
-  eq(VO.gateOf(h, { imgH: 100, roots: 0 }, 'right'), 'not-ready', 'overlay-gate: 根节点 0 个');
+  eq(VO.gateOf(h, { imgH: 100, roots: 1, yTitle: 20 }, 'center', 'top'), 'float!=lr',
+    'overlay-gate: 非浮动');
+  eq(VO.gateOf(h, { imgH: 100, roots: 1, yTitle: 20 }, 'right', 'top'), 'ready',
+    'overlay-gate: 都满足');
+  eq(VO.gateOf(h, { imgH: 0, roots: 1, yTitle: 20 }, 'right', 'top'), 'not-ready',
+    'overlay-gate: 图高 0');
+  eq(VO.gateOf(h, { imgH: 100, roots: 0, yTitle: 20 }, 'right', 'top'), 'not-ready',
+    'overlay-gate: 根节点 0 个');
   const cold = fakeHost({ cls: [] });
-  eq(VO.gateOf(cold, { imgH: 100, roots: 1 }, 'right'), '!bm-floated', 'overlay-gate: 没 bm-floated');
+  eq(VO.gateOf(cold, { imgH: 100, roots: 1, yTitle: 20 }, 'right', 'top'), '!bm-floated',
+    'overlay-gate: 没 bm-floated');
   const gone = fakeHost({ connected: false });
-  eq(VO.gateOf(gone, { imgH: 100, roots: 1 }, 'right'), '!inEditor', 'overlay-gate: 未连进文档');
+  eq(VO.gateOf(gone, { imgH: 100, roots: 1, yTitle: 20 }, 'right', 'top'), '!inEditor',
+    'overlay-gate: 未连进文档');
+
+  /* 第二扇门：middle 量不到标题中心时也算没准备好；top 不看 yTitle */
+  eq(VO.gateOf(h, { imgH: 100, roots: 1, yTitle: NaN }, 'right', 'middle'), 'not-ready',
+    'overlay-gate: middle 且 yTitle 是 NaN');
+  eq(VO.gateOf(h, { imgH: 100, roots: 1, yTitle: null }, 'right', 'middle'), 'not-ready',
+    'overlay-gate: middle 且 yTitle 是 null');
+  eq(VO.gateOf(h, { imgH: 100, roots: 1, yTitle: NaN }, 'right', 'top'), 'ready',
+    'overlay-gate: top 不依赖 yTitle');
 }
 
 /* ------------------------------ 登记 ------------------------------ */

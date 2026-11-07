@@ -6305,16 +6305,22 @@ function clampX(x, viewW, width) {
  * 假设「此刻就调用一次 applyValignLayout」，它会走哪个分支。
  *
  * 这里只是把函数开头那几个 if 按同样的顺序读一遍，纯读，不改任何东西。
- * 顺序与 float.js 保持一致：float → bm-floated → 在编辑区 → 量到了。
+ * 顺序与 float.js 保持一致：float → bm-floated → 在编辑区 → 量到了（两道门）：
+ *   1. 图高 0 或根节点 0 个
+ *   2. middle 档量不到标题中心
  * 任何一条对不上，覆盖层就把标签第三行换成 `→ <分支>`，提醒「这一行绿线
  * 不是它现在的位置」。
  */
-function gateOf(host, probe, floatMode) {
+function gateOf(host, probe, floatMode, valign) {
   if (!host || !host.style) return '!host';
   if (floatMode !== 'left' && floatMode !== 'right') return 'float!=lr';
   if (!classHas(host, 'bm-floated')) return '!bm-floated';
   if (host.isConnected === false) return '!inEditor';
   if (!(probe.imgH > 0) || !(probe.roots > 0)) return 'not-ready';
+  /* 第二扇门：只有 middle 依赖 yTitle（top 只看行高和图高） */
+  const raw = probe.yTitle;
+  const yT = (raw === null || raw === undefined) ? NaN : Number(raw);
+  if (valign === 'middle' && !Number.isFinite(yT)) return 'not-ready';
   return 'ready';
 }
 
@@ -6436,7 +6442,7 @@ function renderOnce(s, remeasure) {
       try {
         off = s.api.offsetOf(probe.lineH, probe.imgH, probe.yTitle, cfg.valign) || 0;
       } catch (e) { off = 0; }
-      const gate = gateOf(host, probe, cfg.float);
+      const gate = gateOf(host, probe, cfg.float, cfg.valign);
       it.off = off;
       it.gate = gate;
       const color = gate === 'ready' ? '#94a3b8' : '#f59e0b';
