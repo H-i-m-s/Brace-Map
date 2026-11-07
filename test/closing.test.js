@@ -287,14 +287,16 @@ function tMultiple() {
   eq(cs.length, 3, 'multi: 三个 closing 括号');
   eq(cs.map((c) => c.group), [0, 1, 2], 'multi: 按声明顺序编号');
 
+  /*
+   * 列位按「垂直方向能不能并排」分配：甲/乙 与 丙/丁 上下不相交，
+   * 同一列就够；第三条括全部叶子，把两段都覆盖了，必须往外一列。
+   */
   const step = I.OPT.braceWidth + I.OPT.colGap;
-  for (let i = 0; i + 1 < cs.length; i++) {
-    eq(cs[i + 1].mainBody - cs[i].mainBody, step, 'multi: 列距 = braceWidth + colGap #' + i);
-  }
-  ok(cs[0].mainBody < cs[1].mainBody && cs[1].mainBody < cs[2].mainBody, 'multi: mainBody 依次递增');
-  for (let i = 0; i + 1 < cs.length; i++) {
-    ok(cs[i].mainBody + I.OPT.braceWidth <= cs[i + 1].mainBody, 'multi: 两列不重叠 #' + i);
-  }
+  eq(cs[0].mainBody, cs[1].mainBody, 'multi: 前两组垂直不重叠，共用一列');
+  eq(cs[2].mainBody - cs[1].mainBody, step, 'multi: 与它重叠的那一列错开一步');
+  ok(cs[2].mainBody >= cs[0].mainBody + I.OPT.braceWidth + I.OPT.colGap,
+    'multi: 两列不重叠');
+  ok(cs[0].cross2 <= cs[1].cross1, 'multi: 前两组确实在垂直方向错开（前提成立）');
 
   // 第一条括 甲/乙，第二条括 丙/丁，第三条括全部叶子
   const jia = nodeByText(L, '甲');
@@ -314,9 +316,9 @@ function tMultiple() {
   ok(L.width >= last.mainTip, 'multi: 画布宽装得下最后一列', L.width + ' vs ' + last.mainTip);
   ok(L.width === last.mainTip + I.OPT.pad, 'multi: 右边界 = 末列尖端 + pad');
 
-  // 单组画布宽 + 2 列 → 宽度正好按列数增长
+  // 单组画布宽 + 1 列 → 宽度按实际用到的列数增长（这次只用两列）
   const one = layout(['closing: true', '- 父', '  - 甲', '  - 乙', '  - 丙', '  - 丁'].join('\n')).L;
-  eq(L.width - one.width, 2 * step, 'multi: 宽度随列数线性增长');
+  eq(L.width - one.width, step, 'multi: 宽度随实际列数增长');
 
   // 每个节点、每条路径都还在 viewBox 里
   const built = I.buildSvg(r, Object.assign({}, LAYOUT_OPTS, { dir: 'lr' }));

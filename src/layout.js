@@ -364,6 +364,7 @@ function layoutTree(roots, opts) {
     const avail = braceWidth + colGap + pad;
     const base = mEnd + (avail - braceWidth) / 2;
     let col = 0;                      // 实际画出来的列号：没命中的那条不留空列
+    const placed = [];                // 每列已经画了哪些括号（拿来判断能不能复用这列）
     for (const [i, group] of closingGroups.entries()) {
       const all = !!(group && group.all);
       const names = group && Array.isArray(group.names) ? group.names : [];
@@ -393,7 +394,24 @@ function layoutTree(roots, opts) {
         c1 = Math.min(c1, t.cross - t.selfCross / 2);
         c2 = Math.max(c2, t.cross + t.selfCross / 2);
       }
-      const mBody = base + col * (braceWidth + colGap);
+      /*
+       * 横向位置：优先占「不会和已有括号撞车」的那一列。
+       *
+       * 以前是每画一组就无条佯往右推一列，结果两个在垂直方向根本不重叠、
+       * 完全可以并排的括号也被拉到很远。现在先看已有括号：只要新组的 cross
+       * 范围和某一列里的所有括号都错开，就复用那一列。
+       *
+       * 第一列仍然沿用全局基线，旧版单组 / 三组逐位一致。
+       */
+      let slot = 0;
+      for (let k = 0; k < placed.length; k++) {
+        const hit = placed[k].some((r) => !(c2 <= r.cross1 || c1 >= r.cross2));
+        if (!hit) { slot = k; break; }
+        slot = k + 1;
+      }
+      const mBody = base + slot * (braceWidth + colGap);
+      while (placed.length <= slot) placed.push([]);
+      placed[slot].push({ cross1: c1, cross2: c2 });
       col++;
       braces.push({
         kind: 'closing',
