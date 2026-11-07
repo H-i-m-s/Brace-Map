@@ -41,6 +41,7 @@ const SOFT_BREAK = '\n';
  */
 function parseClosingGroup(v) {
   const raw = String(v == null ? '' : v).trim();
+  if (/^(false|no|0|off|none)$/i.test(raw)) return null;
   if (!raw || /^(true|yes|1|on)$/i.test(raw)) return { all: true };
   const names = [];
   for (const part of raw.split(/[,，]/)) {
@@ -220,7 +221,8 @@ function parseSource(source) {
       } else if (key === 'box') {
         box = parseBox(val);
       } else if (key === 'closing') {
-        closingGroups.push(parseClosingGroup(val));
+        const g = parseClosingGroup(val);
+        if (g) closingGroups.push(g);   // false / off 之类是「没这条声明」，不是空组
       } else if (key === 'title') {
         titleDirective = cleanInline(val);
       } else if (key === 'maxwidth') {

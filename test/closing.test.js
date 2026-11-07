@@ -466,7 +466,26 @@ function tVertical() {
   }
 }
 
+/* false / off 这类值不是「一条空声明」，是「没有这条声明」：
+ * 不能当成名字去查找，也不该在诊断里留一条「没找到叫 false 的节点」。 */
+function tFalseOff() {
+  const base = ['- 父', '  - 甲', '  - 乙'];
+
+  for (const v of ['false', 'off', 'no', '0', 'none', 'FALSE']) {
+    const r = I.parseSource(['closing: ' + v].concat(base).join('\n'));
+    eq(r.closingGroups.length, 0, 'closing-false: ' + v + ' 不产生声明组');
+    eq(r.closing, false, 'closing-false: ' + v + ' 时 closing 布尔为假');
+    eq(closings(layoutOf(r, 'lr')).length, 0, 'closing-false: ' + v + ' 不画括号');
+  }
+
+  /* 和 true 对照：true 仍然是一条 all 声明 */
+  const t = I.parseSource(['closing: true'].concat(base).join('\n'));
+  eq(t.closingGroups.length, 1, 'closing-false: true 产生一组');
+  eq(t.closingGroups[0], { all: true }, 'closing-false: true 那组是 all');
+}
+
 suite('closing-parse-groups', tParseGroups);
+suite('closing-false-off', tFalseOff);
 suite('closing-bool-compat', tBooleanCompat);
 suite('closing-named', tNamed);
 suite('closing-cross-layer', tCrossLayer);
