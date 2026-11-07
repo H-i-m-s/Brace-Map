@@ -5997,11 +5997,114 @@ class BraceMapPlugin extends Plugin {
    * 诊断日志开关。开的时候顺手把 app 交给诊断层（它默认关着，不会自己绑）。
    * 日志写到 vault 根目录的 brace-map-debug.log。
    */
+  /**
+   * 现场采样（只读）：点一下命令就拿数据，不依赖重渲染。
+   *
+   * 要回答的核心问题：CM6 的记账高度（contentHeight）和 .cm-content 的
+   * 实际高度差多少。CM6 按账上的高度把纵坐标反推成行号，两者不一致，
+   * 就会出现「点这里、光标落在那里」。差值就是错位的像素数。
+   *
+   * 同时把每个括号图宿主的内联样式、rect、以及它后面那段文字的高度
+   * 一并记下来，用来判断错位是不是来自某个 widget。
+   */
+  snapshotLayout() {
+    const out = [];
+    const push = (s) => out.push(s);
+    const num = (v) => (typeof v === 'number' && isFinite(v) ? v.toFixed(2) : String(v));
+
+    push('# Brace Map 布局现场');
+    push('');
+    push('- 时间：' + new Date().toISOString());
+
+    let cm = null;
+    try {
+      const leaves = this.app.workspace.getLeavesOfType('markdown');
+      for (let i = 0; i < leaves.length; i++) {
+        const ed = leaves[i].view && leaves[i].view.editor;
+        if (ed && ed.cm) { cm = ed.cm; break; }
+      }
+    } catch (e) { cm = null; }
+
+    const contentEl = document.querySelector('.markdown-source-view .cm-content');
+    const rect = (el) => {
+      if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+      const r = el.getBoundingClientRect();
+      return { top: r.top, left: r.left, w: r.width, h: r.height };
+    };
+    const box = (r) => (r
+      ? 'top ' + num(r.top) + ' / 高 ' + num(r.h) + ' / 宽 ' + num(r.w)
+      : '（量不到）');
+    const contentRect = rect(contentEl);
+
+    push('');
+    push('## CM6 账本 vs 实际');
+    push('- contentHeight（CM6 记账）：' + (cm ? num(cm.contentHeight) : '拿不到'));
+    push('- .cm-content 实际 rect：' + box(contentRect));
+    if (cm && contentRect) {
+      push('- **差值**：' + num(contentRect.h - cm.contentHeight) + ' px（正数=实际比账高）');
+    }
+    if (cm) {
+      let dh = null;
+      try { dh = cm.defaultLineHeight; } catch (e) { dh = null; }
+      push('- defaultLineHeight：' + (dh == null ? '拿不到' : num(dh)));
+      let vh = null;
+      try { vh = cm.viewportHeight; } catch (e) { vh = null; }
+      push('- viewportHeight：' + (vh == null ? '拿不到' : num(vh)));
+    }
+
+    const hosts = document.querySelectorAll('.block-language-brace');
+    push('');
+    push('## 括号图宿主（' + hosts.length + ' 个）');
+    for (let i = 0; i < hosts.length; i++) {
+      const host = hosts[i];
+      const embed = host.parentElement;
+      push('');
+      push('### 图 ' + (i + 1));
+      push('- 类名：' + host.className);
+      push('- 行内样式：' + (host.style && host.style.cssText ? host.style.cssText : '（空）'));
+      push('- host rect：' + box(rect(host)));
+      push('- embed rect：' + box(rect(embed)));
+      if (embed && typeof getComputedStyle === 'function') {
+        const cs = getComputedStyle(embed);
+        push('- embed computed：height ' + cs.height + ' / position ' + cs.position
+          + ' / contain ' + cs.contain + ' / overflow ' + cs.overflow);
+      }
+      let el = embed && embed.nextElementSibling;
+      let acc = 0;
+      let cnt = 0;
+      while (el && el.classList && el.classList.contains('cm-line')) {
+        const r = rect(el);
+        if (r) acc += r.h;
+        cnt += 1;
+        el = el.nextElementSibling;
+      }
+      push('- 后面连续 cm-line：' + cnt + ' 行，合计 ' + num(acc) + ' px');
+      if (embed && embed.nextElementSibling) {
+        const nx = embed.nextElementSibling;
+        push('- 紧跟的下一个兄弟：' + nx.tagName + '.'
+          + String(nx.className || '').split(' ').slice(0, 3).join('.'));
+      }
+    }
+
+    const text = out.join('\n');
+    const file = 'brace-map-光标诊断.md';
+    try {
+      const w = this.app.vault.adapter.write(file, text);
+      if (w && typeof w.then === 'function') {
+        w.then(() => {
+          try { new Notice('Brace Map 诊断已写入：' + file); } catch (e) { /* ignore */ }
+        }).catch(() => { /* ignore */ });
+      }
+    } catch (e) { /* ignore */ }
+    return text;
+  }
+
   toggleLpDebug() {
     let on = false;
     try { on = dbgSetEnabled(!dbgEnabled()); } catch (e) { on = false; }
     if (on) {
       try { dbgConfigure(this.app); } catch (e) { /* ignore */ }
+      try { this.snapshotLayout(); } catch (e) { /* ignore */ }
     }
     try { dbgFlush(); } catch (e) { /* ignore */ }
     try {
