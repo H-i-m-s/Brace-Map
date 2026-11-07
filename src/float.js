@@ -1081,12 +1081,30 @@ function measureFollowTextHeight(embed) {
  *
  * @returns {number} 写下去的偏移量（0 表示没动样式）
  */
-function applyValignLayout(host, cfg) {
+function applyValignLayout(host, cfg, retried) {
   if (!host || !host.style || !cfg) return 0;
   const mode = cfg.float;
   if (mode !== 'left' && mode !== 'right') return 0;
-  if (!climbTo(host, 'cm-editor')) return 0;       // 阅读视图 / 预览页：不碰
   if (!classHas(host, 'bm-floated')) return 0;     // float 没真写上去时不能加偏移
+
+  /*
+   * 要不要在编辑模式里、宿主有没有挂进文档，这两件事在渲染那一刻都
+   * 常常还是 false：代码块处理器拿到元素时，它还没被插进 .cm-content。
+   * 量不到几何量就只能按 top 处理，但那样功能在真机上永远不生效。
+   *
+   * 这里只给自己一帧的机会：下一帧再试一次，试完就算。不是巡检、
+   * 不是重试循环，也不会因为失败而排新的帧。
+   */
+  if (!host.isConnected || !climbTo(host, 'cm-editor')) {
+    if (!retried && typeof requestAnimationFrame === 'function') {
+      try {
+        requestAnimationFrame(() => {
+          try { applyValignLayout(host, cfg, true); } catch (e) { /* ignore */ }
+        });
+      } catch (e) { /* ignore */ }
+    }
+    return 0;
+  }
 
   const info = { valign: cfg.valign || 'top', textH: 0, imgH: 0, offset: 0, applied: false };
   host.__bmValignInfo = info;
