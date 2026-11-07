@@ -15,6 +15,8 @@
  *   - yTitle 来自根节点文字的 bbox，多个根取平均
  *   - 四个前置条件（float / .cm-editor / bm-floated / 已连进文档）
  *   - 偏移走 setInlineStyle，顺序排在 margin 简写之后，resetFloatLayout 能还原
+ *   - 尺寸观察器：算出偏移后只挂一个；尺寸变了才重算（防抖）；
+ *     宿主被移除 / 复位后断开；偏移没变不重写；未连接时按 120/480/1200 补拍
  * 浏览器里那几条（行高、标题 bbox、绕排）见 headless 实测数据。
  * ============================================================ */
 
@@ -415,6 +417,7 @@ function tSkipDetached() {
     'valign-skip: 未连进文档当 bottom');
   eq(host.style.marginTop, undefined, 'valign-skip: 未连进文档不写样式');
   ok(!host.__bmValignInfo, 'valign-skip: 未连进文档不记诊断（还没量）');
+  I.clearValignRetries(host);                 // 别让补拍在后面的用例里乱跑
 }
 
 function tSkipNoHost() {
@@ -525,6 +528,183 @@ function tInfoFields() {
   eq(b.host.style.marginTop, undefined, 'valign-info: 缺省 bottom 不写样式');
 }
 
+/* ------------------------------ 尺寸观察器 ------------------------------ */
+
+/** 假 ResizeObserver：只记账，手动 fire()，验「挂 / 断 / 防抖 / 不重算」 */
+function installFakeRO() {
+  const made = [];
+  class FakeRO {
+    constructor(cb) { this.cb = cb; this.targets = []; this.disconnected = 0; made.push(this); }
+    observe(t) { if (this.targets.indexOf(t) < 0) this.targets.push(t); }
+    unobserve(t) { const i = this.targets.indexOf(t); if (i >= 0) this.targets.splice(i, 1); }
+    disconnect() { this.disconnected++; this.targets.length = 0; }
+    fire() {
+      if (!this.targets.length) return 0;
+      const list = this.targets.map((t) => ({ target: t, contentRect: t.getBoundingClientRect() }));
+      this.cb(list, this);
+      return 1;
+    }
+  }
+  const prev = global.ResizeObserver;
+  global.ResizeObserver = FakeRO;
+  return {
+    made,
+    restore() {
+      if (prev === undefined) delete global.ResizeObserver;
+      else global.ResizeObserver = prev;
+    },
+  };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 能数「写了几次 margin-top」的 style：直接数赋值次数，不靠最终值猜 */
+function styleCounter() {
+  const counts = { set: 0 };
+  const style = {};
+  Object.defineProperty(style, 'marginTop', {
+    configurable: true,
+    get() { return this.__mt == null ? '' : this.__mt; },
+    set(v) { counts.set++; this.__mt = v; },
+  });
+  return { style, counts };
+}
+
+/** 造一个能跑 valign 的案例：h=48.29、H=imgH、标题中心 75（imgH=151 时 top 写 -102.71） */
+function observerCase(imgH) {
+  const opts = { imgH: imgH == null ? 151 : imgH, rootTexts: [rootText(60, 30)] };
+  const ctx = makeHost(opts);
+  withComputed(ctx.content, { lineHeight: '48.29px', fontSize: '30px' });
+  ctx.embed.nextElementSibling = fakeChain([{ cls: ['cm-line'], h: 40, lh: '48.29px' }]);
+  const c = styleCounter();
+  ctx.host.style = c.style;
+  return { ctx, opts, counts: c.counts };
+}
+
+function tObserverAttachOnce() {
+  const ro = installFakeRO();
+  try {
+    const k = observerCase();
+    const cfg = { float: 'right', valign: 'top' };
+    I.applyValignLayout(k.ctx.host, cfg);
+    eq(k.counts.set, 1, 'valign-observer: 首次写一次 margin-top');
+    eq(ro.made.length, 1, 'valign-observer: 算出偏移后挂一个观察器');
+    eq(ro.made[0].targets.length, 1, 'valign-observer: 观察的是宿主自己');
+    ok(ro.made[0].targets[0] === k.ctx.host, 'valign-observer: 目标就是 host');
+    eq(k.ctx.host.__bmValignObs.fired, 0, 'valign-observer: 触发计数从 0 开始');
+
+    // 同一份几何再算：不重写样式、不叠加观察器
+    const before = k.counts.set;
+    I.applyValignLayout(k.ctx.host, cfg);
+    I.applyValignLayout(k.ctx.host, cfg);
+    eq(k.counts.set, before, 'valign-observer: 偏移相同就不重复写样式');
+    eq(ro.made.length, 1, 'valign-observer: 同一宿主只挂一个观察器');
+  } finally { ro.restore(); }
+}
+
+async function tObserverRecompute() {
+  const ro = installFakeRO();
+  try {
+    const k = observerCase(151);
+    const cfg = { float: 'right', valign: 'top' };
+    I.applyValignLayout(k.ctx.host, cfg);
+    eq(k.ctx.host.style.marginTop, '-102.71px', 'valign-observer: 初始偏移 48.29 − 151');
+
+    /* 图的自校准把图改高了：尺寸回调 → 16ms 防抖 → 重算 */
+    k.opts.imgH = 200;
+    const inst = ro.made[0];
+    inst.fire();
+    eq(k.ctx.host.__bmValignObs.fired, 1, 'valign-observer: 尺寸变化记一次触发');
+    await sleep(60);
+    eq(k.ctx.host.style.marginTop, '-151.71px', 'valign-observer: 图变高后偏移重算（48.29 − 200）');
+    eq(k.ctx.host.__bmValignInfo.imgH, 200, 'valign-observer: 诊断记下新图高');
+    eq(k.counts.set, 3, 'valign-observer: 值变了才重写（先还原旧值再写新值）');
+
+    /* 再变一次、而且连着来：防抖只算一拍 */
+    k.opts.imgH = 151;
+    inst.fire();
+    inst.fire();
+    inst.fire();
+    await sleep(60);
+    eq(k.ctx.host.style.marginTop, '-102.71px', 'valign-observer: 连续回调只算一拍');
+    eq(k.ctx.host.__bmValignObs.fired, 4, 'valign-observer: 三次回调都记了账');
+  } finally { ro.restore(); }
+}
+
+async function tObserverDetached() {
+  const ro = installFakeRO();
+  try {
+    const k = observerCase(151);
+    I.applyValignLayout(k.ctx.host, { float: 'right', valign: 'top' });
+    const before = k.counts.set;
+    const inst = ro.made[0];
+
+    k.ctx.host.isConnected = false;          // widget 重建，宿主被丢弃
+    inst.fire();
+    await sleep(60);
+    eq(k.counts.set, before, 'valign-observer: 宿主被移除后不再写样式');
+    eq(k.ctx.host.__bmValignObs ? 1 : 0, 0, 'valign-observer: 宿主被移除后观察器自己断开');
+    eq(inst.disconnected, 1, 'valign-observer: disconnect 只叫一次');
+    eq(inst.fire(), 0, 'valign-observer: 断开后不再投递回调（不报错）');
+  } finally { ro.restore(); }
+}
+
+function tResetDisconnects() {
+  const ro = installFakeRO();
+  try {
+    const k = observerCase(151);
+    I.applyValignLayout(k.ctx.host, { float: 'right', valign: 'top' });
+    eq(ro.made.length, 1, 'valign-reset: 观察器已挂');
+    I.resetFloatLayout(k.ctx.host);
+    eq(k.ctx.host.__bmValignObs ? 1 : 0, 0, 'valign-reset: resetFloatLayout 断开观察器');
+    eq(ro.made[0].disconnected, 1, 'valign-reset: ResizeObserver.disconnect 已调用');
+    eq(k.ctx.host.style.marginTop, '', 'valign-reset: margin-top 也复位了');
+    eq(k.ctx.host.__bmValignInfo ? 1 : 0, 0, 'valign-reset: 诊断记录一起作废');
+    eq(ro.made[0].fire(), 0, 'valign-reset: 断开后没有幽灵重算');
+  } finally { ro.restore(); }
+}
+
+async function tDelayedMount() {
+  const ro = installFakeRO();
+  let host = null;
+  try {
+    const k = observerCase(151);
+    host = k.ctx.host;
+    host.isConnected = false;                // 渲染那一刻还没插进 .cm-content
+    const cfg = { float: 'right', valign: 'top' };
+    eq(I.applyValignLayout(host, cfg), 0, 'valign-mount: 未连接时算不出偏移');
+    ok(host.__bmValignRetry, 'valign-mount: 排上首次补拍（120/480/1200）');
+    eq(ro.made.length, 0, 'valign-mount: 没量到就不挂观察器');
+    ok(!host.__bmValignInfo, 'valign-mount: 没量到就不写诊断');
+
+    host.isConnected = true;                 // 插进文档
+    await sleep(170);                        // 等第一拍（120ms）
+    eq(host.style.marginTop, '-102.71px', 'valign-mount: 插入后补拍写下偏移');
+    ok(!host.__bmValignRetry, 'valign-mount: 连上后撤掉剩下的补拍');
+    eq(ro.made.length, 1, 'valign-mount: 插入后挂上尺寸观察器');
+    eq(host.__bmValignInfo.lineH, 48.29, 'valign-mount: 补拍量到了行高');
+    eq(k.counts.set, 1, 'valign-mount: 只写一次');
+  } finally {
+    if (host) I.clearValignRetries(host);
+    ro.restore();
+  }
+}
+
+function tObserverNoApi() {
+  // 没有 ResizeObserver 的环境（老浏览器 / 假 DOM）：不挂、不报错，其余照旧
+  const prev = global.ResizeObserver;
+  delete global.ResizeObserver;
+  try {
+    const k = observerCase(151);
+    near(I.applyValignLayout(k.ctx.host, { float: 'right', valign: 'top' }), -102.71,
+      'valign-noapi: 没有 ResizeObserver 也照样写偏移');
+    ok(!k.ctx.host.__bmValignObs, 'valign-noapi: 没挂观察器');
+    eq(k.counts.set, 1, 'valign-noapi: 样式只写一次');
+  } finally {
+    if (prev !== undefined) global.ResizeObserver = prev;
+  }
+}
+
 /* ------------------------------ 渲染出来的根节点标记 ------------------------------ */
 
 function tRootMarkup() {
@@ -561,4 +741,11 @@ suite('valign-skip', () => {
 suite('valign-order', () => { tOrderAfterShorthand(); tRepeatNoDuplicate(); tFloatRerunClearsValign(); });
 suite('valign-reapply', tReapplyKeepsValign);
 suite('valign-info', tInfoFields);
+suite('valign-observer', () => {
+  tObserverAttachOnce();
+  return tObserverRecompute().then(() => tObserverDetached());
+});
+suite('valign-observer-reset', tResetDisconnects);
+suite('valign-mount', tDelayedMount);
+suite('valign-noapi', tObserverNoApi);
 suite('valign-markup', tRootMarkup);

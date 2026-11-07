@@ -977,6 +977,12 @@ function applyFloatLayout(host, cfg) {
  */
 function resetFloatLayout(host) {
   if (!host) return 0;
+  /* 宿主复位 = 这套布局作废：尺寸观察器与补拍一起停掉，免得对着一张已经
+   * 没有 valign 的图重算（幽灵重算），也免得宿主被丢弃后观察器泄漏。 */
+  disconnectValignObserver(host);
+  clearValignRetries(host);
+  host.__bmValignInfo = null;
+  host.__bmValignRec = null;
   const recs = host.__bmFloatLayout;
   let n = 0;
   if (Array.isArray(recs)) {
@@ -1020,8 +1026,15 @@ function resetFloatLayout(host) {
  * 所以「valign 只对 float: left / right 生效」不是妥协，是唯一安全的路径。
  * position: absolute 那条也不行：脱了浮动流，后面的文字立刻不绕排。
  *
- * 不做巡检：挂载那一刻量一次，量不到就按 bottom。编辑中行高或标题位置变了，
- * 图不会跟着重排；重开笔记时重新量一次就回来了。没有 Observer、没有定时器。
+ * 什么时候重算：只跟尺寸走。挂上一个 ResizeObserver 盯宿主自己，尺寸一变就
+ * 重算一次（16ms 防抖）；尺寸不变就永远不触发，没有轮到定时器。
+ *   - 图的自校准（mountBraceSvg 在 0/60/250/1000ms 与字体就绪后重排）会改图高，
+ *     正好被它接住，量到的 yTitle / imgH 才是最终值
+ *   - 观察的是宿主，不是父级 .cm-embed-block：浮动让**父级**高度塌成 0（那个 0
+ *     永远不动），宿主自己的高度就是图高，会变
+ *
+ * 首次挂载那次例外：渲染时宿主还没插进 .cm-content，量不到任何几何量。这里按
+ * attachFloatWrap 的节奏补拍 120/480/1200ms 各一次（有上限，不轮询）。
  * ============================================================ */
 
 /**
@@ -1191,7 +1204,7 @@ function measureTitleCenter(host) {
  *   - cfg.float 是 left / right（center / inline 不浮动，没有可对齐的基准）
  *   - 宿主在 .cm-editor 里（阅读视图那条 floatify / applyWrapMargins 一行不碰）
  *   - 宿主已经带上 bm-floated（说明那一行 float 真的写上了）
- *   - 宿主连在文档上（否则补一帧再试，量不到就按 bottom）
+ *   - 宿主连在文档上（否则按 120/480/1200ms 补拍三次，量不到就按 bottom）
  *
  * 写样式走 setInlineStyle 并记进 host.__bmFloatLayout：那份账归
  * resetFloatLayout 统一还原，复位后不会留下写死的 margin-top。
@@ -1200,9 +1213,9 @@ function measureTitleCenter(host) {
  *
  * bottom 档算出来恒为 0，一个样式都不写（简写里的 margin-top 本来就是 0）。
  *
- * @returns {number} 写下去的偏移量（0 表示没动样式）
+ * @returns {number} 偏移量（0 表示没写样式；值没变时照旧返回，但不重写）
  */
-function applyValignLayout(host, cfg, retried) {
+function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用，行为已由补拍统一负责
   if (!host || !host.style || !cfg) return 0;
   const mode = cfg.float;
   if (mode !== 'left' && mode !== 'right') return 0;
@@ -1213,38 +1226,21 @@ function applyValignLayout(host, cfg, retried) {
    * 常常还是 false：代码块处理器拿到元素时，它还没被插进 .cm-content。
    * 量不到几何量就只能按 bottom 处理，但那样功能在真机上永远不生效。
    *
-   * 这里只给自己一帧的机会：下一帧再试一次，试完就算。不是巡检、
-   * 不是重试循环，也不会因为失败而排新的帧。
+   * 所以这里不是「补一帧就算了」：补拍 120/480/1200ms 各一次（与
+   * attachFloatWrap 同一套节奏，覆盖自校准的 0/60/250/1000ms），每个宿主
+   * 只排一轮，连上就把剩下的撤掉。之后交给尺寸观察器，不再有任何定时器。
    */
   if (!host.isConnected || !climbTo(host, 'cm-editor')) {
-    if (!retried && typeof requestAnimationFrame === 'function') {
-      try {
-        requestAnimationFrame(() => {
-          try { applyValignLayout(host, cfg, true); } catch (e) { /* ignore */ }
-        });
-      } catch (e) { /* ignore */ }
-    }
+    scheduleValignRetries(host, cfg);
     return 0;
   }
+  clearValignRetries(host);                         // 连上了：补拍不用再来
 
   const info = {
     valign: cfg.valign || 'bottom',
     lineH: 0, imgH: 0, yTitle: null, offset: 0, applied: false,
   };
   host.__bmValignInfo = info;
-
-  /* 同一宿主重复调用：先把上一轮的 margin-top 从账上摘掉，避免叠出两条记录。
-   * 账已经不是那一份（中间跑过 applyFloatLayout）时只丢引用，不去动样式。 */
-  const prevRec = host.__bmValignRec;
-  if (prevRec) {
-    const recs = host.__bmFloatLayout;
-    const at = Array.isArray(recs) ? recs.indexOf(prevRec) : -1;
-    if (at >= 0) {
-      recs.splice(at, 1);
-      restoreStyles([prevRec]);
-    }
-    host.__bmValignRec = null;
-  }
 
   const embed = host.parentElement;
   if (!embed || host.isConnected === false) return 0;   // 还没挂进文档：当 bottom
@@ -1256,17 +1252,211 @@ function applyValignLayout(host, cfg, retried) {
 
   // 行高量不到（0）或 yTitle 取不到（null）时，valignOffset 自己退化为 0
   const offset = valignOffset(info.lineH, info.imgH, info.yTitle, info.valign);
-  if (!offset) return 0;
-
   info.offset = round2(offset);
-  const rec = setInlineStyle(host, 'marginTop', info.offset + 'px');
+
+  /* 新算的偏移和账上那条一模一样：一个字节都不重写。
+   * 自校准会把图高改上十来次，没有这道闸每轮都要写一遍样式（样式抖动）。 */
+  const prevRec = host.__bmValignRec;
+  const want = info.offset + 'px';
+  const cur = host.style.marginTop ? String(host.style.marginTop) : '';
+  if (info.offset && prevRec && cur === want) {
+    info.applied = true;
+    ensureValignObserver(host, cfg);
+    return offset;
+  }
+
+  /* 同一宿主重复调用：先把上一轮的 margin-top 从账上摘掉，避免叠出两条记录。
+   * 账已经不是那一份（中间跑过 applyFloatLayout）时只丢引用，不去动样式。 */
+  if (prevRec) {
+    const recs = host.__bmFloatLayout;
+    const at = Array.isArray(recs) ? recs.indexOf(prevRec) : -1;
+    if (at >= 0) {
+      recs.splice(at, 1);
+      restoreStyles([prevRec]);
+    }
+    host.__bmValignRec = null;
+  }
+
+  if (!offset) return 0;                            // bottom 档 / 量不到：一个样式都不写
+
+  const rec = setInlineStyle(host, 'marginTop', want);
   if (rec) {
     if (!Array.isArray(host.__bmFloatLayout)) host.__bmFloatLayout = [];
     host.__bmFloatLayout.push(rec);
     host.__bmValignRec = rec;
     info.applied = true;
   }
+  /* 挂上「尺寸一变就重算」：只盯宿主尺寸，不变化就永远不触发。
+   * 图的自校准与窗口变化都会改宿主高度，正好被它接住。 */
+  ensureValignObserver(host, cfg);
   return offset;
+}
+
+/* ---------------------- valign 的尺寸观察器 / 首次补拍 ---------------------- */
+
+/** 首次挂载补拍的节奏（ms）：与 attachFloatWrap 同一套，有上限，不轮询 */
+const VALIGN_RETRY_DELAYS = [120, 480, 1200];
+
+/** 尺寸变化后的防抖窗口（约一帧）：连续回调只算一次 */
+const VALIGN_DEBOUNCE_MS = 16;
+
+/** 已挂观察器登记簿：只在「宿主被丢弃又没人来道别」时兜底回收 */
+const VALIGN_OBSERVERS = [];
+
+/** 宿主所在的 window（假 DOM / 无 window 时返回 null） */
+function windowOf(host) {
+  const doc = host && host.ownerDocument;
+  const win = doc && doc.defaultView;
+  if (win) return win;
+  return (typeof window !== 'undefined') ? window : null;
+}
+
+/**
+ * 断开某个宿主的尺寸观察器（宿主复位 / 销毁时调）。
+ * 顺带清掉还排着的防抖任务，避免它对着已经没人要的元素重算一遍。
+ *
+ * @returns {number} 断开了一个观察器返回 1
+ */
+function disconnectValignObserver(host) {
+  const st = host && host.__bmValignObs;
+  if (!st) return 0;
+  host.__bmValignObs = null;
+  if (st.timer) {
+    try { clearTimeout(st.timer); } catch (e) { /* ignore */ }
+    st.timer = 0;
+  }
+  if (st.raf) {
+    const win = windowOf(host);
+    try {
+      if (win && typeof win.cancelAnimationFrame === 'function') win.cancelAnimationFrame(st.raf);
+      else if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(st.raf);
+    } catch (e) { /* ignore */ }
+    st.raf = 0;
+  }
+  st.pending = false;
+  if (st.ro) {
+    try { st.ro.disconnect(); } catch (e) { /* ignore */ }
+    st.ro = null;
+  }
+  const at = VALIGN_OBSERVERS.indexOf(st);
+  if (at >= 0) VALIGN_OBSERVERS.splice(at, 1);
+  return 1;
+}
+
+/**
+ * 回收已经脱离文档的宿主：widget 重建时旧宿主被直接丢弃，没有销毁钩子，
+ * 只能在下一次挂新宿主时顺手清一遍（不是巡检，没有定时器）。
+ */
+function pruneValignObservers() {
+  for (let i = VALIGN_OBSERVERS.length - 1; i >= 0; i--) {
+    const st = VALIGN_OBSERVERS[i];
+    if (!st) { VALIGN_OBSERVERS.splice(i, 1); continue; }
+    if (!st.host || st.host.isConnected === false) disconnectValignObserver(st.host);
+  }
+}
+
+/**
+ * 防抖地重算一次 valign。
+ * 16ms 定时器与下一帧赛跑，谁先到算谁的：headless / 页面不可见时
+ * requestAnimationFrame 可能长期不投递，只靠帧会永远排不上。
+ */
+function scheduleValignApply(host) {
+  const st = host && host.__bmValignObs;
+  if (!st || st.pending) return false;
+  st.pending = true;
+  const fire = () => {
+    if (!st.pending) return;                        // 另一路先到，这一路作废
+    st.pending = false;
+    if (st.timer) { try { clearTimeout(st.timer); } catch (e) { /* ignore */ } st.timer = 0; }
+    if (st.raf) {
+      const win = windowOf(host);
+      try {
+        if (win && typeof win.cancelAnimationFrame === 'function') win.cancelAnimationFrame(st.raf);
+        else if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(st.raf);
+      } catch (e) { /* ignore */ }
+      st.raf = 0;
+    }
+    if (host.isConnected === false) { disconnectValignObserver(host); return; }
+    const cfg = st.cfg || host.__bmCfg;
+    if (!cfg) return;
+    try { applyValignLayout(host, cfg, true); } catch (e) { /* ignore */ }
+  };
+  try { st.timer = setTimeout(fire, VALIGN_DEBOUNCE_MS); } catch (e) { st.timer = 0; }
+  const win = windowOf(host);
+  if (win && typeof win.requestAnimationFrame === 'function') {
+    try { st.raf = win.requestAnimationFrame(fire); } catch (e) { st.raf = 0; }
+  }
+  if (!st.timer && !st.raf) fire();                 // 两边都排不上：当场算
+  return true;
+}
+
+/**
+ * 给宿主挂一个只盯尺寸的观察器，同一个宿主只挂一个（重复调用直接返回）。
+ *
+ * 观察宿主自己而不是父级 .cm-embed-block：浮动让父级高度塌成 0，那个 0 不随图高
+ * 变化；宿主自身的高度就是图高，自校准改高时它会回调。
+ * 观察器的首次回调天然就是「挂载后第一次」的兜底：observe 之后浏览器会投递一次。
+ *
+ * @returns {{host:Object, ro:Object, fired:number}|null}
+ */
+function ensureValignObserver(host, cfg) {
+  if (!host || typeof host !== 'object') return null;
+  const has = host.__bmValignObs;
+  if (has && has.ro) { has.cfg = cfg || has.cfg; return has; }   // 只挂一个，重复调用不叠加
+  if (typeof ResizeObserver === 'undefined') return null;
+  pruneValignObservers();
+  const st = { host, ro: null, fired: 0, pending: false, timer: 0, raf: 0, cfg: cfg || null };
+  try {
+    st.ro = new ResizeObserver(() => {
+      st.fired++;
+      if (host.isConnected === false) { disconnectValignObserver(host); return; }
+      scheduleValignApply(host);
+    });
+  } catch (e) { return null; }
+  try {
+    st.ro.observe(host);
+  } catch (e) {
+    try { st.ro.disconnect(); } catch (err) { /* ignore */ }
+    return null;
+  }
+  host.__bmValignObs = st;
+  VALIGN_OBSERVERS.push(st);
+  return st;
+}
+
+/**
+ * 首次挂载：宿主还没插进 .cm-content 时补拍（120 / 480 / 1200ms 各一次）。
+ * 同一个宿主只排一轮；补拍成功就撤掉剩下的。上限就是这三拍，不排第四拍。
+ *
+ * @returns {number} 这一轮排了几拍
+ */
+function scheduleValignRetries(host, cfg) {
+  if (!host || host.__bmValignRetry) return 0;
+  const st = { timers: [] };
+  host.__bmValignRetry = st;
+  for (let i = 0; i < VALIGN_RETRY_DELAYS.length; i++) {
+    const last = i === VALIGN_RETRY_DELAYS.length - 1;
+    try {
+      st.timers.push(setTimeout(() => {
+        if (!host.__bmValignRetry) return;          // 已经连上 / 已复位，这一拍作废
+        try { applyValignLayout(host, cfg, true); } catch (e) { /* ignore */ }
+        if (last) clearValignRetries(host);         // 最后一拍：成没成都不再排
+      }, VALIGN_RETRY_DELAYS[i]));
+    } catch (e) { /* 排不上就算了，还有后面的拍 */ }
+  }
+  return st.timers.length;
+}
+
+/** 撤掉还排着的首次补拍 */
+function clearValignRetries(host) {
+  const st = host && host.__bmValignRetry;
+  if (!st) return 0;
+  host.__bmValignRetry = null;
+  for (let i = 0; i < st.timers.length; i++) {
+    try { clearTimeout(st.timers[i]); } catch (e) { /* ignore */ }
+  }
+  st.timers.length = 0;
+  return 1;
 }
 
 /**
@@ -1348,4 +1538,10 @@ module.exports = {
   measureLineHeight,
   measureTitleCenter,
   applyValignLayout,
+  ensureValignObserver,
+  disconnectValignObserver,
+  pruneValignObservers,
+  scheduleValignRetries,
+  clearValignRetries,
+  VALIGN_RETRY_DELAYS,
 };
