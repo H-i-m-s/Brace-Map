@@ -92,6 +92,9 @@ function makeNode(rawBody, forceBox) {
   return fillNode({
     text: '', runs: [], segRuns: [[]], raw: '',
     children: [], forceBox: !!forceBox,
+    // 这个节点前面隔着几个空行（0 = 紧挨上一个兄弟）。布局按它把「空行」
+    // 换成实打实的一行高度，见 layout.js 的 siblingGap。
+    gapBefore: 0,
   }, rawBody);
 }
 
@@ -112,9 +115,12 @@ function parseSource(source) {
   let width = 0;                 // 浮动时的宽度（px）；0 = 按图自身宽
   let bg = '';                   // PNG 底色；空 = 透明（默认）
   let firstContentSeen = false;
+  // 连续空行的计数。碰到下一条列表项时结算到那个节点的 gapBefore 上；
+  // 碰到指令、续行或任何被忽略的行，计数清零（空行只隔开紧邻的两个节点）。
+  let blankRun = 0;
 
   for (const raw of lines) {
-    if (!raw.trim()) continue;
+    if (!raw.trim()) { blankRun++; continue; }
     const isFirst = !firstContentSeen;
     firstContentSeen = true;
     const indent = leadingIndent(raw);
@@ -135,10 +141,23 @@ function parseSource(source) {
       const node = makeNode(body, forceBox);
       // 行内本来就没内容 → 空节点（纯分叉点）；
       // 有内容但被清洗空了（例如只有 ** ）→ 当作无效行跳过
-      if (!node.text && body.trim() !== '') continue;
+      if (!node.text && body.trim() !== '') { blankRun = 0; continue; }
       while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
-      if (stack.length) stack[stack.length - 1].node.children.push(node);
-      else roots.push(node);
+      /*
+       * 空行的归属：算在「较浅的那一层」，也就是新节点和它上一个同级兄弟之间。
+       *
+       * 弹栈之后 stack 顶就是新节点的父节点（没有就是根列表），它一定是
+       * 上一个节点自己的祖先之一 —— stack 本来就是上一个节点的祖先链，
+       * 所以这一层恰好是两者最浅的共同层级：
+       *   - A1 / A3 之间空行   → 父节点是 A，记在 A 的子项间距上
+       *   - A 的末尾 / B 之间空行 → 父节点是根，记在根列表上，不牵扯 A1、B1
+       * 多层嵌套下这条规则都由同一个 pop 结果决定，不会出现两解。
+       */
+      const siblings = stack.length ? stack[stack.length - 1].node.children : roots;
+      // 前面没有兄弟 = 自己是父节点的第一个子项，没有东西要隔开，空行丢掉
+      if (blankRun > 0 && siblings.length > 0) node.gapBefore = blankRun;
+      blankRun = 0;
+      siblings.push(node);
       stack.push({ node, indent });
       continue;
     }
@@ -148,6 +167,7 @@ function parseSource(source) {
       const hm = raw.trim().match(HEAD_RE);
       if (hm) {
         titleHash = cleanInline(hm[1]);
+        blankRun = 0;
         continue;
       }
     }
@@ -202,16 +222,29 @@ function parseSource(source) {
         // PNG 导出底色：不写 = 透明（默认）；theme = 取主题底色；其余当颜色值
         bg = val;
       }
+      blankRun = 0;
       continue;
     }
 
-    // 续行（软换行）：并进上一个节点，重新走一遍行内解析
+    /*
+     * 续行（软换行）：并进上一个节点，重新走一遍行内解析。
+     *
+     * 节点内部（续行之间）的空行直接丢掉，不在文字里留空行。理由：
+     *   1) fillNode 本来就把「空段」过滤掉（<br> 在行首/行尾/连写时不留空行），
+     *      想留空行就得改这条更基础的规则；
+     *   2) 留空行会多出一个空 tspan 行，n.lineCount、节点高、data-seq 的
+     *      几何全都跟着变，这正是这次要避免的「空行影响既有几何」；
+     *   3) 节点的行数语义一直是「每行都有字」（<br> 连写都不留空行），在这里单开
+     *      一个例外，同一个空行在图中会随位置变出两种效果。
+     */
     if (deeper) {
+      blankRun = 0;
       fillNode(prev.node, joinContinuation(prev.node.raw, raw));
       continue;
     }
 
     // 4) 其余忽略
+    blankRun = 0;
   }
 
   return {

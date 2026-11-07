@@ -22,10 +22,31 @@ const { braceGeom, geomToD } = require('./brace');
  *   cSize     = 节点在 cross 上的子树总占位，只用于兄弟排布与居中
  * ============================================================ */
 
-function childrenTotal(node, rowGap) {
+/*
+ * 兄弟之间的纵向（cross 上）间距。
+ *
+ * 默认就是 rowGap；节点前面记着 gapBefore 个空行时，一个空行再加一整行 lineH。
+ * 「一行」的高度取 lineH（= fontSize × OPT.lineHRatio），不取 rowGap：
+ *   - lineH 是「文字行高」，多行节点内部换一行的行距也是它（渲染时 tspan dy = lineH），
+ *     所以空一行看起来就是文字跳过一行，两把尺子同一刻度；
+ *   - rowGap = 0.4 × lineH 只是兄弟之间那道固定的呼吸间隙，拿它当「行」会让
+ *     空行比文字行矮一半，连空两行时与真实行的差距会越拉越开。
+ */
+function siblingGap(child, rowGap, lineH) {
+  const n = child && Number.isFinite(child.gapBefore) && child.gapBefore > 0
+    ? child.gapBefore
+    : 0;
+  return rowGap + n * lineH;
+}
+
+function childrenTotal(node, rowGap, lineH) {
   let sum = 0;
-  for (const c of node.children) sum += c.cSize;
-  return sum + rowGap * (node.children.length - 1);
+  for (let i = 0; i < node.children.length; i++) {
+    const c = node.children[i];
+    sum += c.cSize;
+    if (i > 0) sum += siblingGap(c, rowGap, lineH);
+  }
+  return sum;
 }
 
 /** 一段文字的宽度：与 wrap 里 append 的口径一致（逐 run 累加，量不出来按 0） */
@@ -212,7 +233,7 @@ function layoutTree(roots, opts) {
       if (n.children.length) {
         sizeAll(n.children, depth + 1);
         n.mSize = n.selfMain;
-        n.cSize = Math.max(n.selfCross, childrenTotal(n, rowGap));
+        n.cSize = Math.max(n.selfCross, childrenTotal(n, rowGap, lineH));
       } else {
         n.mSize = n.selfMain;
         n.cSize = n.selfCross;
@@ -227,16 +248,20 @@ function layoutTree(roots, opts) {
   // 2) 摆位（后序）：先把子节点排进父节点槽位，再用首末子节点中点定父节点
   const placeAll = (list, mStart, cStart) => {
     let c = cStart;
+    let first = true;
     for (const n of list) {
+      // 间距只在这里加（与 childrenTotal 同一把尺子），节点自身高度不变
+      if (!first) c += siblingGap(n, rowGap, lineH);
+      first = false;
       n.main = mStart + n.mSize / 2;
       const slotStart = c;
       const slotEnd = c + n.cSize;
       n.crossStart = slotStart;
       n.crossEnd = slotEnd;
-      c = slotEnd + rowGap;
+      c = slotEnd;
 
       if (n.children.length) {
-        const total = childrenTotal(n, rowGap);
+        const total = childrenTotal(n, rowGap, lineH);
         // 子块在槽位里居中（槽位可能比子块宽，因为父节点自身更宽）
         placeAll(n.children, mStart + n.mSize + levelGap, slotStart + (n.cSize - total) / 2);
         const kids = n.children;
