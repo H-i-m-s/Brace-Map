@@ -168,6 +168,19 @@
   overflow-x: auto;
 }
 
+/*
+  编辑模式浮动时，图要从 widget 的顶边开始，不能带任何上边距。
+
+  两层都要归零：宿主自己那层由 applyFloatLayout 写成 margin-top: 0；
+  内层 .brace-map-block 还有 0.9em（约 15px），而宿主浮动后自成格式化
+  上下文，这条 margin 不会塌陷出去，会实打实地把 SVG 顶下去。
+
+  只限定在编辑模式：阅读视图里这 15px 是图与正文之间的呼吸，去掉会贴顶。
+*/
+.markdown-source-view.mod-cm6 .bm-floated .brace-map-block {
+  margin-top: 0;
+}
+
 /* SVG 默认 max-width: none，会顶住宿主的 width 不让缩。
    浮动时放开，让图跟着宿主宽度走。 */
 .bm-floated .brace-map-svg {

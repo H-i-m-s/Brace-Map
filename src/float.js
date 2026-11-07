@@ -943,11 +943,11 @@ function applyFloatLayout(host, cfg) {
 
   if (mode === 'left') {
     put('float', 'left');
-    put('margin', '0.5rem 1rem 0.5rem 0');
+    put('margin', '0 1rem 0.5rem 0');
     put('clear', 'both');
   } else if (mode === 'right') {
     put('float', 'right');
-    put('margin', '0.5rem 0 0.5rem 1rem');
+    put('margin', '0 0 0.5rem 1rem');
     put('clear', 'both');
   } else if (mode === 'center') {
     // 居中不是 float：强制换行后自己居中，文字不环绕

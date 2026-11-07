@@ -56,8 +56,10 @@ function tApplyRight() {
   eq(host.style.float, 'right', 'float-apply: 右浮动');
   eq(host.style.width, '400px', 'float-apply: 宽度带上 px');
   eq(host.style.clear, 'both', 'float-apply: 清掉前面的浮动');
-  ok(/0\.5rem 0 0\.5rem 1rem/.test(host.style.margin),
-    'float-apply: 左边留出文字间距（与主题一致）', host.style.margin);
+  ok(/0 0 0\.5rem 1rem/.test(host.style.margin),
+    'float-apply: 左边留出文字间距、顶边贴齐 widget', host.style.margin);
+  ok(/^0\s/.test(host.style.margin.trim()),
+    'float-apply: margin-top 为 0，图从 widget 顶边开始', host.style.margin);
   ok(host.classList.has('bm-float-right'), 'float-apply: 打上方向类名');
 }
 
@@ -65,8 +67,10 @@ function tApplyLeft() {
   const host = fakeHost();
   I.applyFloatLayout(host, { float: 'left', width: 300 });
   eq(host.style.float, 'left', 'float-apply: 左浮动');
-  ok(/0\.5rem 1rem 0\.5rem 0/.test(host.style.margin),
-    'float-apply: 右边留出文字间距', host.style.margin);
+  ok(/0 1rem 0\.5rem 0/.test(host.style.margin),
+    'float-apply: 右边留出文字间距、顶边贴齐 widget', host.style.margin);
+  ok(/^0\s/.test(host.style.margin.trim()),
+    'float-apply: 左浮动同样 margin-top 为 0', host.style.margin);
 }
 
 function tApplyCenter() {
