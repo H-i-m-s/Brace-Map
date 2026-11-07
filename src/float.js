@@ -1226,11 +1226,19 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
    * 常常还是 false：代码块处理器拿到元素时，它还没被插进 .cm-content。
    * 量不到几何量就只能按 bottom 处理，但那样功能在真机上永远不生效。
    *
-   * 所以这里不是「补一帧就算了」：补拍 120/480/1200ms 各一次（与
-   * attachFloatWrap 同一套节奏，覆盖自校准的 0/60/250/1000ms），每个宿主
-   * 只排一轮，连上就把剩下的撤掉。之后交给尺寸观察器，不再有任何定时器。
+   * 这里判 .cm-content 而不是 .cm-editor：climbTo 最多爬 CLIMB_LIMIT(4) 层，
+   * 而真实链路是
+   *   host → .cm-embed-block → .cm-content → .cm-contentContainer → .cm-sizer
+   *   → .cm-scroller → .cm-editor
+   * 第 5 层只到 .cm-sizer，.cm-editor 还在上面两层，永远够不着。
+   * 之前写 .cm-editor 就是这个功能在真机上一次都没生效的真因。
+   * .cm-content 在第 3 层，既够得着，又同样能区分「在编辑区里」和阅读视图。
+   *
+   * 补拍 120/480/1200ms 各一次（与 attachFloatWrap 同一套节奏，覆盖自校准的
+   * 0/60/250/1000ms），每个宿主只排一轮，连上就把剩下的撤掉。之后交给尺寸
+   * 观察器，不再有任何定时器。
    */
-  if (!host.isConnected || !climbTo(host, 'cm-editor')) {
+  if (!host.isConnected || !climbTo(host, 'cm-content')) {
     scheduleValignRetries(host, cfg);
     return 0;
   }

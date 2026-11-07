@@ -13,7 +13,7 @@
  *   - valignOffset(h, H, yTitle, valign) 的数值与三个退化口子
  *   - 行高取自 computed line-height，其次兄弟 .cm-line，最后 fontSize × lineHRatio
  *   - yTitle 来自根节点文字的 bbox，多个根取平均
- *   - 四个前置条件（float / .cm-editor / bm-floated / 已连进文档）
+ *   - 四个前置条件（float / .cm-content / bm-floated / 已连进文档）
  *   - 偏移走 setInlineStyle，顺序排在 margin 简写之后，resetFloatLayout 能还原
  *   - 尺寸观察器：算出偏移后只挂一个；尺寸变了才重算（防抖）；
  *     宿主被移除 / 复位后断开；偏移没变不重写；未连接时按 120/480/1200 补拍
@@ -392,8 +392,12 @@ function tSkipModes() {
 }
 
 function tSkipNoEditor() {
-  const { host, embed, editor } = makeHost({ imgH: 151, rootTexts: [rootText(60, 30)] });
-  editor.classList._list.length = 0;          // 不在 .cm-editor 里（阅读视图）
+  const { host, embed, editor, content } = makeHost({ imgH: 151, rootTexts: [rootText(60, 30)] });
+  /* 阅读视图里既没有 .cm-editor 也没有 .cm-content。
+     两者都得抹掉：判定看的是 .cm-content（climbTo 只爬 4 层，
+     .cm-editor 在真实链路里够不着），只清 .cm-editor 测不出这个场景。 */
+  editor.classList._list.length = 0;
+  content.classList._list.length = 0;
   embed.nextElementSibling = fakeChain([{ cls: ['cm-line'], h: 48.29, lh: '48.29px' }]);
   eq(I.applyValignLayout(host, { float: 'right', valign: 'top' }), 0,
     'valign-skip: 不在编辑模式不偏移');
