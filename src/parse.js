@@ -111,7 +111,7 @@ function parseSource(source) {
   let titleHash = '';
   let maxWidth = 0;              // 节点文字折行宽度上限（SVG 坐标，px）；0 = 不折行
   let floatMode = '';            // 'left' | 'right' | 'center' | 'inline' | ''
-  let valign = 'top';            // 浮动图的垂直基准：'top' | 'middle' | 'bottom'
+  let valign = 'bottom';          // 图相对所在行的垂直基准：'top' | 'middle' | 'bottom'（默认下）
   let width = 0;                 // 浮动时的宽度（px）；0 = 按图自身宽
   let bg = '';                   // PNG 底色；空 = 透明（默认）
   let firstContentSeen = false;
@@ -211,9 +211,11 @@ function parseSource(source) {
         else if (v === 'c' || v === 'center' || v === 'centre') floatMode = 'center';
         else if (v === 'inl' || v === 'inline') floatMode = 'inline';
       } else if (key === 'valign') {
-        // 浮动图的垂直基准：只认三个词，写错就回落到默认的 top
+        // 图相对「图片所在行」的垂直基准，只认三个词：
+        //   下 bottom（默认）= 图顶对齐行顶，上 top = 图底对齐行，中 middle = 标题中心对齐行中心
+        // 写错、写成 center 之类一律回落到默认的 bottom
         const v = val.toLowerCase();
-        valign = (v === 'middle' || v === 'bottom') ? v : 'top';
+        valign = (v === 'top' || v === 'middle') ? v : 'bottom';
       } else if (key === 'width') {
         // 浮动时用来定宽；不写就让图按自身宽度自然收缩
         const n = parseFloat(val);

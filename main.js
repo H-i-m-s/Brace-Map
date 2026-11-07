@@ -50,7 +50,7 @@ let CALIB_TOLERANCE, MAX_REBUILDS, readActualWidths, measureWidestLine, calibrat
 let applyFloatLayout, attachFloatWrap, resetFloat, floatify, pickContext,
   collectWrapTargets, applyWrapMargins, restoreWrapMargins, restoreStyles,
   setInlineStyle, elHeight, isLivePreview, FLOAT_GAP, CLIMB_LIMIT, WRAP_LIMIT, pxValue,
-  readMargins, applyValignLayout, valignOffset, measureFollowTextHeight;
+  readMargins, applyValignLayout, valignOffset, measureLineHeight, measureTitleCenter;
 let classHas, climbTo;
 /* 图为什么看不见：裁剪链体检（只读，诊断命令用） */
 let CLIP_DEPTH, CLIP_HARD_STOP, styleOfEl, overflowClips, containClips, isClipHardStop,
@@ -1739,6 +1739,8 @@ __mods["src/float.js"] = function (module, exports, require) {
 const {
   dbg, dbgEl, dbgRect, dbgCss, dbgInlineAll, dbgChain,
 } = require('./debug.js');
+/* valign 量不到行高时的最后兜底要 fontSize × lineHRatio */
+const { OPT } = require('./opt.js');
 
 /* ============================================================
  * ★★★ 编辑模式（Live Preview）浮动总开关 ★★★
@@ -2722,10 +2724,17 @@ function resetFloatLayout(host) {
 }
 
 /* ============================================================
- * 垂直基准（valign）：只能在浮动状态下靠 margin-top 把图往下推
+ * 垂直基准（valign）：图相对「图片所在的那一行」上下挪
  *
- * 语义：图的顶边 / 中心 / 底边，分别对齐它旁边那段文字的顶边 / 中心 / 底边。
- * 所以 top 档是 0，middle / bottom 都是**正数**（往下推）。
+ * 参照物是**行**，不是图后面那段可绕排文字。按用户原话：
+ *   下 bottom（默认）：图片顶部对齐所在行 → 图就停在行顶，offset = 0
+ *   上 top：          图片底部对齐所在行 → offset = h - H（图高过行，负值，整体上移）
+ *   中 middle：       一级标题的中心对齐行中心 → offset = h / 2 - yTitle
+ *
+ * 三个量：
+ *   h      图片所在那一行的行高（正文行高，不是图高，也不是后面那段文字的总高）
+ *   H      图的高度（宿主 rect 高）
+ *   yTitle 一级标题文字在图内的垂直中心，相对图的顶边；有多个根节点时取平均
  *
  * 为什么非浮动时一个数都不能写：
  *   styles.css 给非浮动 widget 加了 display: flow-root（8daf8aa 修的
@@ -2742,73 +2751,185 @@ function resetFloatLayout(host) {
  * 所以「valign 只对 float: left / right 生效」不是妥协，是唯一安全的路径。
  * position: absolute 那条也不行：脱了浮动流，后面的文字立刻不绕排。
  *
- * 不做巡检：挂载那一刻量一次，量不到就按 top。编辑中后续文字高度会变，
+ * 不做巡检：挂载那一刻量一次，量不到就按 bottom。编辑中行高或标题位置变了，
  * 图不会跟着重排；重开笔记时重新量一次就回来了。没有 Observer、没有定时器。
  * ============================================================ */
 
 /**
- * 纯计算：按垂直基准算出 margin-top 该写的偏移（px，0 或正数）。
+ * 纯计算：按垂直基准算出 margin-top 该写的偏移（px）。
  *
- * textH 是图旁边那段可绕排文字的高度，imgH 是图自己的高度。
- * 图比文字段矮时才有可对齐的空间；文字更矮（或等高）时三种基准一律返回 0：
- * 不把图推到文字块外面去。
+ * bottom 恒为 0；top 把图整体上推 (H - h)；middle 把「一级标题中心」挪到行中心。
+ * 三个退化口子：
+ *   H 为 0（图没渲染出来）→ 一律 0
+ *   h 拿不到或为 0     → top / middle 都不做偏移（退化为 bottom）
+ *   yTitle 拿不到      → middle 退化为 0（即 bottom）
  *
- * @param {number} textH
- * @param {number} imgH
+ * @param {number} h        图片所在那一行的行高（正文行高）
+ * @param {number} imgH     图高（宿主 rect 高）
+ * @param {number} yTitle   一级标题在图内的垂直中心，相对图的顶边
  * @param {'top'|'middle'|'bottom'} valign
  * @returns {number}
  */
-function valignOffset(textH, imgH, valign) {
-  const t = Number(textH);
-  const h = Number(imgH);
-  if (!Number.isFinite(t) || !Number.isFinite(h)) return 0;
-  /*
-   * t 为 0 表示图后面压根没有可绕排的文字段（代码块在笔记末尾），
-   * 「对齐旁边那段文字」无从谈起，保持 top。
-   *
-   * 但 t > 0 且比图矮时不能返回 0：那正是图高于文字段的情形，
-   * 居中 / 靠下依旧有定义 —— 图要往上移，溢出的部分就是它在
-   * 段落上下两边均分（middle）或全堆在顶部（bottom）的结果。
-   * 早期版本在这里错写成「图比文字高就不推」，导致高图完全不吃
-   * valign，看起来像没生效。
-   */
-  if (!(t > 0)) return 0;
-  if (valign !== 'middle' && valign !== 'bottom') return 0;
-  const diff = t - h;
-  return valign === 'middle' ? diff / 2 : diff;
+function valignOffset(h, imgH, yTitle, valign) {
+  const line = Number(h);
+  const H = Number(imgH);
+  if (!Number.isFinite(line) || !Number.isFinite(H)) return 0;
+  if (!(H > 0)) return 0;                                 // 图没渲染出来：不动
+  if (valign !== 'top' && valign !== 'middle') return 0;  // bottom（默认）/ 非法值
+  if (!(line > 0)) return 0;                              // 行高量不到：退化为 bottom
+  if (valign === 'top') return line - H;
+  /* null / undefined 单独拦：Number(null) 是 0，会让「量不到标题」误当成「标题在顶边」 */
+  if (yTitle == null) return 0;
+  const y = Number(yTitle);
+  if (!Number.isFinite(y)) return 0;                      // 取不到标题位置：退化为 bottom
+  return line / 2 - y;
 }
 
 /**
- * 量「图旁边那段可绕排文字」的高度：从 .cm-embed-block 的下一个兄弟开始，
- * 只累加带 cm-line 的兄弟，碰到第一个不带 cm-line 的立刻停。
- *
- * 停下来的那条规则是必须的：再往后就是别的块（另一个 widget、代码块），
- * 它们不参与绕排，算进来只会把图推得太低。
+ * 读一个 computed 长度，只认能变成正数 px 的。
+ * line-height: normal 的计算值就是 'normal'，parseFloat 得 NaN，正好落到下一条兜底。
+ * 没有 defaultView / 假 DOM 读不到时同样返回 NaN。
  */
-function measureFollowTextHeight(embed) {
-  let el = embed && embed.nextElementSibling ? embed.nextElementSibling : null;
-  let acc = 0;
-  while (el) {
-    if (!classHas(el, 'cm-line')) break;
-    acc += elHeight(el);
+function computedPx(el, prop) {
+  if (!el) return NaN;
+  try {
+    const doc = el.ownerDocument;
+    const view = doc && doc.defaultView;
+    const cs = view && view.getComputedStyle ? view.getComputedStyle(el) : null;
+    if (!cs) return NaN;
+    const v = parseFloat(cs[prop]);
+    return Number.isFinite(v) && v > 0 ? v : NaN;
+  } catch (e) { return NaN; }
+}
+
+/**
+ * 量「图片所在那一行的行高」。
+ *
+ * 四个候选，按可信程度排：
+ *   1. 相邻 .cm-line（真的正文行元素）的 computed line-height：这是那一行自己的
+ *      CSS 行高，与旁边恰好排了什么无关。也不能只看 .cm-content：宿主是块 widget，
+ *      它自己不在 .cm-line 里，而 line-height 可能只写在 .cm-line 上。
+ *   2. 相邻 .cm-line 里一个行盒的高（块高 ÷ 行数）：浏览器真排出来的那一行。
+ *      元素 rect 高不能直接用：一个 .cm-line 是一段落，折两行就是两个行高。
+ *   3. 宿主所在层级（.cm-line 祖先，没有就 .cm-content）的 computed line-height。
+ *   4. fontSize × OPT.lineHRatio：连几何都量不到时的最后兜底。
+ * 都拿不到返回 0，调用方按「不做偏移」处理。
+ */
+function measureLineHeight(host) {
+  const sib = siblingLine(host);
+
+  const fromSib = computedPx(sib, 'lineHeight');
+  if (fromSib > 0) return fromSib;
+
+  const fromRow = sib ? rowHeightOf(sib) : 0;
+  if (fromRow > 0) return fromRow;
+
+  const anchor = climbTo(host, 'cm-line', CLIMB_LIMIT) || climbTo(host, 'cm-content', CLIMB_LIMIT);
+  const fromAnchor = computedPx(anchor, 'lineHeight');
+  if (fromAnchor > 0) return fromAnchor;
+
+  const fs = computedPx(sib, 'fontSize') || computedPx(anchor, 'fontSize');
+  return fs > 0 ? fs * OPT.lineHRatio : 0;
+}
+
+/**
+ * 一个 .cm-line 里「一行行盒」的高度。
+ *
+ * 不能直接用元素 rect 高：CM6 里一个 .cm-line 是一段落，长文会折成好几行，
+ * 元素高 = 行数 × 行高（headless 实测：折两行那段 rect 是 63px，行高 31.5px）。
+ * 做法：用 Range 数它内部有几个视觉行（按顶边去重），再用块高除以行数。
+ * 没 Range（假 DOM / 旧环境）或数不出行数时退回整块高。
+ */
+function rowHeightOf(el) {
+  const blockH = elHeight(el);
+  if (!(blockH > 0)) return 0;
+  try {
+    const doc = el && el.ownerDocument;
+    if (doc && typeof doc.createRange === 'function') {
+      const rng = doc.createRange();
+      rng.selectNodeContents(el);
+      const rects = typeof rng.getClientRects === 'function' ? rng.getClientRects() : null;
+      if (rects && rects.length) {
+        const tops = [];
+        for (let i = 0; i < rects.length; i++) {
+          const r = rects[i];
+          if (!r || !(r.height > 0)) continue;
+          const t = Math.round(r.top * 10) / 10;
+          if (tops.indexOf(t) < 0) tops.push(t);
+        }
+        if (tops.length > 1) return blockH / tops.length;
+      }
+    }
+  } catch (e) { /* 数不出行数就退回整块高 */ }
+  return blockH;
+}
+
+/**
+ * 找一个「真正的正文行」：离宿主最近的兄弟 .cm-line。
+ * 先往后（图下方那行就是图片所在行），图在笔记末尾时再往前。
+ * 只看元素本身，不量尺寸——调用方自己决定要它的 computed 还是行盒高。
+ */
+function siblingLine(host) {
+  const line = climbTo(host, 'cm-line', CLIMB_LIMIT);
+  const anchor = line || (host && host.parentElement) || null;
+  if (!anchor) return null;
+
+  let el = anchor.nextElementSibling;
+  for (let i = 0; el && i < WRAP_LIMIT; i++) {
+    if (classHas(el, 'cm-line')) return el;
     el = el.nextElementSibling;
   }
-  return acc;
+  el = anchor.previousElementSibling;
+  for (let i = 0; el && i < WRAP_LIMIT; i++) {
+    if (classHas(el, 'cm-line')) return el;
+    el = el.previousElementSibling;
+  }
+  return null;
 }
 
 /**
- * 按 cfg.valign 给编辑模式里的浮动图写垂直偏移（正的 margin-top，把图往下推）。
+ * 量一级标题（cfg.roots 的根节点，不是 title: 指令那个图题）在图内的垂直中心，
+ * 单位是相对宿主顶边（= 图顶边）的距离。
+ *
+ * 根节点的 <text> 在渲染时带 data-bm-root（见 src/svg.js）。量的是它自己的 bbox，
+ * 所以缩放、题图 <g transform> 的偏移、方向映射全都自动含进去了，
+ * 不需要再把 layout 的 SVG 坐标换算回宿主坐标。
+ * 多行根节点取整块文字的 bbox 中心；多个根取平均；一个都量不到返回 NaN。
+ */
+function measureTitleCenter(host) {
+  if (!host || typeof host.querySelectorAll !== 'function') return NaN;
+  let roots = null;
+  try { roots = host.querySelectorAll('[data-bm-root]'); } catch (e) { return NaN; }
+  if (!roots || !roots.length) return NaN;
+  const hr = rectOf(host);
+  if (!hr) return NaN;
+
+  let sum = 0;
+  let n = 0;
+  for (let i = 0; i < roots.length; i++) {
+    const r = rectOf(roots[i]);
+    if (!r || !(r.height > 0)) continue;      // 纯公式根节点文字框可能是空的
+    sum += (r.top + r.height / 2) - hr.top;
+    n++;
+  }
+  return n ? sum / n : NaN;
+}
+
+/**
+ * 按 cfg.valign 给编辑模式里的浮动图写垂直偏移（正的 margin-top 往下推，负的往上提）。
  *
  * 四个前置条件缺一不可：
- *   - cfg.float 是 left / right（center / inline 不浮动，没有可对齐对象）
+ *   - cfg.float 是 left / right（center / inline 不浮动，没有可对齐的基准）
  *   - 宿主在 .cm-editor 里（阅读视图那条 floatify / applyWrapMargins 一行不碰）
  *   - 宿主已经带上 bm-floated（说明那一行 float 真的写上了）
- *   - 宿主连在文档上、量得到文字高度（否则按 top，不重试）
+ *   - 宿主连在文档上（否则补一帧再试，量不到就按 bottom）
  *
  * 写样式走 setInlineStyle 并记进 host.__bmFloatLayout：那份账归
  * resetFloatLayout 统一还原，复位后不会留下写死的 margin-top。
  * 顺序上 applyFloatLayout 先写 margin 简写（margin-top: 0），这里再写
  * margin-top 长属性，长属性覆盖简写里的那一段，不会被吃掉。
+ *
+ * bottom 档算出来恒为 0，一个样式都不写（简写里的 margin-top 本来就是 0）。
  *
  * @returns {number} 写下去的偏移量（0 表示没动样式）
  */
@@ -2821,7 +2942,7 @@ function applyValignLayout(host, cfg, retried) {
   /*
    * 要不要在编辑模式里、宿主有没有挂进文档，这两件事在渲染那一刻都
    * 常常还是 false：代码块处理器拿到元素时，它还没被插进 .cm-content。
-   * 量不到几何量就只能按 top 处理，但那样功能在真机上永远不生效。
+   * 量不到几何量就只能按 bottom 处理，但那样功能在真机上永远不生效。
    *
    * 这里只给自己一帧的机会：下一帧再试一次，试完就算。不是巡检、
    * 不是重试循环，也不会因为失败而排新的帧。
@@ -2837,7 +2958,10 @@ function applyValignLayout(host, cfg, retried) {
     return 0;
   }
 
-  const info = { valign: cfg.valign || 'top', textH: 0, imgH: 0, offset: 0, applied: false };
+  const info = {
+    valign: cfg.valign || 'bottom',
+    lineH: 0, imgH: 0, yTitle: null, offset: 0, applied: false,
+  };
   host.__bmValignInfo = info;
 
   /* 同一宿主重复调用：先把上一轮的 margin-top 从账上摘掉，避免叠出两条记录。
@@ -2854,12 +2978,15 @@ function applyValignLayout(host, cfg, retried) {
   }
 
   const embed = host.parentElement;
-  if (!embed || host.isConnected === false) return 0;   // 还没挂进文档：当 top
+  if (!embed || host.isConnected === false) return 0;   // 还没挂进文档：当 bottom
 
   info.imgH = round2(elHeight(host));
-  info.textH = round2(measureFollowTextHeight(embed));
-  // textH 为 0（挂载那一刻还没排出文字）时 valignOffset 会返回 0，即 top
-  const offset = valignOffset(info.textH, info.imgH, info.valign);
+  info.lineH = round2(measureLineHeight(host));
+  const y = measureTitleCenter(host);
+  info.yTitle = Number.isFinite(y) ? round2(y) : null;
+
+  // 行高量不到（0）或 yTitle 取不到（null）时，valignOffset 自己退化为 0
+  const offset = valignOffset(info.lineH, info.imgH, info.yTitle, info.valign);
   if (!offset) return 0;
 
   info.offset = round2(offset);
@@ -2890,7 +3017,7 @@ function reapplyLivePreviewFloatLayout(doc) {
     if (!host.__bmCfg) return 0;
     applyFloatLayout(host, host.__bmCfg);
     /* 重写 float 时旧账（含 valign 的 margin-top）已整体还原，这里补写回去；
-     * 不补的话，设置页把开关关一次再开，图就永远停在 top 档。 */
+     * 不补的话，设置页把开关关一次再开，图就永远停在 bottom 档。 */
     if (typeof applyValignLayout === 'function') applyValignLayout(host, host.__bmCfg);
     return 1;
   });
@@ -2949,7 +3076,8 @@ module.exports = {
   attachFloatWrap,
   applyFloatLayout,
   valignOffset,
-  measureFollowTextHeight,
+  measureLineHeight,
+  measureTitleCenter,
   applyValignLayout,
 };
 
@@ -4509,7 +4637,7 @@ function parseSource(source) {
   let titleHash = '';
   let maxWidth = 0;              // 节点文字折行宽度上限（SVG 坐标，px）；0 = 不折行
   let floatMode = '';            // 'left' | 'right' | 'center' | 'inline' | ''
-  let valign = 'top';            // 浮动图的垂直基准：'top' | 'middle' | 'bottom'
+  let valign = 'bottom';          // 图相对所在行的垂直基准：'top' | 'middle' | 'bottom'（默认下）
   let width = 0;                 // 浮动时的宽度（px）；0 = 按图自身宽
   let bg = '';                   // PNG 底色；空 = 透明（默认）
   let firstContentSeen = false;
@@ -4609,9 +4737,11 @@ function parseSource(source) {
         else if (v === 'c' || v === 'center' || v === 'centre') floatMode = 'center';
         else if (v === 'inl' || v === 'inline') floatMode = 'inline';
       } else if (key === 'valign') {
-        // 浮动图的垂直基准：只认三个词，写错就回落到默认的 top
+        // 图相对「图片所在行」的垂直基准，只认三个词：
+        //   下 bottom（默认）= 图顶对齐行顶，上 top = 图底对齐行，中 middle = 标题中心对齐行中心
+        // 写错、写成 center 之类一律回落到默认的 bottom
         const v = val.toLowerCase();
-        valign = (v === 'middle' || v === 'bottom') ? v : 'top';
+        valign = (v === 'top' || v === 'middle') ? v : 'bottom';
       } else if (key === 'width') {
         // 浮动时用来定宽；不写就让图按自身宽度自然收缩
         const n = parseFloat(val);
@@ -4679,6 +4809,18 @@ const { nodeHasMath, mathGroupMarkup } = require('./math');
 /* ============================================================
  * 出图（纯字符串，便于 selftest 无 DOM 调用）
  * ============================================================ */
+
+/**
+ * 根节点（cfg.roots 的第一层）在文字上加一个 data-bm-root 标记。
+ *
+ * valign: middle 要靠它把「一级标题在图内的垂直中心」量出来：直接读这个元素的
+ * bbox 即可，缩放、题图 <g transform> 的偏移、方向映射全含在 bbox 里。
+ * 用 data 属性而不是 class：test/helpers.js 与几个用例是按 `class="bm-text"`
+ * 这个前缀切标记的，多一个 class 会把它们的解析打断。
+ */
+function rootAttr(n) {
+  return n && n.depth === 0 ? ' data-bm-root="1"' : '';
+}
 
 /**
  * 文字锚点。
@@ -4758,7 +4900,7 @@ function mathNodeMarkup(n, p, m) {
 
   const text = '<text class="bm-text" x="' + num(p.x) + '" y="' + num(firstCenter + shift) + '"'
     + ' text-anchor="start" data-seq="' + num(n.seq) + '" data-math="1"'
-    + ' dominant-baseline="alphabetic">' + spans.join('') + '</text>';
+    + ' dominant-baseline="alphabetic"' + rootAttr(n) + '>' + spans.join('') + '</text>';
 
   return text + groups.join('');
 }
@@ -4815,13 +4957,13 @@ function svgMarkup(m) {
       }
       out.push(
         `<text class="bm-text" x="${num(p.x)}" y="${num(firstY)}"`
-        + ` text-anchor="${p.anchor}" data-seq="${num(n.seq)}" dominant-baseline="central">${spans.join('')}</text>`
+        + ` text-anchor="${p.anchor}" data-seq="${num(n.seq)}" dominant-baseline="central"${rootAttr(n)}>${spans.join('')}</text>`
       );
       continue;
     }
     out.push(
       `<text class="bm-text" x="${num(p.x)}" y="${num(n.y)}"`
-      + ` text-anchor="${p.anchor}" data-seq="${num(n.seq)}" dominant-baseline="central">${renderRuns(n.runs, n.text)}</text>`
+      + ` text-anchor="${p.anchor}" data-seq="${num(n.seq)}" dominant-baseline="central"${rootAttr(n)}>${renderRuns(n.runs, n.text)}</text>`
     );
   }
 
@@ -5751,7 +5893,8 @@ function loadModules() {
   ({ FLOAT_GAP, CLIMB_LIMIT, WRAP_LIMIT, pxValue, elHeight, collectWrapTargets,
      setInlineStyle, restoreStyles, applyWrapMargins, restoreWrapMargins, readMargins,
      isLivePreview, pickContext, floatify, resetFloat, attachFloatWrap,
-     applyFloatLayout, classHas, climbTo, applyValignLayout, valignOffset, measureFollowTextHeight,
+     applyFloatLayout, classHas, climbTo, applyValignLayout, valignOffset,
+     measureLineHeight, measureTitleCenter,
      CLIP_DEPTH, CLIP_HARD_STOP, styleOfEl, overflowClips, containClips, isClipHardStop,
      clipNodeInfo, clipChainOf, visibilityReport,
      LP_FLOAT, isLpFloatEnabled, setLpFloatEnabled,
@@ -6008,10 +6151,11 @@ async function renderBraceMap(source, host, opts) {
   dbgFloatState(host, 'render.mounted');
 
   /*
-   * 垂直基准：只对 float: left / right 生效，而且只在编辑模式下。
+   * 垂直基准：图相对「图片所在那一行」上下挪，只对 float: left / right 生效，
+   * 而且只在编辑模式下。
    * 必须排在 applyFloatLayout（那一行 margin 简写）之后：这里写的是 margin-top
    * 长属性，长属性覆盖简写，顺序反了就会被简写里的 margin-top: 0 吃掉。
-   * 量不到后续文字（还没排好 / 在阅读视图里）就按 top，不重试。
+   * 宿主还没挂进文档时自己补一帧，量不到行高就按 bottom（默认）。
    */
   applyValignLayout(host, cfg);
   dbgFloatState(host, 'render.valign');
@@ -6492,10 +6636,10 @@ class BraceMapPlugin extends Plugin {
       }
 
       /*
-       * 垂直基准（valign）：只有浮动宿主会写负 margin-top，而且只在编辑模式。
-       * 这里把「配置的基准、量到的两个高度、真正写下去的 margin-top、
-       * embed 的 rect 高」四样并排摆出来 —— 浮动生效时 embed 高必须是 0，
-       * 不是 0 就说明负 margin 影响了 widget 的记账，光标会错位。
+       * 垂直基准（valign）：图相对「图片所在那一行」上下挪。
+       * 这里把「配置的基准、行高 / 图高 / 一级标题中心、真正写下的 margin-top、
+       * embed 的 rect 高」并排摆出来 —— 浮动生效时 embed 高必须是 0，
+       * 不是 0 就说明 margin 影响了 widget 的记账，光标会错位。
        */
       const vi = host.__bmValignInfo || null;
       const cfgHost = host.__bmCfg || null;
@@ -6503,10 +6647,12 @@ class BraceMapPlugin extends Plugin {
       push('- valign：' + valignTxt
         + '（float ' + (cfgHost && cfgHost.float ? cfgHost.float : '无') + '）');
       if (vi) {
-        push('- valign 量到的 textH / imgH：' + num(vi.textH) + ' / ' + num(vi.imgH)
-          + ' px（差值 ' + signed(vi.textH - vi.imgH) + '）');
+        push('- valign 量到的 行高 / 图高：' + num(vi.lineH) + ' / ' + num(vi.imgH)
+          + ' px（行高是正文行高，不是图高）');
+        push('- valign 量到的一级标题中心 yTitle：'
+          + (vi.yTitle == null ? '（未取到 / 没有根节点）' : num(vi.yTitle) + ' px（相对图顶边）'));
       } else {
-        push('- valign 量到的 textH / imgH：（没有记录：这次挂载没走 applyValignLayout）');
+        push('- valign 量到的 行高 / 图高：（没有记录：这次挂载没走 applyValignLayout）');
       }
       push('- valign 写下的 margin-top：'
         + (host.style && host.style.marginTop ? host.style.marginTop : '（未写）')
@@ -6807,9 +6953,10 @@ function buildInternals() {
   resetFloatLayout,
   clearLivePreviewFloatLayout,
   reapplyLivePreviewFloatLayout,
-  // 垂直基准（只对浮动生效）：纯计算、测量、写偏移
+  // 垂直基准（只对浮动生效）：纯计算、量行高、量一级标题位置、写偏移
   valignOffset,
-  measureFollowTextHeight,
+  measureLineHeight,
+  measureTitleCenter,
   applyValignLayout,
   DEFAULT_SETTINGS,
   // 临时诊断（Live Preview 图文混排）：默认关闭；自测用 dbgSetEnabled(true) 打开

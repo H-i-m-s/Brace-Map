@@ -14,6 +14,18 @@ const { nodeHasMath, mathGroupMarkup } = require('./math');
  * ============================================================ */
 
 /**
+ * 根节点（cfg.roots 的第一层）在文字上加一个 data-bm-root 标记。
+ *
+ * valign: middle 要靠它把「一级标题在图内的垂直中心」量出来：直接读这个元素的
+ * bbox 即可，缩放、题图 <g transform> 的偏移、方向映射全含在 bbox 里。
+ * 用 data 属性而不是 class：test/helpers.js 与几个用例是按 `class="bm-text"`
+ * 这个前缀切标记的，多一个 class 会把它们的解析打断。
+ */
+function rootAttr(n) {
+  return n && n.depth === 0 ? ' data-bm-root="1"' : '';
+}
+
+/**
  * 文字锚点。
  * 带框节点统一用 middle + 节点中心：框宽 = 文字宽 + 2*boxPadX，只要文字宽度
  * 有一点测量误差，start/end 锚点就会把误差全堆到一侧（一边贴框线、一边宽留白）；
@@ -91,7 +103,7 @@ function mathNodeMarkup(n, p, m) {
 
   const text = '<text class="bm-text" x="' + num(p.x) + '" y="' + num(firstCenter + shift) + '"'
     + ' text-anchor="start" data-seq="' + num(n.seq) + '" data-math="1"'
-    + ' dominant-baseline="alphabetic">' + spans.join('') + '</text>';
+    + ' dominant-baseline="alphabetic"' + rootAttr(n) + '>' + spans.join('') + '</text>';
 
   return text + groups.join('');
 }
@@ -148,13 +160,13 @@ function svgMarkup(m) {
       }
       out.push(
         `<text class="bm-text" x="${num(p.x)}" y="${num(firstY)}"`
-        + ` text-anchor="${p.anchor}" data-seq="${num(n.seq)}" dominant-baseline="central">${spans.join('')}</text>`
+        + ` text-anchor="${p.anchor}" data-seq="${num(n.seq)}" dominant-baseline="central"${rootAttr(n)}>${spans.join('')}</text>`
       );
       continue;
     }
     out.push(
       `<text class="bm-text" x="${num(p.x)}" y="${num(n.y)}"`
-      + ` text-anchor="${p.anchor}" data-seq="${num(n.seq)}" dominant-baseline="central">${renderRuns(n.runs, n.text)}</text>`
+      + ` text-anchor="${p.anchor}" data-seq="${num(n.seq)}" dominant-baseline="central"${rootAttr(n)}>${renderRuns(n.runs, n.text)}</text>`
     );
   }
 
