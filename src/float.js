@@ -990,100 +990,6 @@ function resetFloatLayout(host) {
   return n;
 }
 
-/* ============================================================
- * 垂直基准（valign）：只能靠负 margin-top 模拟
- *
- * 浮动元素没法垂直居中；换成 position: absolute 又会脱离浮动流，后面的文字
- * 立刻不绕排。所以只能「量出来再顶上去」：量出图高和它后面那段可绕排文字的
- * 高度，按基准算出该往上提多少，写进宿主的 margin-top。
- *
- * 有意不做巡检：编辑过程中后面的文字段高度会变，图不会跟着重排。允许不准，
- * 重开笔记时重新量一次就恢复。这里不加 MutationObserver、不加定时器、不加
- * rAF 循环，也不重试 —— 挂载那一刻量不到就按 top 处理。
- * ============================================================ */
-
-/**
- * 纯计算：按垂直基准算出 margin-top 该写的偏移（px，0 或负数）。
- *
- * textH 是图后面那段可绕排文字的高度，imgH 是图自己的高度。
- * 文字比图矮时没有可对齐的空间，三种基准一律返回 0：宁可贴顶，
- * 也不把图往下推（往下推会盖住后面本来该绕排的文字）。
- *
- * @param {number} textH
- * @param {number} imgH
- * @param {'top'|'middle'|'bottom'} valign
- * @returns {number}
- */
-function valignOffset(textH, imgH, valign) {
-  const t = Number(textH);
-  const h = Number(imgH);
-  if (!Number.isFinite(t) || !Number.isFinite(h)) return 0;
-  if (valign !== 'middle' && valign !== 'bottom') return 0;
-  const diff = t - h;
-  if (!(diff > 0)) return 0;
-  return valign === 'middle' ? -diff / 2 : -diff;
-}
-
-/**
- * 量「图后面那段可绕排文字」的高度：从 .cm-embed-block 的下一个兄弟开始，
- * 只累加带 cm-line 的兄弟，碰到第一个不带 cm-line 的就停。
- *
- * 停下来的那条规则是必须的：再往后就是别的块（另一个 widget、代码块），
- * 它们不参与绕排，算进来只会把图提得太高。
- */
-function measureFollowTextHeight(embed) {
-  let el = embed && embed.nextElementSibling ? embed.nextElementSibling : null;
-  let acc = 0;
-  while (el) {
-    if (!classHas(el, 'cm-line')) break;
-    acc += elHeight(el);
-    el = el.nextElementSibling;
-  }
-  return acc;
-}
-
-/**
- * 按 cfg.valign 给编辑模式里的浮动图写垂直偏移（负 margin-top）。
- *
- * 只对真正浮动的 left/right 生效；center/inline 本来就不浮动，valign 没有
- * 可对齐的对象。只对编辑模式（宿主在 .cm-editor 里）生效，阅读视图那条
- * floatify / applyWrapMargins 的路一行都不动。
- *
- * 写样式必须走 setInlineStyle 并记进 host.__bmFloatLayout：那份记录归
- * resetFloatLayout 统一还原，复位后不会留下写死的 margin-top。
- *
- * 不做重试：宿主还没连进文档、或量出来 textH 为 0，都当 top（偏移 0）处理。
- *
- * @returns {number} 写下去的偏移量（0 表示没动样式）
- */
-function applyValignLayout(host, cfg) {
-  if (!host || !host.style || !cfg) return 0;
-  const mode = cfg.float;
-  if (mode !== 'left' && mode !== 'right') return 0;
-  if (!climbTo(host, 'cm-editor')) return 0;       // 阅读视图 / 预览页：不碰
-  if (!classHas(host, 'bm-floated')) return 0;     // float 没真写上去时不能加偏移
-
-  const info = { valign: cfg.valign || 'top', textH: 0, imgH: 0, offset: 0 };
-  host.__bmValignInfo = info;
-
-  const embed = host.parentElement;
-  if (!embed || host.isConnected === false) return 0;   // 还没挂进文档：当 top
-
-  info.imgH = round2(elHeight(host));
-  info.textH = round2(measureFollowTextHeight(embed));
-  // textH 为 0（挂载那一刻还没排出文字）时 valignOffset 会返回 0，即 top
-  const offset = valignOffset(info.textH, info.imgH, info.valign);
-  if (!offset) return 0;
-
-  info.offset = round2(offset);
-  const rec = setInlineStyle(host, 'marginTop', info.offset + 'px');
-  if (rec) {
-    if (!Array.isArray(host.__bmFloatLayout)) host.__bmFloatLayout = [];
-    host.__bmFloatLayout.push(rec);
-  }
-  return offset;
-}
-
 /**
  * 把当前页编辑区里所有括号图宿主的 float 复位（开关关掉时用）。
  * 没有 document（自测 / 非浏览器环境）时返回 0，不报错。
@@ -1156,7 +1062,4 @@ module.exports = {
   resetFloat,
   attachFloatWrap,
   applyFloatLayout,
-  valignOffset,
-  measureFollowTextHeight,
-  applyValignLayout,
 };
