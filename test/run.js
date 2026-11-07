@@ -29,6 +29,7 @@ require('./link.test');
 require('./boxnode.test');
 require('./float.test');
 require('./floatwrap.test');
+require('./valign.test');
 require('./wrapdiag.test');
 require('./debug.test');
 

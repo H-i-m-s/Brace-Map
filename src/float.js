@@ -990,6 +990,130 @@ function resetFloatLayout(host) {
   return n;
 }
 
+/* ============================================================
+ * 垂直基准（valign）：只能在浮动状态下靠 margin-top 把图往下推
+ *
+ * 语义：图的顶边 / 中心 / 底边，分别对齐它旁边那段文字的顶边 / 中心 / 底边。
+ * 所以 top 档是 0，middle / bottom 都是**正数**（往下推）。
+ *
+ * 为什么非浮动时一个数都不能写：
+ *   styles.css 给非浮动 widget 加了 display: flow-root（8daf8aa 修的
+ *   外边距塌陷）。widget 自成 BFC 时，子元素的 margin-top 会直接参与父级
+ *   高度计算（负的减、正的加），widget 的 rect 跟着变，而 CM6 正是按 rect
+ *   记账的 —— 图挪了多少，光标就错多少。
+ *
+ * 为什么浮动时反而安全：
+ *   浮动状态下 styles.css 那条 flow-root 是关掉的（:not(:has(.bm-float-*))），
+ *   .cm-embed-block 里只剩一个浮动子元素，高度塌成 0。0 这个数不随
+ *   宿主 margin-top 变（浮动元素的外边距不进父级高度），账实仍然一致，
+ *   图只是视觉上往下挪，绕排照旧。
+ *
+ * 所以「valign 只对 float: left / right 生效」不是妥协，是唯一安全的路径。
+ * position: absolute 那条也不行：脱了浮动流，后面的文字立刻不绕排。
+ *
+ * 不做巡检：挂载那一刻量一次，量不到就按 top。编辑中后续文字高度会变，
+ * 图不会跟着重排；重开笔记时重新量一次就回来了。没有 Observer、没有定时器。
+ * ============================================================ */
+
+/**
+ * 纯计算：按垂直基准算出 margin-top 该写的偏移（px，0 或正数）。
+ *
+ * textH 是图旁边那段可绕排文字的高度，imgH 是图自己的高度。
+ * 图比文字段矮时才有可对齐的空间；文字更矮（或等高）时三种基准一律返回 0：
+ * 不把图推到文字块外面去。
+ *
+ * @param {number} textH
+ * @param {number} imgH
+ * @param {'top'|'middle'|'bottom'} valign
+ * @returns {number}
+ */
+function valignOffset(textH, imgH, valign) {
+  const t = Number(textH);
+  const h = Number(imgH);
+  if (!Number.isFinite(t) || !Number.isFinite(h)) return 0;
+  if (valign !== 'middle' && valign !== 'bottom') return 0;
+  const diff = t - h;
+  if (!(diff > 0)) return 0;
+  return valign === 'middle' ? diff / 2 : diff;
+}
+
+/**
+ * 量「图旁边那段可绕排文字」的高度：从 .cm-embed-block 的下一个兄弟开始，
+ * 只累加带 cm-line 的兄弟，碰到第一个不带 cm-line 的立刻停。
+ *
+ * 停下来的那条规则是必须的：再往后就是别的块（另一个 widget、代码块），
+ * 它们不参与绕排，算进来只会把图推得太低。
+ */
+function measureFollowTextHeight(embed) {
+  let el = embed && embed.nextElementSibling ? embed.nextElementSibling : null;
+  let acc = 0;
+  while (el) {
+    if (!classHas(el, 'cm-line')) break;
+    acc += elHeight(el);
+    el = el.nextElementSibling;
+  }
+  return acc;
+}
+
+/**
+ * 按 cfg.valign 给编辑模式里的浮动图写垂直偏移（正的 margin-top，把图往下推）。
+ *
+ * 四个前置条件缺一不可：
+ *   - cfg.float 是 left / right（center / inline 不浮动，没有可对齐对象）
+ *   - 宿主在 .cm-editor 里（阅读视图那条 floatify / applyWrapMargins 一行不碰）
+ *   - 宿主已经带上 bm-floated（说明那一行 float 真的写上了）
+ *   - 宿主连在文档上、量得到文字高度（否则按 top，不重试）
+ *
+ * 写样式走 setInlineStyle 并记进 host.__bmFloatLayout：那份账归
+ * resetFloatLayout 统一还原，复位后不会留下写死的 margin-top。
+ * 顺序上 applyFloatLayout 先写 margin 简写（margin-top: 0），这里再写
+ * margin-top 长属性，长属性覆盖简写里的那一段，不会被吃掉。
+ *
+ * @returns {number} 写下去的偏移量（0 表示没动样式）
+ */
+function applyValignLayout(host, cfg) {
+  if (!host || !host.style || !cfg) return 0;
+  const mode = cfg.float;
+  if (mode !== 'left' && mode !== 'right') return 0;
+  if (!climbTo(host, 'cm-editor')) return 0;       // 阅读视图 / 预览页：不碰
+  if (!classHas(host, 'bm-floated')) return 0;     // float 没真写上去时不能加偏移
+
+  const info = { valign: cfg.valign || 'top', textH: 0, imgH: 0, offset: 0, applied: false };
+  host.__bmValignInfo = info;
+
+  /* 同一宿主重复调用：先把上一轮的 margin-top 从账上摘掉，避免叠出两条记录。
+   * 账已经不是那一份（中间跑过 applyFloatLayout）时只丢引用，不去动样式。 */
+  const prevRec = host.__bmValignRec;
+  if (prevRec) {
+    const recs = host.__bmFloatLayout;
+    const at = Array.isArray(recs) ? recs.indexOf(prevRec) : -1;
+    if (at >= 0) {
+      recs.splice(at, 1);
+      restoreStyles([prevRec]);
+    }
+    host.__bmValignRec = null;
+  }
+
+  const embed = host.parentElement;
+  if (!embed || host.isConnected === false) return 0;   // 还没挂进文档：当 top
+
+  info.imgH = round2(elHeight(host));
+  info.textH = round2(measureFollowTextHeight(embed));
+  // textH 为 0（挂载那一刻还没排出文字）时 valignOffset 会返回 0，即 top
+  const offset = valignOffset(info.textH, info.imgH, info.valign);
+  if (!offset) return 0;
+
+  info.offset = round2(offset);
+  const rec = setInlineStyle(host, 'marginTop', info.offset + 'px');
+  if (rec) {
+    if (!Array.isArray(host.__bmFloatLayout)) host.__bmFloatLayout = [];
+    host.__bmFloatLayout.push(rec);
+    host.__bmValignRec = rec;
+    info.applied = true;
+  }
+  return offset;
+}
+
 /**
  * 把当前页编辑区里所有括号图宿主的 float 复位（开关关掉时用）。
  * 没有 document（自测 / 非浏览器环境）时返回 0，不报错。
@@ -1006,6 +1130,9 @@ function reapplyLivePreviewFloatLayout(doc) {
   return eachLiveHost(doc, (host) => {
     if (!host.__bmCfg) return 0;
     applyFloatLayout(host, host.__bmCfg);
+    /* 重写 float 时旧账（含 valign 的 margin-top）已整体还原，这里补写回去；
+     * 不补的话，设置页把开关关一次再开，图就永远停在 top 档。 */
+    if (typeof applyValignLayout === 'function') applyValignLayout(host, host.__bmCfg);
     return 1;
   });
 }
@@ -1062,4 +1189,7 @@ module.exports = {
   resetFloat,
   attachFloatWrap,
   applyFloatLayout,
+  valignOffset,
+  measureFollowTextHeight,
+  applyValignLayout,
 };

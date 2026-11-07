@@ -50,7 +50,7 @@ let CALIB_TOLERANCE, MAX_REBUILDS, readActualWidths, measureWidestLine, calibrat
 let applyFloatLayout, attachFloatWrap, resetFloat, floatify, pickContext,
   collectWrapTargets, applyWrapMargins, restoreWrapMargins, restoreStyles,
   setInlineStyle, elHeight, isLivePreview, FLOAT_GAP, CLIMB_LIMIT, WRAP_LIMIT, pxValue,
-  readMargins;
+  readMargins, applyValignLayout, valignOffset, measureFollowTextHeight;
 let classHas, climbTo;
 /* 图为什么看不见：裁剪链体检（只读，诊断命令用） */
 let CLIP_DEPTH, CLIP_HARD_STOP, styleOfEl, overflowClips, containClips, isClipHardStop,
@@ -2721,6 +2721,130 @@ function resetFloatLayout(host) {
   return n;
 }
 
+/* ============================================================
+ * 垂直基准（valign）：只能在浮动状态下靠 margin-top 把图往下推
+ *
+ * 语义：图的顶边 / 中心 / 底边，分别对齐它旁边那段文字的顶边 / 中心 / 底边。
+ * 所以 top 档是 0，middle / bottom 都是**正数**（往下推）。
+ *
+ * 为什么非浮动时一个数都不能写：
+ *   styles.css 给非浮动 widget 加了 display: flow-root（8daf8aa 修的
+ *   外边距塌陷）。widget 自成 BFC 时，子元素的 margin-top 会直接参与父级
+ *   高度计算（负的减、正的加），widget 的 rect 跟着变，而 CM6 正是按 rect
+ *   记账的 —— 图挪了多少，光标就错多少。
+ *
+ * 为什么浮动时反而安全：
+ *   浮动状态下 styles.css 那条 flow-root 是关掉的（:not(:has(.bm-float-*))），
+ *   .cm-embed-block 里只剩一个浮动子元素，高度塌成 0。0 这个数不随
+ *   宿主 margin-top 变（浮动元素的外边距不进父级高度），账实仍然一致，
+ *   图只是视觉上往下挪，绕排照旧。
+ *
+ * 所以「valign 只对 float: left / right 生效」不是妥协，是唯一安全的路径。
+ * position: absolute 那条也不行：脱了浮动流，后面的文字立刻不绕排。
+ *
+ * 不做巡检：挂载那一刻量一次，量不到就按 top。编辑中后续文字高度会变，
+ * 图不会跟着重排；重开笔记时重新量一次就回来了。没有 Observer、没有定时器。
+ * ============================================================ */
+
+/**
+ * 纯计算：按垂直基准算出 margin-top 该写的偏移（px，0 或正数）。
+ *
+ * textH 是图旁边那段可绕排文字的高度，imgH 是图自己的高度。
+ * 图比文字段矮时才有可对齐的空间；文字更矮（或等高）时三种基准一律返回 0：
+ * 不把图推到文字块外面去。
+ *
+ * @param {number} textH
+ * @param {number} imgH
+ * @param {'top'|'middle'|'bottom'} valign
+ * @returns {number}
+ */
+function valignOffset(textH, imgH, valign) {
+  const t = Number(textH);
+  const h = Number(imgH);
+  if (!Number.isFinite(t) || !Number.isFinite(h)) return 0;
+  if (valign !== 'middle' && valign !== 'bottom') return 0;
+  const diff = t - h;
+  if (!(diff > 0)) return 0;
+  return valign === 'middle' ? diff / 2 : diff;
+}
+
+/**
+ * 量「图旁边那段可绕排文字」的高度：从 .cm-embed-block 的下一个兄弟开始，
+ * 只累加带 cm-line 的兄弟，碰到第一个不带 cm-line 的立刻停。
+ *
+ * 停下来的那条规则是必须的：再往后就是别的块（另一个 widget、代码块），
+ * 它们不参与绕排，算进来只会把图推得太低。
+ */
+function measureFollowTextHeight(embed) {
+  let el = embed && embed.nextElementSibling ? embed.nextElementSibling : null;
+  let acc = 0;
+  while (el) {
+    if (!classHas(el, 'cm-line')) break;
+    acc += elHeight(el);
+    el = el.nextElementSibling;
+  }
+  return acc;
+}
+
+/**
+ * 按 cfg.valign 给编辑模式里的浮动图写垂直偏移（正的 margin-top，把图往下推）。
+ *
+ * 四个前置条件缺一不可：
+ *   - cfg.float 是 left / right（center / inline 不浮动，没有可对齐对象）
+ *   - 宿主在 .cm-editor 里（阅读视图那条 floatify / applyWrapMargins 一行不碰）
+ *   - 宿主已经带上 bm-floated（说明那一行 float 真的写上了）
+ *   - 宿主连在文档上、量得到文字高度（否则按 top，不重试）
+ *
+ * 写样式走 setInlineStyle 并记进 host.__bmFloatLayout：那份账归
+ * resetFloatLayout 统一还原，复位后不会留下写死的 margin-top。
+ * 顺序上 applyFloatLayout 先写 margin 简写（margin-top: 0），这里再写
+ * margin-top 长属性，长属性覆盖简写里的那一段，不会被吃掉。
+ *
+ * @returns {number} 写下去的偏移量（0 表示没动样式）
+ */
+function applyValignLayout(host, cfg) {
+  if (!host || !host.style || !cfg) return 0;
+  const mode = cfg.float;
+  if (mode !== 'left' && mode !== 'right') return 0;
+  if (!climbTo(host, 'cm-editor')) return 0;       // 阅读视图 / 预览页：不碰
+  if (!classHas(host, 'bm-floated')) return 0;     // float 没真写上去时不能加偏移
+
+  const info = { valign: cfg.valign || 'top', textH: 0, imgH: 0, offset: 0, applied: false };
+  host.__bmValignInfo = info;
+
+  /* 同一宿主重复调用：先把上一轮的 margin-top 从账上摘掉，避免叠出两条记录。
+   * 账已经不是那一份（中间跑过 applyFloatLayout）时只丢引用，不去动样式。 */
+  const prevRec = host.__bmValignRec;
+  if (prevRec) {
+    const recs = host.__bmFloatLayout;
+    const at = Array.isArray(recs) ? recs.indexOf(prevRec) : -1;
+    if (at >= 0) {
+      recs.splice(at, 1);
+      restoreStyles([prevRec]);
+    }
+    host.__bmValignRec = null;
+  }
+
+  const embed = host.parentElement;
+  if (!embed || host.isConnected === false) return 0;   // 还没挂进文档：当 top
+
+  info.imgH = round2(elHeight(host));
+  info.textH = round2(measureFollowTextHeight(embed));
+  // textH 为 0（挂载那一刻还没排出文字）时 valignOffset 会返回 0，即 top
+  const offset = valignOffset(info.textH, info.imgH, info.valign);
+  if (!offset) return 0;
+
+  info.offset = round2(offset);
+  const rec = setInlineStyle(host, 'marginTop', info.offset + 'px');
+  if (rec) {
+    if (!Array.isArray(host.__bmFloatLayout)) host.__bmFloatLayout = [];
+    host.__bmFloatLayout.push(rec);
+    host.__bmValignRec = rec;
+    info.applied = true;
+  }
+  return offset;
+}
+
 /**
  * 把当前页编辑区里所有括号图宿主的 float 复位（开关关掉时用）。
  * 没有 document（自测 / 非浏览器环境）时返回 0，不报错。
@@ -2737,6 +2861,9 @@ function reapplyLivePreviewFloatLayout(doc) {
   return eachLiveHost(doc, (host) => {
     if (!host.__bmCfg) return 0;
     applyFloatLayout(host, host.__bmCfg);
+    /* 重写 float 时旧账（含 valign 的 margin-top）已整体还原，这里补写回去；
+     * 不补的话，设置页把开关关一次再开，图就永远停在 top 档。 */
+    if (typeof applyValignLayout === 'function') applyValignLayout(host, host.__bmCfg);
     return 1;
   });
 }
@@ -2793,6 +2920,9 @@ module.exports = {
   resetFloat,
   attachFloatWrap,
   applyFloatLayout,
+  valignOffset,
+  measureFollowTextHeight,
+  applyValignLayout,
 };
 
 };
@@ -4239,7 +4369,7 @@ const HEAD_RE = /^#{1,6}\s+(.*)$/;
  * 但它同时长得像指令（`注意: 这个很重要`）。这时看键——白名单里的还是指令
  * （`float: left` 不会被续行吞掉），不认识的当正文（不会被指令分支吃掉）。
  */
-const DIR_KEYS = ['dir', 'brace', 'box', 'closing', 'title', 'maxwidth', 'float', 'width', 'bg'];
+const DIR_KEYS = ['dir', 'brace', 'box', 'closing', 'title', 'maxwidth', 'float', 'width', 'valign', 'bg'];
 
 // 续行拼接用的硬换行符：原样留在 raw 里，由 text.js 的行内解析层切开
 const SOFT_BREAK = '\n';
@@ -4323,6 +4453,7 @@ function parseSource(source) {
   let titleHash = '';
   let maxWidth = 0;              // 节点文字折行宽度上限（SVG 坐标，px）；0 = 不折行
   let floatMode = '';            // 'left' | 'right' | 'center' | 'inline' | ''
+  let valign = 'top';            // 浮动图的垂直基准：'top' | 'middle' | 'bottom'
   let width = 0;                 // 浮动时的宽度（px）；0 = 按图自身宽
   let bg = '';                   // PNG 底色；空 = 透明（默认）
   let firstContentSeen = false;
@@ -4404,6 +4535,10 @@ function parseSource(source) {
         else if (v === 'r' || v === 'right') floatMode = 'right';
         else if (v === 'c' || v === 'center' || v === 'centre') floatMode = 'center';
         else if (v === 'inl' || v === 'inline') floatMode = 'inline';
+      } else if (key === 'valign') {
+        // 浮动图的垂直基准：只认三个词，写错就回落到默认的 top
+        const v = val.toLowerCase();
+        valign = (v === 'middle' || v === 'bottom') ? v : 'top';
       } else if (key === 'width') {
         // 浮动时用来定宽；不写就让图按自身宽度自然收缩
         const n = parseFloat(val);
@@ -4432,6 +4567,7 @@ function parseSource(source) {
     closing,
     maxWidth,
     float: floatMode,
+    valign,
     width,
     bg,
     roots,
@@ -5529,7 +5665,7 @@ function loadModules() {
   ({ FLOAT_GAP, CLIMB_LIMIT, WRAP_LIMIT, pxValue, elHeight, collectWrapTargets,
      setInlineStyle, restoreStyles, applyWrapMargins, restoreWrapMargins, readMargins,
      isLivePreview, pickContext, floatify, resetFloat, attachFloatWrap,
-     applyFloatLayout, classHas, climbTo,
+     applyFloatLayout, classHas, climbTo, applyValignLayout, valignOffset, measureFollowTextHeight,
      CLIP_DEPTH, CLIP_HARD_STOP, styleOfEl, overflowClips, containClips, isClipHardStop,
      clipNodeInfo, clipChainOf, visibilityReport,
      LP_FLOAT, isLpFloatEnabled, setLpFloatEnabled,
@@ -5784,6 +5920,15 @@ async function renderBraceMap(source, host, opts) {
    */
   trackFloat(cfg, host, { svg });
   dbgFloatState(host, 'render.mounted');
+
+  /*
+   * 垂直基准：只对 float: left / right 生效，而且只在编辑模式下。
+   * 必须排在 applyFloatLayout（那一行 margin 简写）之后：这里写的是 margin-top
+   * 长属性，长属性覆盖简写，顺序反了就会被简写里的 margin-top: 0 吃掉。
+   * 量不到后续文字（还没排好 / 在阅读视图里）就按 top，不重试。
+   */
+  applyValignLayout(host, cfg);
+  dbgFloatState(host, 'render.valign');
 
   // 工具条
   const bar = wrap.createDiv({ cls: 'bm-toolbar' });
@@ -6259,6 +6404,31 @@ class BraceMapPlugin extends Plugin {
         push('- 紧跟的下一个兄弟：' + nx.tagName + '.'
           + String(nx.className || '').split(' ').slice(0, 3).join('.'));
       }
+
+      /*
+       * 垂直基准（valign）：只有浮动宿主会写负 margin-top，而且只在编辑模式。
+       * 这里把「配置的基准、量到的两个高度、真正写下去的 margin-top、
+       * embed 的 rect 高」四样并排摆出来 —— 浮动生效时 embed 高必须是 0，
+       * 不是 0 就说明负 margin 影响了 widget 的记账，光标会错位。
+       */
+      const vi = host.__bmValignInfo || null;
+      const cfgHost = host.__bmCfg || null;
+      const valignTxt = vi ? vi.valign : (cfgHost && cfgHost.valign ? cfgHost.valign : '（没有记录）');
+      push('- valign：' + valignTxt
+        + '（float ' + (cfgHost && cfgHost.float ? cfgHost.float : '无') + '）');
+      if (vi) {
+        push('- valign 量到的 textH / imgH：' + num(vi.textH) + ' / ' + num(vi.imgH)
+          + ' px（差值 ' + signed(vi.textH - vi.imgH) + '）');
+      } else {
+        push('- valign 量到的 textH / imgH：（没有记录：这次挂载没走 applyValignLayout）');
+      }
+      push('- valign 写下的 margin-top：'
+        + (host.style && host.style.marginTop ? host.style.marginTop : '（未写）')
+        + '｜computed ' + (hostCs ? hostCs.marginTop : '拿不到')
+        + '｜偏移 ' + (vi ? signed(vi.offset) : '无记录') + ' px');
+      const ebBlock = embed ? blockOf(embed) : null;
+      push('- embed rect 高（浮动后应为 0）：' + (er ? num(er.h) : '拿不到')
+        + ' px｜账上 ' + (ebBlock && Number.isFinite(ebBlock.height) ? num(ebBlock.height) : '拿不到') + ' px');
     }
 
     const text = out.join('\n');
@@ -6551,6 +6721,10 @@ function buildInternals() {
   resetFloatLayout,
   clearLivePreviewFloatLayout,
   reapplyLivePreviewFloatLayout,
+  // 垂直基准（只对浮动生效）：纯计算、测量、写偏移
+  valignOffset,
+  measureFollowTextHeight,
+  applyValignLayout,
   DEFAULT_SETTINGS,
   // 临时诊断（Live Preview 图文混排）：默认关闭；自测用 dbgSetEnabled(true) 打开
   DEBUG_LP,
