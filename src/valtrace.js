@@ -253,6 +253,116 @@ function floatCount() {
   try { return floatRows.length; } catch (e) { return 0; }
 }
 
+/* ============================================================
+ * floatify 的上游（attachFloatWrap）单独再一份
+ *
+ * 为什么要单独一份：floatify 的轨迹里一条记录都没有时，可能是
+ *   （1）attachFloatWrap 压根没被调用（不该发生）
+ *   （2）被调了，但每个入口都提前返回了
+ *   （3）进了 apply()，但因为宿主还没插进 DOM 就 dispose 了
+ * 这三种在 floatify 的缓冲里完全长得一样（都是 0 条）。没有这一层，
+ * 就只能看到「没跑到」，看不到「在哪里停住的」。
+ * ============================================================ */
+
+const MAX_ATTACH_ROWS = 400;
+
+let attachRows = [];
+let attachSeq = 0;
+let attachT0 = 0;
+
+/** attachFloatWrap 的出口代号 */
+const ATTACH_EXIT_DOC = [
+  ['enter', '刚进 attachFloatWrap：记下 side / 是否实时预览 / 是否已连进文档 / 两个 closest'],
+  ['!side', 'cfg.float 不是 left / right'],
+  ['!host', '宿主不存在或量不了尺寸'],
+  ['!style', '宿主没有 style'],
+  ['isLivePreview', '实时预览：编辑模式那条路，不在这里浮动'],
+  ['!doc', '拿不到 ownerDocument / document'],
+  ['!connected', 'apply() 发现宿主还没插进 DOM：跳过这一拍，等补拍与「连上就重排」'],
+  ['keep', '最后一次量不出可用几何，但上一轮已生效的结果被保住了（没复位）'],
+  ['floatify', 'apply() 真的走到 floatify 了'],
+  ['dispose', 'dispose() 被调用：观察器、补拍、监听全拆掉'],
+];
+
+function recordAttach(entry) {
+  try {
+    const host = entry ? entry.host : null;
+    attachSeq += 1;
+    const t = nowMs();
+    if (!attachT0) attachT0 = t;
+    const k = keyOf(host);
+    const b01val = (v) => (v === true ? 1 : (v === false ? 0 : null));
+    const row = {
+      n: attachSeq,
+      t,
+      dt: t - attachT0,
+      exit: entry && entry.exit ? String(entry.exit) : 'other',
+      tag: k.tag,
+      vid: k.vid,
+      idx: k.idx,
+      side: entry && entry.side ? String(entry.side) : '',
+      live: b01val(entry ? entry.live : null),
+      conn: b01val(entry ? entry.conn : null),
+      cmContent: b01val(entry ? entry.cmContent : null),
+      cmEditor: b01val(entry ? entry.cmEditor : null),
+      applies: entry && entry.applies != null ? entry.applies : null,
+      why: entry && entry.why ? String(entry.why) : '',
+    };
+    attachRows.push(row);
+    if (attachRows.length > MAX_ATTACH_ROWS) attachRows.splice(0, attachRows.length - MAX_ATTACH_ROWS);
+    return row;
+  } catch (e) {
+    return null;
+  }
+}
+
+function attachAll() {
+  try { return attachRows.slice(); } catch (e) { return []; }
+}
+
+function attachCount() {
+  try { return attachRows.length; } catch (e) { return 0; }
+}
+
+/**
+ * 第四节：floatify 的上游。
+ *
+ * 看这张表只用问一句：宿主最后一次停在哪个出口？
+ * 停在 `!connected` 且后面没有 `floatify`，就是「还没插进 DOM 就被放弃了」
+ * ——这正好是第四节（floatify）一条记录都没有的原因。
+ */
+function formatFloatifyUpstream() {
+  const list = attachAll();
+  const out = [];
+  out.push('## 四、floatify 上游轨迹（attachFloatWrap）');
+  out.push('');
+  out.push('阅读视图的浮动入口是 `attachFloatWrap`，`floatify` 在它的 `apply()` 里被调用。');
+  out.push('上游任何一个提前返回 / 提前 dispose，都会让 floatify 一条记录都没有。');
+  out.push('所以「floatify 调用 0 次」要到这里看它到底停在哪儿。');
+  out.push('');
+  out.push('- 轨迹条数：' + list.length + '（上限 ' + MAX_ATTACH_ROWS + ' 条，超出从头截断）');
+  out.push('');
+  out.push('| 出口 | 含义 |');
+  out.push('| --- | --- |');
+  for (const [k, v] of ATTACH_EXIT_DOC) out.push('| `' + k + '` | ' + v + ' |');
+  out.push('');
+  if (!list.length) {
+    out.push('（没有记录：本次加载以来 `attachFloatWrap` 一次都没被调用过）');
+    return out.join('\n');
+  }
+  out.push('| # | +ms | 宿主 | → 出口 | side | live | conn | cm-content | cm-editor | applies | 说明 |');
+  out.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+  const tri = (v) => (v === null || v === undefined ? '?' : String(v));
+  for (const r of list) {
+    out.push('| ' + r.n + ' | +' + r.dt + ' | ' + cell(r.tag) + ' | `' + cell(r.exit) + '`'
+      + ' | ' + cell(r.side || '—') + ' | ' + tri(r.live) + ' | ' + tri(r.conn)
+      + ' | ' + tri(r.cmContent) + ' | ' + tri(r.cmEditor)
+      + ' | ' + (r.applies == null ? '—' : r.applies)
+      + ' | ' + cell(r.why || '') + ' |');
+  }
+  return out.join('\n');
+}
+
 function reset() {
   try {
     rows = [];
@@ -263,6 +373,9 @@ function reset() {
     floatRows = [];
     floatSeq = 0;
     floatT0 = 0;
+    attachRows = [];
+    attachSeq = 0;
+    attachT0 = 0;
   } catch (e) { /* ignore */ }
 }
 
@@ -558,7 +671,7 @@ function floatTableRow(r) {
 function formatFloatifyTrace() {
   const list = floatAll();
   const out = [];
-  out.push('## 四、floatify 调用轨迹（阅读视图）');
+  out.push('## 五、floatify 调用轨迹（阅读视图）');
   out.push('');
   out.push('阅读视图的 valign 不走 `applyValignLayout`，而是 `floatify` 把偏移量加进绝对定位的 `top`。');
   out.push('这一节只记后者，与上面的编辑模式轨迹完全分开。');
@@ -600,7 +713,7 @@ function formatFloatifyTrace() {
 function formatFloatifyCompare(items) {
   const out = [];
   const list = Array.isArray(items) ? items : [];
-  out.push('## 五、floatify 的初值与现值对照');
+  out.push('## 六、floatify 的初值与现值对照');
   out.push('');
   out.push('对每个宿主：左边两列是 `floatify` 当初 / 最后一次记下的五个值（从轨迹里读）；');
   out.push('右边一列是命令触发这一刻重新调一次 `readerValignInfo` 的结果（只读，不写样式）。');
@@ -668,8 +781,7 @@ function nowErrText(it) {
 
 /** 完整文档：轨迹 + 现场快照 */
 function formatDoc(items, floatItems) {
-  const parts = [formatTrace(), formatSnapshot(items)];
-  parts.push(formatFloatifyTrace());
+  const parts = [formatTrace(), formatSnapshot(items), formatFloatifyUpstream(), formatFloatifyTrace()];
   if (floatItems && floatItems.length) parts.push(formatFloatifyCompare(floatItems));
   else parts.push(formatFloatifyCompare([]));
   return parts.join('\n\n') + '\n';
@@ -678,21 +790,27 @@ function formatDoc(items, floatItems) {
 module.exports = {
   MAX_ROWS,
   MAX_FLOAT_ROWS,
+  MAX_ATTACH_ROWS,
   EXIT_DOC,
   FLOAT_EXIT_DOC,
+  ATTACH_EXIT_DOC,
   SRC_DOC,
   record,
   recordFloat,
+  recordAttach,
   all,
   count,
   floatAll,
   floatCount,
+  attachAll,
+  attachCount,
   reset,
   hostTag,
   keyOf,
   f2,
   formatTrace,
   formatSnapshot,
+  formatFloatifyUpstream,
   formatFloatifyTrace,
   formatFloatifyCompare,
   formatDoc,

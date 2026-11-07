@@ -59,6 +59,8 @@ let VT_MAX_ROWS, vtRecord, vtRows, vtReset, vtCount, vtHostTag,
   formatValignTrace, formatValignSnapshot, formatValignDoc, valtrace;
 /* 阅读视图那条路（floatify）的轨迹与对照 */
 let VT_MAX_FLOAT_ROWS, vtFloatRows, vtFloatCount, formatFloatTrace, formatFloatCompare;
+/* floatify 的上游（attachFloatWrap）轨迹：解释「floatify 一条记录都没有」 */
+let VT_MAX_ATTACH_ROWS, vtAttachRows, vtAttachCount, formatAttachTrace;
 /* valign 对齐标记覆盖层（只读可视化）：见 src/valoverlay.js */
 let valoverlay, toggleValignOverlay, hideValignOverlay, isValignOverlayOn;
 let classHas, climbTo;
@@ -2335,6 +2337,70 @@ function resetFloat(record) {
 /* --------------------------- 重算调度 --------------------------- */
 
 /**
+ * 记一条 attachFloatWrap 的上游轨迹。与 vtFloat 同一套路：自己吞异常，
+ * 绝不影响浮动。
+ */
+function vtAttach(host, exit, extra) {
+  try {
+    const e = extra || {};
+    vt.recordAttach({
+      exit,
+      host,
+      side: e.side || '',
+      live: e.live,
+      conn: e.conn,
+      cmContent: e.cmContent,
+      cmEditor: e.cmEditor,
+      applies: e.applies,
+      why: e.why || '',
+    });
+  } catch (err) { /* ignore */ }
+}
+
+/** 入口现场：一次把几个最要紧的判断题取出来，给轨迹用 */
+function attachEnv(host, side) {
+  const closestOf = (sel) => {
+    try {
+      if (!host || typeof host.closest !== 'function') return null;
+      return !!host.closest(sel);
+    } catch (e) { return null; }
+  };
+  return {
+    side: side || '',
+    live: isLivePreview(host),
+    conn: host ? host.isConnected !== false : null,
+    cmContent: closestOf('.cm-content'),
+    cmEditor: closestOf('.cm-editor'),
+  };
+}
+
+/**
+ * 只读体检：这一拍 apply 能不能算出有效结果（一个样式都不写）。
+ *
+ * 判据必须与 floatify 的前半段对上（同样的 pickContext / rect / 留白范围），
+ * 否则会出现「以为能算、结果算不出来，但已经把上一轮复位掉了」。
+ * 返回 null 表示这一拍算不出东西。
+ *
+ * ⚠ 它只服务于一个判断：已经有结果时，先问一遍“这次算得出来吗”，
+ *   算不出来就别动。若哪天 floatify 的入口条件变了，这里要同步。
+ */
+function floatReadiness(el, cfg) {
+  try {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+    const ctx = pickContext(el);
+    if (!ctx || !ctx.ancestor || !ctx.block || ctx.block === ctx.ancestor) return null;
+    const bRect = rectOf(ctx.block);
+    if (!bRect || !(bRect.height > 0)) return null;
+    const vin = readerValignInfo(el, ctx.block, cfg, bRect);
+    const plan = collectWrapTargets(ctx.block.nextElementSibling, bRect.height, {
+      startOffset: vin.offset,
+    });
+    if (!plan.length) return null;
+    return { bRect, vin, plan };
+  } catch (e) { return null; }
+}
+
+/**
  * 给一个浮动块挂上「尺寸一变就重算」的调度器。
  *
  * 重算必须做：窗口变化、字体加载、mountBraceSvg 的自校准都会改图的真实高度，
@@ -2345,6 +2411,8 @@ function resetFloat(record) {
 function attachFloatWrap(host, cfg, opts) {
   const o = opts || {};
   const side = cfg && cfg.float;
+  const env = attachEnv(host, side);
+  vtAttach(host, 'enter', env);
   // 诊断：直接回答「isLivePreview(host) 是不是 false，于是走了阅读视图那条路」
   dbg('attach.enter', () => ({
     side: side || null,
@@ -2353,9 +2421,12 @@ function attachFloatWrap(host, cfg, opts) {
     inDoc: !!(host && host.isConnected),
     chain: dbgChain(host, 5),
   }));
-  if (side !== 'left' && side !== 'right') return null;
-  if (!host || typeof host.getBoundingClientRect !== 'function') return null;
-  if (typeof host.style === 'undefined') return null;
+  if (side !== 'left' && side !== 'right') { vtAttach(host, '!side', env); return null; }
+  if (!host || typeof host.getBoundingClientRect !== 'function') {
+    vtAttach(host, '!host', env);
+    return null;
+  }
+  if (typeof host.style === 'undefined') { vtAttach(host, '!style', env); return null; }
   /*
    * 编辑模式：宿主上那一行 float 就是全部（renderBraceMap 已经写过），
    * 这里不再算任何高度、不再碰任何行。开关关掉时把 float 撤掉，图回到整行。
@@ -2363,17 +2434,21 @@ function attachFloatWrap(host, cfg, opts) {
   if (isLivePreview(host)) {
     if (!isLpFloatEnabled()) resetFloatLayout(host);
     dbg('attach.branch', () => ({ branch: 'live-preview-float-only', lpFloat: isLpFloatEnabled() }));
+    vtAttach(host, 'isLivePreview', env);
     return null;
   }
   dbg('attach.branch', () => ({ branch: 'reader' }));
   const doc = host.ownerDocument || (typeof document !== 'undefined' ? document : null);
-  if (!doc) return null;
+  if (!doc) { vtAttach(host, '!doc', env); return null; }
 
   const win = doc.defaultView || (typeof window !== 'undefined' ? window : null);
   let record = null;
   let appliedKey = '';
   let disposed = false;
   let observedAncestor = null;
+  let mo = null;                 // 「连上就立刻重排」的一次性观察器
+  let watching = false;
+  let watchHits = 0;
 
   const raf = (win && typeof win.requestAnimationFrame === 'function')
     ? (fn) => win.requestAnimationFrame(fn)
@@ -2399,12 +2474,48 @@ function attachFloatWrap(host, cfg, opts) {
   };
 
   let applies = 0;
+  /** 控制柄：apply() 要改 waitingForDom，所以它得先存在 */
+  const ctl = {
+    host,
+    update: null,
+    dispose: null,
+    state: null,
+    /* 还没连进 DOM 时为真：trackFloat 清理时不会把一个「只是还没插进页面」的控件当死控件 */
+    waitingForDom: true,
+  };
   const apply = () => {
     applies++;
     if (disposed) return;
-    if (!host.isConnected && typeof host.isConnected === 'boolean') { dispose(); return; }
+    if (host.isConnected === false) {
+      /*
+       * 还没插进 DOM：不是终局。
+       *
+       * 以前这里直接 dispose()，把尺寸观察器、三拍补拍、resize 监听全拆了。
+       * 而 renderBraceMap 执行的那一刻（阅读视图）宿主确实还没挂进文档，
+       * 于是第一次 apply 就 dispose，floatify 一次都跑不到
+       * —— 真机轨迹里「floatify 调用 0 次」就是这么来的。
+       * 现在只跳过这一拍，并挂一个「连上就立即重排」的一次性观察器。
+       */
+      vtAttach(host, '!connected', { ...attachEnv(host, side), applies });
+      watchConnect();
+      return;
+    }
+    if (ctl.waitingForDom) {
+      ctl.waitingForDom = false;
+      stopConnectWatch();
+    }
+    /*
+     * 已经有结果、而这一拍量不出可用几何（图还没排出来 / 后面没有可绕排的块）：
+     * 不要先 resetFloat。因为复位之后 floatify 又失败，图会跳回原位而且不回来
+     * —— 与编辑模式那个「测量失败却把结果撤掉」的坑是同一个。
+     */
+    if (record && !floatReadiness(host, cfg)) {
+      vtAttach(host, 'keep', { ...attachEnv(host, side), applies });
+      return;
+    }
     resetFloat(record);                 // 先复位，避免上一轮的改动叠上来
     record = null;
+    vtAttach(host, 'floatify', { ...attachEnv(host, side), applies });
     let next = null;
     try {
       next = floatify(host, cfg, { svg: o.svg, gap: o.gap, reader: o.reader });
@@ -2460,9 +2571,49 @@ function attachFloatWrap(host, cfg, opts) {
     try { win.addEventListener('resize', onResize); } catch (e) { /* ignore */ }
   }
 
-  const dispose = () => {
+  /*
+   * 「连上就立即重排」：只在「宿主还没插进 DOM」时挂，连上的第一刻就拆。
+   *
+   * 为什么选 MutationObserver 而不是轮询：
+   *   - 事件驱动，没变化时就什么都不跑，不会引入常驻轮询
+   *   - 不靠固定时间：挂载早一点、晚一点都能接住（三拍补拍是 120/480/1200ms，
+   *     超过 1.2s 才挂进文档的情况它就全落空了）
+   *   - 自己会结束：连上、或 dispose、或回调次数超上限（防泄漏）就断
+   * 没有 MutationObserver 的环境（旧内核 / 假 DOM）直接不挂，靠三拍补拍。
+   */
+  const CONNECT_WATCH_MAX = 400;
+  const stopConnectWatch = () => {
+    if (!watching) return;
+    watching = false;
+    if (mo) { try { mo.disconnect(); } catch (e) { /* ignore */ } }
+    mo = null;
+  };
+  const watchConnect = () => {
+    if (disposed || watching) return;
+    const MO = (typeof MutationObserver !== 'undefined') ? MutationObserver : null;
+    const target = doc.documentElement || doc.body;
+    if (!MO || !target) return;
+    try {
+      mo = new MO(() => {
+        watchHits++;
+        if (disposed) { stopConnectWatch(); return; }
+        if (host.isConnected === false) {
+          if (watchHits >= CONNECT_WATCH_MAX) stopConnectWatch();
+          return;
+        }
+        stopConnectWatch();            // 连上了：拆掉，再重排一次
+        schedule();
+      });
+      mo.observe(target, { childList: true, subtree: true });
+      watching = true;
+    } catch (e) { mo = null; watching = false; }
+  };
+
+  const dispose = (why) => {
     if (disposed) return;
     disposed = true;
+    stopConnectWatch();
+    vtAttach(host, 'dispose', { ...attachEnv(host, side), applies, why: why || 'api' });
     if (pending) {
       const p = pending;
       pending = null;
@@ -2477,7 +2628,20 @@ function attachFloatWrap(host, cfg, opts) {
     record = null;
   };
 
-  apply();                              // 立即生效一次：挂载时图已经在文档里了
+  ctl.update = schedule;
+  ctl.dispose = dispose;
+  ctl.state = () => (record
+    ? {
+      side: record.side,
+      width: record.width,
+      margin: record.margin,
+      targets: record.wrap.length,
+      valign: record.valign || null,
+      applies,
+    }
+    : { applies });
+
+  apply();                              // 立即生效一次：这时宿主可能还没插进文档
 
   /*
    * 自校准（mountBraceSvg）是异步的，会在 0/60/250/1000ms 与字体就绪后重排，
@@ -2494,21 +2658,7 @@ function attachFloatWrap(host, cfg, opts) {
     }
   } catch (e) { /* ignore */ }
 
-  return {
-    host,
-    update: schedule,
-    dispose,
-    state: () => (record
-      ? {
-        side: record.side,
-        width: record.width,
-        margin: record.margin,
-        targets: record.wrap.length,
-        valign: record.valign || null,
-        applies,
-      }
-      : { applies }),
-  };
+  return ctl;
 }
 
 /* ============================================================
@@ -6999,6 +7149,116 @@ function floatCount() {
   try { return floatRows.length; } catch (e) { return 0; }
 }
 
+/* ============================================================
+ * floatify 的上游（attachFloatWrap）单独再一份
+ *
+ * 为什么要单独一份：floatify 的轨迹里一条记录都没有时，可能是
+ *   （1）attachFloatWrap 压根没被调用（不该发生）
+ *   （2）被调了，但每个入口都提前返回了
+ *   （3）进了 apply()，但因为宿主还没插进 DOM 就 dispose 了
+ * 这三种在 floatify 的缓冲里完全长得一样（都是 0 条）。没有这一层，
+ * 就只能看到「没跑到」，看不到「在哪里停住的」。
+ * ============================================================ */
+
+const MAX_ATTACH_ROWS = 400;
+
+let attachRows = [];
+let attachSeq = 0;
+let attachT0 = 0;
+
+/** attachFloatWrap 的出口代号 */
+const ATTACH_EXIT_DOC = [
+  ['enter', '刚进 attachFloatWrap：记下 side / 是否实时预览 / 是否已连进文档 / 两个 closest'],
+  ['!side', 'cfg.float 不是 left / right'],
+  ['!host', '宿主不存在或量不了尺寸'],
+  ['!style', '宿主没有 style'],
+  ['isLivePreview', '实时预览：编辑模式那条路，不在这里浮动'],
+  ['!doc', '拿不到 ownerDocument / document'],
+  ['!connected', 'apply() 发现宿主还没插进 DOM：跳过这一拍，等补拍与「连上就重排」'],
+  ['keep', '最后一次量不出可用几何，但上一轮已生效的结果被保住了（没复位）'],
+  ['floatify', 'apply() 真的走到 floatify 了'],
+  ['dispose', 'dispose() 被调用：观察器、补拍、监听全拆掉'],
+];
+
+function recordAttach(entry) {
+  try {
+    const host = entry ? entry.host : null;
+    attachSeq += 1;
+    const t = nowMs();
+    if (!attachT0) attachT0 = t;
+    const k = keyOf(host);
+    const b01val = (v) => (v === true ? 1 : (v === false ? 0 : null));
+    const row = {
+      n: attachSeq,
+      t,
+      dt: t - attachT0,
+      exit: entry && entry.exit ? String(entry.exit) : 'other',
+      tag: k.tag,
+      vid: k.vid,
+      idx: k.idx,
+      side: entry && entry.side ? String(entry.side) : '',
+      live: b01val(entry ? entry.live : null),
+      conn: b01val(entry ? entry.conn : null),
+      cmContent: b01val(entry ? entry.cmContent : null),
+      cmEditor: b01val(entry ? entry.cmEditor : null),
+      applies: entry && entry.applies != null ? entry.applies : null,
+      why: entry && entry.why ? String(entry.why) : '',
+    };
+    attachRows.push(row);
+    if (attachRows.length > MAX_ATTACH_ROWS) attachRows.splice(0, attachRows.length - MAX_ATTACH_ROWS);
+    return row;
+  } catch (e) {
+    return null;
+  }
+}
+
+function attachAll() {
+  try { return attachRows.slice(); } catch (e) { return []; }
+}
+
+function attachCount() {
+  try { return attachRows.length; } catch (e) { return 0; }
+}
+
+/**
+ * 第四节：floatify 的上游。
+ *
+ * 看这张表只用问一句：宿主最后一次停在哪个出口？
+ * 停在 `!connected` 且后面没有 `floatify`，就是「还没插进 DOM 就被放弃了」
+ * ——这正好是第四节（floatify）一条记录都没有的原因。
+ */
+function formatFloatifyUpstream() {
+  const list = attachAll();
+  const out = [];
+  out.push('## 四、floatify 上游轨迹（attachFloatWrap）');
+  out.push('');
+  out.push('阅读视图的浮动入口是 `attachFloatWrap`，`floatify` 在它的 `apply()` 里被调用。');
+  out.push('上游任何一个提前返回 / 提前 dispose，都会让 floatify 一条记录都没有。');
+  out.push('所以「floatify 调用 0 次」要到这里看它到底停在哪儿。');
+  out.push('');
+  out.push('- 轨迹条数：' + list.length + '（上限 ' + MAX_ATTACH_ROWS + ' 条，超出从头截断）');
+  out.push('');
+  out.push('| 出口 | 含义 |');
+  out.push('| --- | --- |');
+  for (const [k, v] of ATTACH_EXIT_DOC) out.push('| `' + k + '` | ' + v + ' |');
+  out.push('');
+  if (!list.length) {
+    out.push('（没有记录：本次加载以来 `attachFloatWrap` 一次都没被调用过）');
+    return out.join('\n');
+  }
+  out.push('| # | +ms | 宿主 | → 出口 | side | live | conn | cm-content | cm-editor | applies | 说明 |');
+  out.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+  const tri = (v) => (v === null || v === undefined ? '?' : String(v));
+  for (const r of list) {
+    out.push('| ' + r.n + ' | +' + r.dt + ' | ' + cell(r.tag) + ' | `' + cell(r.exit) + '`'
+      + ' | ' + cell(r.side || '—') + ' | ' + tri(r.live) + ' | ' + tri(r.conn)
+      + ' | ' + tri(r.cmContent) + ' | ' + tri(r.cmEditor)
+      + ' | ' + (r.applies == null ? '—' : r.applies)
+      + ' | ' + cell(r.why || '') + ' |');
+  }
+  return out.join('\n');
+}
+
 function reset() {
   try {
     rows = [];
@@ -7009,6 +7269,9 @@ function reset() {
     floatRows = [];
     floatSeq = 0;
     floatT0 = 0;
+    attachRows = [];
+    attachSeq = 0;
+    attachT0 = 0;
   } catch (e) { /* ignore */ }
 }
 
@@ -7304,7 +7567,7 @@ function floatTableRow(r) {
 function formatFloatifyTrace() {
   const list = floatAll();
   const out = [];
-  out.push('## 四、floatify 调用轨迹（阅读视图）');
+  out.push('## 五、floatify 调用轨迹（阅读视图）');
   out.push('');
   out.push('阅读视图的 valign 不走 `applyValignLayout`，而是 `floatify` 把偏移量加进绝对定位的 `top`。');
   out.push('这一节只记后者，与上面的编辑模式轨迹完全分开。');
@@ -7346,7 +7609,7 @@ function formatFloatifyTrace() {
 function formatFloatifyCompare(items) {
   const out = [];
   const list = Array.isArray(items) ? items : [];
-  out.push('## 五、floatify 的初值与现值对照');
+  out.push('## 六、floatify 的初值与现值对照');
   out.push('');
   out.push('对每个宿主：左边两列是 `floatify` 当初 / 最后一次记下的五个值（从轨迹里读）；');
   out.push('右边一列是命令触发这一刻重新调一次 `readerValignInfo` 的结果（只读，不写样式）。');
@@ -7414,8 +7677,7 @@ function nowErrText(it) {
 
 /** 完整文档：轨迹 + 现场快照 */
 function formatDoc(items, floatItems) {
-  const parts = [formatTrace(), formatSnapshot(items)];
-  parts.push(formatFloatifyTrace());
+  const parts = [formatTrace(), formatSnapshot(items), formatFloatifyUpstream(), formatFloatifyTrace()];
   if (floatItems && floatItems.length) parts.push(formatFloatifyCompare(floatItems));
   else parts.push(formatFloatifyCompare([]));
   return parts.join('\n\n') + '\n';
@@ -7424,21 +7686,27 @@ function formatDoc(items, floatItems) {
 module.exports = {
   MAX_ROWS,
   MAX_FLOAT_ROWS,
+  MAX_ATTACH_ROWS,
   EXIT_DOC,
   FLOAT_EXIT_DOC,
+  ATTACH_EXIT_DOC,
   SRC_DOC,
   record,
   recordFloat,
+  recordAttach,
   all,
   count,
   floatAll,
   floatCount,
+  attachAll,
+  attachCount,
   reset,
   hostTag,
   keyOf,
   f2,
   formatTrace,
   formatSnapshot,
+  formatFloatifyUpstream,
   formatFloatifyTrace,
   formatFloatifyCompare,
   formatDoc,
@@ -7705,7 +7973,9 @@ function loadModules() {
      hostTag: vtHostTag, formatTrace: formatValignTrace, formatSnapshot: formatValignSnapshot,
      formatDoc: formatValignDoc, MAX_FLOAT_ROWS: VT_MAX_FLOAT_ROWS, floatAll: vtFloatRows,
      floatCount: vtFloatCount, formatFloatifyTrace: formatFloatTrace,
-     formatFloatifyCompare: formatFloatCompare } = vtmod);
+     formatFloatifyCompare: formatFloatCompare, MAX_ATTACH_ROWS: VT_MAX_ATTACH_ROWS,
+     attachAll: vtAttachRows, attachCount: vtAttachCount,
+     formatFloatifyUpstream: formatAttachTrace } = vtmod);
 
   // valign 对齐标记覆盖层：只读，手动开关，样式全内联
   valoverlay = req('src/valoverlay.js');
@@ -7798,7 +8068,9 @@ function trackFloat(cfg, host, opts) {
   // 先把已经不在文档里的控件清掉：阅读视图会重建代码块，旧宿主早已脱离 DOM
   for (let i = floatControls.length - 1; i >= 0; i--) {
     const c = floatControls[i];
-    const gone = !c || !c.host || c.host.isConnected === false;
+    /* 还没插进 DOM 的控件不算死：renderBraceMap 那一刻宿主确实还没连上，
+     * 以前这里会连 dispose 一起把它清掉，浮动就永远起不来。 */
+    const gone = !c || !c.host || (c.host.isConnected === false && !c.waitingForDom);
     if (!gone) continue;
     try { if (c && c.dispose) c.dispose(); } catch (e) { /* ignore */ }
     floatControls.splice(i, 1);
@@ -9058,6 +9330,10 @@ function buildInternals() {
   vtFloatCount,
   formatFloatTrace,
   formatFloatCompare,
+  VT_MAX_ATTACH_ROWS,
+  vtAttachRows,
+  vtAttachCount,
+  formatAttachTrace,
   readerValignInfo,
   // valign 对齐标记覆盖层（只读可视化，自测用）
   valoverlay,

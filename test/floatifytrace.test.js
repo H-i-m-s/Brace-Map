@@ -141,7 +141,7 @@ function tZeroThenGrow() {
 
 function tTraceText() {
   const text = I.formatFloatTrace();
-  ok(text.indexOf('## 四、floatify 调用轨迹（阅读视图）') === 0,
+  ok(text.indexOf('## 五、floatify 调用轨迹（阅读视图）') >= 0,
     'floatify-text: 单独一节，标题写清是阅读视图');
   ok(text.indexOf('`!plan.length`') >= 0, 'floatify-text: 第一个出口在表里');
   ok(text.indexOf('`ok`') >= 0, 'floatify-text: 正常完成也在');
@@ -207,7 +207,7 @@ async function tCompareSection() {
 
   ok(!!written, 'floatify-compare: 真的调了 adapter.write');
   eq(written.path, 'brace-map-valign-trace.md', 'floatify-compare: 写进已有的那个轨迹文件');
-  ok(text.indexOf('## 五、floatify 的初值与现值对照') >= 0, 'floatify-compare: 有此一节');
+  ok(text.indexOf('## 六、floatify 的初值与现值对照') >= 0, 'floatify-compare: 有此一节');
   ok(text.indexOf('调用时的块高 0.00（图还没渲染） → 现在 169.79') >= 0,
     'floatify-compare: 判读指出初值是空图、现在是真值');
   ok(text.indexOf('这一拍没写 top（出口 `!plan.length`）') >= 0,
