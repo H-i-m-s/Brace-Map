@@ -219,6 +219,8 @@ function recordFloat(entry) {
       float: entry && entry.float ? String(entry.float) : '',
       bH: entry && entry.bH !== undefined ? entry.bH : null,
       bW: entry && entry.bW !== undefined ? entry.bW : null,
+      blk: entry && entry.blk ? String(entry.blk) : '',
+      anc: entry && entry.anc ? String(entry.anc) : '',
       vin: vin
         ? {
           valign: vin.valign || '',
@@ -650,13 +652,14 @@ const FLOAT_EXIT_DOC = [
 
 /** 表头：floatify 一张表 */
 function floatTableHead() {
-  return '| # | +ms | 宿主 | → 出口 | bH | bW | val | lineH | imgH | yTitle | off | baseTop | top | recH | 写了 |';
+  return '| # | +ms | 宿主 | → 出口 | bH | bW | blk（选中的块） | anc（定位祖先） | val | lineH | imgH | yTitle | off | baseTop | top | recH | 写了 |';
 }
 
 function floatTableRow(r) {
   const v = r.vin || {};
   return '| ' + r.n + ' | +' + r.dt + ' | ' + cell(r.tag) + ' | `' + cell(r.exit) + '`'
-    + ' | ' + f2(r.bH) + ' | ' + f2(r.bW) + ' | ' + cell(r.val || '?')
+    + ' | ' + f2(r.bH) + ' | ' + f2(r.bW) + ' | ' + cell(r.blk || '—') + ' | ' + cell(r.anc || '—')
+    + ' | ' + cell(r.val || '?')
     + ' | ' + f2(v.lineH) + ' | ' + f2(v.imgH) + ' | ' + (v.yTitle === null || v.yTitle === undefined ? '—' : f2(v.yTitle))
     + ' | ' + f2(v.offset) + ' | ' + f2(r.baseTop) + ' | ' + f2(r.top)
     + ' | ' + f2(r.recH) + ' | ' + (r.wrote ? '1' : '0') + ' |';
@@ -682,7 +685,9 @@ function formatFloatifyTrace() {
   out.push('| --- | --- |');
   out.push('| `bH` | **调用那一刻 `block.getBoundingClientRect().height`**——图还没渲染时它是 0 |');
   out.push('| `bW` | 同上，宽 |');
-  out.push('| `lineH` / `imgH` / `yTitle` / `off` | `readerValignInfo` 当场量出的四个值 |');
+  out.push('| `blk` | `pickContext` 选中的那个块：`tagName.className`（截短到 40 字） |');
+  out.push('| `anc` | 被当成定位祖先的那个元素：同上 |');
+  out.push('| `lineH` / `imgH` / `yTitle` / `off` | `readerValignInfo` 当场量出的四个值（`imgH` 是**实际用来算高**的那个值：块本身高 0 时会从宿主 / SVG 退回来） |');
   out.push('| `baseTop` | 块在流里的位置（= 块 rect 顶 − 祖先 rect 顶） |');
   out.push('| `top` | 最终写下去的值 = baseTop + off |');
   out.push('| `recH` | 写完宽度之后重新量到的块高（可能与 bH 不同） |');
@@ -771,6 +776,23 @@ function formatFloatifyCompare(items) {
     out.push('判读：');
     for (const n of notes) out.push('- ' + n);
     out.push('');
+    if (Array.isArray(it.chain) && it.chain.length) {
+      out.push('父链各层：从宿主往上量，最多 8 层。★blk = `pickContext` 选中的块，★anc = 定位祖先。');
+      out.push('高度在哪一层变 0，就是图高在哪一层丢的。');
+      out.push('');
+      out.push('| 层 | 元素 | 高 | 宽 | 标记 |');
+      out.push('| --- | --- | --- | --- | --- |');
+      for (const c of it.chain) {
+        const marks = [];
+        if (c.isBlock) marks.push('★blk');
+        if (c.isAncestor) marks.push('★anc');
+        if (c.flow) marks.push('正文列');
+        if (!(Number(c.h) > 0)) marks.push('高 0');
+        out.push('| ' + c.lv + (c.lv === 0 ? '（宿主）' : '') + ' | ' + cell(c.name || '?')
+          + ' | ' + f2(c.h) + ' | ' + f2(c.w) + ' | ' + marks.join(' · ') + ' |');
+      }
+      out.push('');
+    }
   }
   return out.join('\n');
 }

@@ -46,6 +46,7 @@ function makeEl(o) {
   const el = {
     style: {},
     tagName: opt.tag || 'DIV',
+    className: (opt.cls || []).join(' '),
     classList: { contains: (c) => (opt.cls || []).indexOf(c) >= 0 },
     parentElement: null,
     nextElementSibling: null,
@@ -71,6 +72,7 @@ function makeEl(o) {
       };
     },
     querySelectorAll() { return el.__roots; },
+    querySelector: (sel) => (sel === 'svg' ? (el.__svg || null) : null),
     closest: () => null,          // 阅读视图：不在 .cm-editor 里
   };
   Object.defineProperty(el, 'offsetHeight', { get: () => el.__box.height });
@@ -215,6 +217,10 @@ async function tCompareSection() {
   ok(text.indexOf('只有一次调用，之后没有重算') >= 0, 'floatify-compare: 点出没有回头重算');
   ok(text.indexOf('| imgH | 0.00 | 0.00 | 169.79 |') >= 0,
     'floatify-compare: 三列并排（初值 / 末值 / 现值）');
+  ok(text.indexOf('父链各层') >= 0, 'floatify-compare: 有父链各层表');
+  ok(text.indexOf('★blk') >= 0, 'floatify-compare: 标出了选中的块');
+  ok(text.indexOf('★anc') >= 0, 'floatify-compare: 标出了定位祖先');
+  ok(text.indexOf('正文列') >= 0, 'floatify-compare: 标出了正文列（sizer）');
 }
 
 /* ------------------------------ 对照：写过一个偏的 top ------------------------------ */
@@ -251,6 +257,86 @@ async function tCompareWithWrongTop() {
   ok(text.indexOf('写下的 top 是按 100.00 算的') >= 0, 'floatify-compare2: 指出 top 是按初值算的');
 }
 
+/* ------------------------------ 高 0 的壳 ------------------------------ */
+
+/**
+ * 真机形状：sizer → 外层壳(高 0) → 内层壳(高 0) → 宿主(169.79)。
+ * 壳之所以高 0，是因为 applyFloatLayout 先给宿主写了 float: right，
+ * 宿主一浮动，包着它的壳高度就塌成 0。
+ */
+function buildCollapsed() {
+  const sizer = makeEl({ h: 2000, clientW: 800, kids: 3, cls: ['markdown-preview-sizer'] });
+  const outer = makeEl({ h: 0, top: 100, kids: 1 });
+  const inner = makeEl({ h: 0, top: 100, kids: 1 });
+  const host = makeEl({ h: 169.79, top: 100, w: 670.52, kids: 1 });
+  const para = makeEl({ tag: 'P', h: 100, top: 100, cs: { lineHeight: '31.5px' } });
+  const rootText = makeEl({ h: 24, top: 179.9 });
+
+  outer.parentElement = sizer;
+  inner.parentElement = outer;
+  host.parentElement = inner;
+  host.__roots = [rootText];
+  /* 正文段是 sizer 的直接子元素，挂在最外层壳后面 */
+  outer.nextElementSibling = para;
+  para.previousElementSibling = outer;
+
+  return { sizer, outer, inner, host, para, rootText };
+}
+
+function tCollapsedShell() {
+  I.vtReset();
+  const { sizer, outer, inner, host, para } = buildCollapsed();
+
+  /* 1) pickContext 不能把高 0 的壳当块：它量不出图高，宽度也不是图宽 */
+  const ctx = I.pickContext(host);
+  ok(ctx, 'pickcontext: 能选出上下文');
+  eq(ctx && ctx.ancestor === sizer, true, 'pickcontext: 祖先爬到正文列');
+  eq(ctx && ctx.block === host, true, 'pickcontext: 块是宿主（有高度那个），不是高 0 的壳');
+  ok(outer !== ctx.block && inner !== ctx.block, 'pickcontext: 两层壳都没被选成块');
+
+  /* 2) floatify 能算出 plan，并且写下真实 top */
+  const cfg = { float: 'right', valign: 'middle' };
+  const rec = I.floatify(host, cfg);
+  ok(rec, 'pickcontext: floatify 不再停在 !plan.length');
+  eq(rec && rec.height, 169.79, 'pickcontext: 记录的图高是真实值');
+  ok(rec && rec.wrap.length >= 1, 'pickcontext: 留白落到了正文段上');
+  ok(para.style.marginRight && para.style.marginRight !== '0px',
+    'pickcontext: 正文段真的加了右边距');
+  eq(host.style.top, '23.85px', 'pickcontext: top = baseTop 100 + offset (−76.15)');
+
+  const rows = I.vtFloatRows();
+  eq(rows.length, 1, 'pickcontext: 轨迹一条');
+  eq(rows[0].exit, 'ok', 'pickcontext: 出口是正常完成');
+  eq(rows[0].bH, 169.79, 'pickcontext: bH 记的是真实图高');
+  eq(rows[0].vin.offset, -76.15, 'pickcontext: 偏移 −76.15');
+  eq(rows[0].baseTop, 100, 'pickcontext: baseTop 100');
+  eq(rows[0].top, 23.85, 'pickcontext: top 23.85');
+  ok(String(rows[0].blk).indexOf('div') >= 0, 'pickcontext: blk 列写上了选中的元素');
+  ok(String(rows[0].anc).indexOf('markdown-preview-sizer') >= 0,
+    'pickcontext: anc 列写上了正文列');
+}
+
+/** 宿主自己也是 0 高（还没渲染）：退回 SVG 的高度，否则图高仍是 0 */
+function tZeroHostFallsBackToSvg() {
+  I.vtReset();
+  const sizer = makeEl({ h: 2000, clientW: 800, kids: 2, cls: ['markdown-preview-sizer'] });
+  const host = makeEl({ h: 0, top: 100, w: 670.52, kids: 1 });
+  const para = makeEl({ tag: 'P', h: 100, top: 100, cs: { lineHeight: '31.5px' } });
+  const rootText = makeEl({ h: 24, top: 179.9 });
+  const svg = makeEl({ h: 169.79, top: 100, w: 670.52 });
+  host.parentElement = sizer;
+  host.nextElementSibling = para;
+  para.previousElementSibling = host;
+  host.__roots = [rootText];
+  host.__svg = svg;
+
+  const rec = I.floatify(host, { float: 'right', valign: 'middle' });
+  ok(rec, 'pickcontext: 宿主高 0 时靠 SVG 也能算出 plan');
+  eq(rec && rec.height, 169.79, 'pickcontext: 图高退回 SVG 的 169.79');
+  eq(I.vtFloatRows()[0].vin.imgH, 169.79, 'pickcontext: 轨迹里 imgH 也是真值');
+  eq(I.vtFloatRows()[0].bH, 0, 'pickcontext: bH 仍如实记 0（宿主自己确实没高度）');
+}
+
 /* ------------------------------ 登记 ------------------------------ */
 
 suite('floatify-trace/zero-then-grow', tZeroThenGrow);
@@ -258,3 +344,5 @@ suite('floatify-trace/text', tTraceText);
 suite('floatify-trace/exits', tExitCodes);
 suite('floatify-trace/compare', tCompareSection);
 suite('floatify-trace/compare-wrong-top', tCompareWithWrongTop);
+suite('floatify-trace/collapsed-shell', tCollapsedShell);
+suite('floatify-trace/zero-host-svg', tZeroHostFallsBackToSvg);

@@ -345,6 +345,16 @@ function isPureWrapper(parent, child) {
  * 只是包装，脱离流要作用在最外层壳上，留白要落在壳的兄弟上（那才是正文块）。
  * 判断依据：父盒高度≈图高 → 它只是壳，继续往上爬；一旦父盒里还有别的内容，
  * 它就是要用的定位祖先。
+ *
+ * 两个角色必须分开：
+ *   祖先 = 往上爬到的那个框（决定坐标基准，也决定留白落在谁身上）
+ *   块   = 真正能被绝对定位、且**量得到高度**的那个元素
+ *
+ * 为什么块不能直接用「爬到的最外层 child」：阅读视图里 applyFloatLayout 先给
+ * 宿主写了 float: right，宿主一浮动，包着它的壳高度就塌成 0。继续往上爬是必要的
+ * （否则拿不到真正的定位祖先），但把这种 0 高壳当成块就错了——它既量不出图高，
+ * 宽度也是正文列宽而不是图宽，留白会被算成“图占满整列”。
+ * 所以额外记一个 solid：爬到过的、高度 > 0 的最外层 child。
  */
 function pickContext(el) {
   if (!el || typeof el.getBoundingClientRect !== 'function') return null;
@@ -352,19 +362,48 @@ function pickContext(el) {
   if (!parent) return null;
   const own = elHeight(el);
   let child = el;
+  let solid = own > 0 ? el : null;
   for (let i = 0; i < CLIMB_LIMIT && parent; i++) {
     // sizer 是正文列，就算整页只有这一张图也不能再往上爬
-    if (isFlowColumn(parent)) return { ancestor: parent, block: child };
+    if (isFlowColumn(parent)) return { ancestor: parent, block: solid || child };
     const ph = elHeight(parent);
     // 两种信号：只包着一个元素（壳），或者高度就是个图高（壳上有外边距也算）
     const wrapper = isPureWrapper(parent, child) || (ph > 0 && own > 0 && ph <= own + 2);
-    if (!wrapper) return { ancestor: parent, block: child };
+    if (!wrapper) return { ancestor: parent, block: solid || child };
     const up = parent.parentElement;
-    if (!up) return { ancestor: parent, block: child };
+    if (!up) return { ancestor: parent, block: solid || child };
     child = parent;
+    if (elHeight(child) > 0) solid = child;   // 这层壳有真实高度：它才是图的外框
     parent = up;
   }
-  return { ancestor: parent, block: child };
+  return { ancestor: parent, block: solid || child };
+}
+
+/**
+ * block 归属的那个 ancestor 直接子元素（正文块层级的那个）。
+ * block 本来就是直接子元素时返回它自己。
+ */
+function childOfAncestor(block, ancestor) {
+  if (!block) return null;
+  if (!ancestor) return block;
+  let node = block;
+  for (let i = 0; node && i < 16; i++) {
+    if (node.parentElement === ancestor) return node;
+    node = node.parentElement;
+  }
+  return block;   // 结构意外：退回老行为
+}
+
+/**
+ * 留白从哪个块开始数。
+ *
+ * block 可能不是 ancestor 的直接子元素（它被几层壳包着），而只有 ancestor 的
+ * 直接子元素的兄弟才是「正文块」。所以先往上找到「ancestor 的那个直接子元素」，
+ * 再从它的下一个兄弟开始。block 本来就是直接子元素时，结果与 block.nextElementSibling 相同。
+ */
+function wrapStartAfter(block, ancestor) {
+  const anchor = childOfAncestor(block, ancestor);
+  return anchor ? anchor.nextElementSibling : null;
 }
 
 /* --------------------------- 浮动本体 --------------------------- */
@@ -383,10 +422,10 @@ function pickContext(el) {
  *
  * @returns {{valign:string, lineH:number, imgH:number, yTitle:number|null, offset:number}}
  */
-function readerValignInfo(host, block, cfg, bRect) {
+function readerValignInfo(host, block, cfg, bRect, anchorEl) {
   const valign = (cfg && cfg.valign) || 'bottom';
   const imgH = bRect ? bRect.height : 0;
-  const lineH = measureReaderLineHeight(block);
+  const lineH = measureReaderLineHeight(block, anchorEl);
   const y = measureTitleCenter(host, block);
   const yTitle = Number.isFinite(y) ? round2(y) : null;
   return {
@@ -396,6 +435,52 @@ function readerValignInfo(host, block, cfg, bRect) {
     yTitle,
     offset: round2(valignOffset(lineH, imgH, yTitle, valign)),
   };
+}
+
+/**
+ * 元素摘要：`div.el-pre.bm-xxx`，截短到 40 字。
+ * 轨迹里的 blk / anc 两列用它：「选中的是哪个元素」比数字更能定位问题。
+ */
+function elName(el) {
+  if (!el) return '—';
+  try {
+    const tag = String(el.tagName || el.nodeName || '?').toLowerCase();
+    let cls = '';
+    if (typeof el.className === 'string' && el.className) cls = el.className;
+    else if (el.classList && Array.isArray(el.classList._list)) cls = el.classList._list.join(' ');
+    else if (el.classList && typeof el.classList.length === 'number') {
+      const parts = [];
+      for (let i = 0; i < el.classList.length; i++) parts.push(el.classList[i]);
+      cls = parts.join(' ');
+    }
+    const short = String(cls || '').trim().split(/\s+/).filter(Boolean).join('.');
+    const out = short ? tag + '.' + short : tag;
+    return out.length > 40 ? out.slice(0, 40) + '…' : out;
+  } catch (e) { return '?'; }
+}
+
+/**
+ * 「图高」到底是多少：block 自己量得到就用它，量不到退回宿主，再退回里面的 SVG。
+ *
+ * 为什么需要这道兜底：阅读视图里 applyFloatLayout 会先给宿主写上 float: right，
+ * 宿主一浮动，包着它的那层壳（.el-pre 这类）高度就塌成 0。pickContext 又恰恰会把
+ * 这种壳当成「被选中的块」（结构上必须这样，见那里的注释），于是 bRect.height = 0。
+ *
+ * 而 collectWrapTargets 拿到 height = 0 时直接返回空，floatify 就永远停在
+ * !plan.length —— 现场表现为「bH 恒为 0、bW 有值，图完全不动」。
+ * 所以这里必须交出一个真实图高，而不是把 0 传下去。
+ */
+function figureHeightOf(block, host) {
+  const own = elHeight(block);
+  if (own > 0) return own;
+  const hostH = elHeight(host);
+  if (hostH > 0) return hostH;
+  let svg = null;
+  try {
+    svg = (host && typeof host.querySelector === 'function') ? host.querySelector('svg') : null;
+  } catch (e) { svg = null; }
+  const svgH = elHeight(svg);
+  return svgH > 0 ? svgH : 0;
 }
 
 /**
@@ -426,8 +511,8 @@ function vtFloat(el, cfg, st, exit) {
       exit,
       host: el,
       block: s.block || null,
-      bH: s.bRect ? s.bRect.height : null,
-      bW: s.bRect ? s.bRect.width : null,
+      bH: s.bRectRaw ? s.bRectRaw.height : (s.bRect ? s.bRect.height : null),
+      bW: s.bRectRaw ? s.bRectRaw.width : (s.bRect ? s.bRect.width : null),
       vin: s.vin || null,
       baseTop: s.baseTop,
       top: s.top,
@@ -435,6 +520,8 @@ function vtFloat(el, cfg, st, exit) {
       wrote: !!s.wrote,
       val: (cfg && cfg.valign) || 'bottom',
       float: (cfg && cfg.float) || '',
+      blk: s.blk || '',
+      anc: s.anc || '',
       err: s.err || '',
     });
   } catch (e) { /* 轨迹失败绝不影响浮动 */ }
@@ -458,8 +545,24 @@ function floatifyPass(el, cfg, o) {
 
   const aRect = rectOf(ancestor);
   if (!aRect) return vtFloat(el, cfg, { block }, '!aRect');
-  const bRect = rectOf(block);
-  if (!bRect) return vtFloat(el, cfg, { block }, '!bRect');
+  const bRectRaw = rectOf(block);
+  if (!bRectRaw) return vtFloat(el, cfg, { block }, '!bRect');
+
+  /*
+   * 图高单独算，不用 bRect.height 原值：块可能是一个「有宽没高」的壳
+   * （宿主浮动把外层壳塌成 0 的情况，见 figureHeightOf 的注释）。
+   * 下面的 bRect 统一用这个高度，后续留白范围、偏移、记录全拿真实图高。
+   */
+  const imgH = figureHeightOf(block, el);
+  const bRect = {
+    left: bRectRaw.left,
+    top: bRectRaw.top,
+    width: bRectRaw.width,
+    height: imgH,
+    right: bRectRaw.right,
+    bottom: bRectRaw.top + imgH,
+  };
+  const names = { blk: elName(block), anc: elName(ancestor) };
 
   const gap = Number(o.gap) > 0 ? Number(o.gap) : FLOAT_GAP;
   const svgRect = o.svg ? rectOf(o.svg) : null;
@@ -489,7 +592,8 @@ function floatifyPass(el, cfg, o) {
    * 多少，需要绕的段落就跟着挪多少）。量的时候什么都还没写，所以提前到
    * 留白范围之前不会引入任何状态差异。
    */
-  const vin = readerValignInfo(el, block, cfg, bRect);
+  const anchorEl = childOfAncestor(block, ancestor);
+  const vin = readerValignInfo(el, block, cfg, bRect, anchorEl);
 
   /*
    * 后面没有兄弟块时别动手：浮动的全部意义是「让后面的文字绕上来」，
@@ -497,11 +601,11 @@ function floatifyPass(el, cfg, o) {
    * 从它自己的壳里抽出来）。用流里的高度先数一遍上界。
    * startOffset 把 valign 的偏移量带进来：图顶不再默认贴第一个兄弟顶边。
    */
-  const plan = collectWrapTargets(block.nextElementSibling, record.height, {
+  const plan = collectWrapTargets(wrapStartAfter(block, ancestor), record.height, {
     limit: o.maxBlocks,
     startOffset: vin.offset,
   });
-  if (!plan.length) return vtFloat(el, cfg, { block, bRect, vin }, '!plan.length');
+  if (!plan.length) return vtFloat(el, cfg, { block, bRect, bRectRaw, vin, ...names }, '!plan.length');
 
   // 定位祖先进程：只补 position: relative，不动 display（动 display 会改整页排版）
   const pos = computedPosition(ancestor);
@@ -552,7 +656,7 @@ function floatifyPass(el, cfg, o) {
    * 别让垂直偏移串进来变成间距。
    */
   const after = rectOf(block) || bRect;
-  record.height = elHeight(block);
+  record.height = elHeight(block) || imgH;   // 壳高 0 时不要把图高记成 0
   record.clearance = side === 'right'
     ? Math.max(0, contentRight - after.left)
     : Math.max(0, after.right - contentLeft);
@@ -575,8 +679,8 @@ function floatifyPass(el, cfg, o) {
     if (acc >= record.height + vin.offset) break;   // 图底 = 图高 + 垂直偏移
   }
   vtFloat(el, cfg, {
-    block, bRect, vin, baseTop: record.valign.baseTop, top: record.valign.top,
-    recH: record.height, wrote: true,
+    block, bRect, bRectRaw, vin, baseTop: record.valign.baseTop, top: record.valign.top,
+    recH: record.height, wrote: true, ...names,
   }, 'ok');
   return record;
 }
@@ -646,10 +750,17 @@ function floatReadiness(el, cfg) {
     if (!el || typeof el.getBoundingClientRect !== 'function') return null;
     const ctx = pickContext(el);
     if (!ctx || !ctx.ancestor || !ctx.block || ctx.block === ctx.ancestor) return null;
-    const bRect = rectOf(ctx.block);
-    if (!bRect || !(bRect.height > 0)) return null;
-    const vin = readerValignInfo(el, ctx.block, cfg, bRect);
-    const plan = collectWrapTargets(ctx.block.nextElementSibling, bRect.height, {
+    const raw = rectOf(ctx.block);
+    if (!raw) return null;
+    /* 与 floatify 用同一套图高取法：块高 0 时退回宿主 / SVG */
+    const imgH = figureHeightOf(ctx.block, el);
+    if (!(imgH > 0)) return null;
+    const bRect = {
+      left: raw.left, top: raw.top, width: raw.width, height: imgH,
+      right: raw.right, bottom: raw.top + imgH,
+    };
+    const vin = readerValignInfo(el, ctx.block, cfg, bRect, childOfAncestor(ctx.block, ctx.ancestor));
+    const plan = collectWrapTargets(wrapStartAfter(ctx.block, ctx.ancestor), imgH, {
       startOffset: vin.offset,
     });
     if (!plan.length) return null;
@@ -1474,8 +1585,8 @@ function readerParagraph(block) {
  * 再用「块高 ÷ Range 数出的视觉行数」。两个都拿不到返回 0，调用方按「不偏移」处理。
  * 与编辑模式共用同一套判据，只是「那一行」换成了段落，所以单独一个入口。
  */
-function measureReaderLineHeight(block) {
-  const para = readerParagraph(block);
+function measureReaderLineHeight(block, anchorEl) {
+  const para = readerParagraph(anchorEl || block);
   if (!para) return 0;
   const fromCss = computedPx(para, 'lineHeight');
   if (fromCss > 0) return fromCss;
@@ -2077,6 +2188,9 @@ module.exports = {
   readMargins,
   isLivePreview,
   pickContext,
+  childOfAncestor,
+  wrapStartAfter,
+  figureHeightOf,
   floatify,
   resetFloat,
   attachFloatWrap,
