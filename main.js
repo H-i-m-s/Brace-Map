@@ -3088,6 +3088,12 @@ function measureTitleCenter(host, origin) {
  *
  * 没有 closest 的环境（测试里的假 DOM）退回 climbTo，限于明显够用的深度。
  */
+/** 宿主里那个 SVG（图真正画在里面的地方）。拿不到返回 null。 */
+function pickSvg(host) {
+  if (!host || typeof host.querySelector !== 'function') return null;
+  try { return host.querySelector('svg'); } catch (e) { return null; }
+}
+
 function inEditorNow(host) {
   if (!host) return false;
   if (typeof host.closest === 'function') {
@@ -3124,15 +3130,20 @@ function applyValignLayout(host, cfg, retried) {   // retried：兼容旧调用�
     valign: cfg.valign || 'bottom',
     lineH: 0, imgH: 0, yTitle: null, offset: 0, applied: false,
   };
-  host.__bmValignInfo = info;
 
-  const embed = host.parentElement;
-  if (!embed || host.isConnected === false) return 0;   // 还没挂进文档：当 bottom
-
-  info.imgH = round2(elHeight(host));
+  /*
+   * 先量再记账。以前 info 在量之前就挂到宿主上，一旦中途 return，就留下
+   * 一条「记录存在但字段全 0」的残影，诊断读到的 imgH 0.00 就是这么来的，
+   * 排查时会被带偏。
+   *
+   * imgH 优先宿主自身，拿不到再退到 SVG：浮动刚生效、或宿主还没排出高度时，
+   * 宿主 rect 可能是 0，而图已经在 SVG 里画好了。
+   */
+  info.imgH = round2(elHeight(host) || elHeight(pickSvg(host)));
   info.lineH = round2(measureLineHeight(host));
   const y = measureTitleCenter(host);
   info.yTitle = Number.isFinite(y) ? round2(y) : null;
+  host.__bmValignInfo = info;
 
   // 行高量不到（0）或 yTitle 取不到（null）时，valignOffset 自己退化为 0
   const offset = valignOffset(info.lineH, info.imgH, info.yTitle, info.valign);
