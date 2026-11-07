@@ -159,7 +159,7 @@ function tMeasureFirstFrame() {
   const ctl = I.attachLivePreviewFloat(tree.host, { float: 'right' },
     { svg: tree.svg, cm, timers: clock });
   ok(!!ctl, 'measure: 控制器挂上了');
-  eq(tree.embed.style.float, 'right', 'measure: 样式已经写了');
+  eq(tree.embed.style.height, '45px', 'measure: 样式已经写了（widget 钉成一行）');
 
   eq(cm.calls, 0, 'measure: 施加完不当场调（浏览器还没布局）');
   eq(clock.rafPending(), 1, 'measure: 排了一帧');
@@ -207,7 +207,7 @@ function tMeasureNoCm() {
   const ctl = I.attachLivePreviewFloat(tree.host, { float: 'right' },
     { svg: tree.svg, timers: clock });
   ok(!!ctl, 'measure-nocm: 拿不到 cm 也照样挂控制器');
-  eq(tree.embed.style.float, 'right', 'measure-nocm: 样式不受影响');
+  eq(tree.embed.style.height, '45px', 'measure-nocm: 样式不受影响');
   let threw = '';
   try { clock.flushRaf(); } catch (e) { threw = String(e && e.message ? e.message : e); }
   eq(threw, '', 'measure-nocm: 拿不到 cm 不抛错');
@@ -370,16 +370,16 @@ function tSwitchLive() {
   const cm = fakeCm();
   const ctl = I.attachLivePreviewFloat(tree.host, { float: 'right' },
     { svg: tree.svg, cm, timers: clock });
-  eq(tree.embed.style.float, 'right', 'switch-live: 开着时是浮动的');
+  eq(tree.embed.style.height, '45px', 'switch-live: 开着时是浮动的');
 
   I.setLpFloatEnabled(false);
-  ok(tree.embed.style.float === undefined, 'switch-live: 关掉后 float 当场撤回');
+  ok(tree.embed.style.height === undefined, 'switch-live: 关掉后 float 当场撤回');
   ok(tree.embed.style.margin === undefined, 'switch-live: margin 也撤回');
   ok(tree.host.style.display === undefined, 'switch-live: 宿主的 flow-root 也撤回');
   eq(I.measureSchedulerCount(), 0, 'switch-live: 重测调度器一起拆了');
 
   I.setLpFloatEnabled(true);
-  eq(tree.embed.style.float, 'right', 'switch-live: 再打开立刻恢复浮动');
+  eq(tree.embed.style.height, '45px', 'switch-live: 再打开立刻恢复浮动');
   ctl.dispose();
   eq(I.measureSchedulerCount(), 0, 'switch-live: 卸载后调度器归零');
 }

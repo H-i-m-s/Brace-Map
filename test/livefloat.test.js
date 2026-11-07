@@ -6,14 +6,14 @@
  * Live Preview 里正文被切成一个个 .cm-line，widget 浮在自己那行，后面的行跟它
  * 没有兄弟关系 —— 阅读视图那套「给后续兄弟加外边距」对它无效。两种结构分两条路：
  *
- *   direct-embed（.cm-content > .cm-embed-block） → 纯 CSS float，零 JS 布局
+ *   direct-embed（.cm-content > .cm-embed-block） → 一行高度 + 绝对定位图 + 逐行留白
  *   cm-line（.cm-content > .cm-line > .cm-embed-block）→ 绝对定位 + 逐行 padding
  *
  * 真实布局只能靠浏览器验，这里测能用假 DOM 判定的几件事：
  *   1. planLivePreviewLines / planWrappedLines：该给哪些行留白（老结构）
  *   2. planLinePads：多张图压到同一行时取最大值、不叠加
  *   3. applyLivePreviewFloat + 账本：施加、重复施加、复位是否彻底（老结构）
- *   4. applyLivePreviewCssFloat：新结构只写 float / width / margin，一行 padding 都不加
+ *   4. applyLivePreviewCssFloat：新结构把 widget 钉成一行、图绝对定位、后续行留白
  *   5. 几个「不该动手」的守卫
  * ============================================================ */
 
@@ -53,6 +53,7 @@ function fakeEl(classes, h, rect, init) {
     parentElement: null,
     nextElementSibling: null,
     isConnected: true,
+    nodeType: 1,
     offsetHeight: h || 0,
     clientWidth: 0,
     clientLeft: 0,
@@ -579,7 +580,7 @@ function tDirectCandidates() {
   eq(onlyWidget.length, 2, 'lp-direct: 从另一个 widget 起步也继续往后扫');
 }
 
-/* ------------------ 新结构（direct-embed）：纯 CSS float ------------------ */
+/* -------------- 新结构（direct-embed）：一行高度 + 绝对定位图 + 逐行留白 -------------- */
 
 function tCssApply() {
   const tree = cmTreeDirect();
@@ -588,49 +589,65 @@ function tCssApply() {
   eq(rec.mode, 'direct-embed', 'lp-css: 结果里带分支名');
   eq(rec.side, 'right', 'lp-css: 右浮动');
   eq(rec.width, 400, 'lp-css: 图宽取 SVG 渲染宽');
-  eq(rec.margin, '0 0 8px 16px', 'lp-css: 右浮动留左边距、下边留一点');
-  eq(rec.styles.length, 6, 'lp-css: 一共只写 6 个属性');
+  eq(rec.lineH, 60, 'lp-css: 一行高取候选行里最矮的');
+  eq(rec.imgH, 106, 'lp-css: 图高取 SVG / 宿主里大的那个');
+  eq(rec.overflow, 46, 'lp-css: 需要下行盖住的高度 = 图底 - widget 底');
+  eq(rec.span, 416, 'lp-css: 留白宽度 = 图宽 + 间距');
 
-  /* 只写 float / width / margin：不定位、不算 top、不碰行与 content */
-  eq(tree.embed.style.float, 'right', 'lp-css: embed 是原生 float');
-  eq(tree.embed.style.width, '400px', 'lp-css: 宽度落在 embed 上');
-  eq(tree.embed.style.margin, '0 0 8px 16px', 'lp-css: 间距落在 embed 上');
+  /* widget 钉成一行：CSS 高度 / DOM 高度 / CM6 记账要三方一字 */
+  eq(tree.embed.style.height, '60px', 'lp-css: embed 高度钉成一行');
+  eq(tree.embed.style.minHeight, '0', 'lp-css: min-height 归零');
+  eq(tree.embed.style.maxHeight, '60px', 'lp-css: max-height 也是一行');
+  eq(tree.embed.style.overflow, 'visible', 'lp-css: 溢出可见（图要浮出去）');
+  eq(tree.embed.style.float, 'none', 'lp-css: 明确不 float');
+  eq(tree.embed.style.width, 'auto', 'lp-css: 宽度不压窄');
+  eq(tree.embed.style.position, 'relative', 'lp-css: 当绝对定位的包含块');
+  eq(tree.embed.style.margin, '0', 'lp-css: 外边距清零');
   eq(tree.embed.style.__important.margin, 'important',
-    'lp-css: 间距带 !important（app.css 给 .cm-content > * 写了 margin: 0 !important）');
-  ok(tree.embed.style.position !== 'absolute', 'lp-css: 没有绝对定位');
-  ok(tree.embed.style.top === undefined, 'lp-css: 不算 top');
-  ok(tree.embed.style.left === undefined && tree.embed.style.right === undefined, 'lp-css: 不贴 left / right');
-  ok(tree.embed.style.maxWidth === undefined, 'lp-css: 不碰 max-width');
-  ok(tree.content.style.position === undefined, 'lp-css: .cm-content 的 position 不动');
-  eq(tree.lines[0].style.paddingRight, undefined, 'lp-css: 第一行没有 padding');
-  eq(tree.lines[1].style.paddingRight, undefined, 'lp-css: 第二行没有 padding');
-  eq(tree.lines[0].style.paddingLeft, undefined, 'lp-css: 左侧也没 pad 东西');
+    'lp-css: 清零带 !important（app.css 给 .cm-content > * 写了 margin: 0 !important）');
 
-  /* 宿主重新归位：否则图会被自己的 margin 往里推，贴不到边界 */
+  /* 图绝对定位贴右边：从这一行往下溢出 */
+  eq(tree.host.style.position, 'absolute', 'lp-css: 宿主绝对定位');
+  eq(tree.host.style.top, '0', 'lp-css: 图顶贴住 widget 顶');
+  eq(tree.host.style.right, '0', 'lp-css: 右浮动贴正文列右边');
+  eq(tree.host.style.left, 'auto', 'lp-css: 另一侧自动');
+  eq(tree.host.style.width, '400px', 'lp-css: 宽度落在宿主上');
+  eq(tree.host.style.maxWidth, 'none', 'lp-css: 抹掉 applyFloatLayout 的 max-width:100%');
   eq(tree.host.style.float, 'none', 'lp-css: 宿主不再浮动');
+  eq(tree.host.style.clear, 'none', 'lp-css: clear:both 也清掉');
   eq(tree.host.style.margin, '0', 'lp-css: 宿主外边距清零');
   eq(tree.host.style.display, 'flow-root', 'lp-css: 宿主自成一块');
+  ok(tree.content.style.position === undefined, 'lp-css: .cm-content 的 position 不动');
 
-  /* 左浮动镜像 */
+  /* 后续行留白：图往下溢出 46，一行 60 就盖住了，第二行不碰 */
+  eq(tree.lines[0].style.paddingRight, '416px', 'lp-css: 第一行留白');
+  eq(tree.lines[1].style.paddingRight, undefined, 'lp-css: 图只溢出 46，第二行不用留白');
+  eq(tree.lines[2].style.paddingRight, undefined, 'lp-css: 第三行更不碰');
+  eq(tree.lines[0].style.paddingLeft, undefined, 'lp-css: 右浮动不碰左留白');
+  eq(rec.pads.length, 1, 'lp-css: 留白行数');
+  eq(rec.covered, 60, 'lp-css: 累积高度');
+  eq(rec.shortfall, 0, 'lp-css: 盖住了，没有缺口');
+  eq(rec.stopped, true, 'lp-css: 是盖住之后停的');
+
+  /* 左浮动镜像：图贴左，行加左留白 */
   const left = cmTreeDirect();
   const lrec = I.applyLivePreviewCssFloat(left.host, { float: 'left' }, { svg: left.svg });
   eq(lrec.side, 'left', 'lp-css: 左浮动');
-  eq(lrec.margin, '0 16px 8px 0', 'lp-css: 左浮动留右边距');
-  eq(left.embed.style.float, 'left', 'lp-css: float 落成 left');
+  eq(left.host.style.left, '0', 'lp-css: 贴左边');
+  eq(left.host.style.right, 'auto', 'lp-css: 右侧自动');
+  eq(left.lines[0].style.paddingLeft, '416px', 'lp-css: 左浮动加左留白');
+  eq(left.lines[0].style.paddingRight, undefined, 'lp-css: 左浮动不碰右留白');
 
-  /* 图宽：配置优先，超列宽收到列宽 */
+  /* 图宽：配置优先，超列宽收到列宽，留白跟着宽度走 */
   const cfgW = cmTreeDirect();
   const wrec = I.applyLivePreviewCssFloat(cfgW.host, { float: 'right', width: 300 }, { svg: cfgW.svg });
   eq(wrec.width, 300, 'lp-css: cfg.width 优先');
-  eq(cfgW.embed.style.width, '300px', 'lp-css: 配置宽写进行内样式');
+  eq(cfgW.host.style.width, '300px', 'lp-css: 配置宽写进行内样式');
+  eq(cfgW.lines[0].style.paddingRight, '316px', 'lp-css: 留白 = 图宽 + 间距');
+  ok(cfgW.lines[1].style.paddingRight === undefined, 'lp-css: 一行盖住就不再往下写');
   const wide = cmTreeDirect();
   const wideRec = I.applyLivePreviewCssFloat(wide.host, { float: 'right', width: 2000 }, { svg: wide.svg });
   eq(wideRec.width, 820, 'lp-css: 图宽不超过正文列宽');
-
-  /* 间距本身是纯函数，单独验一下两侧顺序 */
-  eq(I.cssFloatMargin('right', 16), '0 0 8px 16px', 'lp-css: 右浮动的 margin 四值顺序');
-  eq(I.cssFloatMargin('left', 12), '0 12px 8px 0', 'lp-css: 左浮动用传进来的间距');
-  eq(I.cssFloatMargin('right', 0), '0 0 8px 16px', 'lp-css: 间距非法时回退默认值');
 }
 
 function tCssGuards() {
@@ -639,7 +656,7 @@ function tCssGuards() {
   eq(I.applyLivePreviewCssFloat(tree.host, { float: 'inline' }, {}), null, 'lp-css: inline 不处理');
   eq(I.applyLivePreviewCssFloat(tree.host, {}, {}), null, 'lp-css: 没有 float 不处理');
   eq(I.applyLivePreviewCssFloat(null, { float: 'right' }, {}), null, 'lp-css: 没有宿主 → null');
-  ok(tree.embed.style.float === undefined, 'lp-css: 不处理时一个样式都不写');
+  ok(tree.embed.style.height === undefined, 'lp-css: 不处理时一个样式都不写');
   const orphan = fakeEl([], 10);
   eq(I.applyLivePreviewCssFloat(orphan, { float: 'right' }, {}), null, 'lp-css: 不在 CM6 结构里 → null');
 
@@ -647,18 +664,107 @@ function tCssGuards() {
   const old = cmTree();
   eq(I.applyLivePreviewCssFloat(old.host, { float: 'right' }, { svg: old.svg }), null,
     'lp-css: cm-line 结构交给绝对定位那条');
-  ok(old.embed.style.float === undefined, 'lp-css: 老结构的 embed 没被浮动');
+  ok(old.embed.style.height === undefined, 'lp-css: 老结构的 embed 没被钉高');
 
   /* 旧的绝对定位实现也不再接管新结构 */
   eq(I.applyLivePreviewFloat(tree.host, { float: 'right' }, { svg: tree.svg }), null,
     'lp-css: 绝对定位 + 留白那套不再进 direct-embed');
   ok(tree.embed.style.position === undefined, 'lp-css: 新结构里没人写 position');
 
-  /* 后面没有行也照样浮：CSS 是声明式的，不需要「有没有行可绕」这个判断 */
+  /* 后面没有行：没东西可留白，照样施加（图溢进空白区，不遮字）*/
   const solo = cmTreeDirect({ lineHeights: [] });
   const rec = I.applyLivePreviewCssFloat(solo.host, { float: 'right' }, { svg: solo.svg });
-  ok(!!rec, 'lp-css: 后面一行正文都没有也照样浮');
+  ok(!!rec, 'lp-css: 后面一行正文都没有也照样施加');
+  eq(rec.pads.length, 0, 'lp-css: 没行就不留白');
+
+  /* 量不到图高：彻底不动手，否则图会盖住正文 */
+  const blind = cmTreeDirect({ embedH: 0 });
+  blind.host.getBoundingClientRect = () => ({ top: 0, left: 0, width: 400, height: 0, right: 400, bottom: 0 });
+  blind.svg.getBoundingClientRect = () => ({ top: 0, left: 0, width: 400, height: 0, right: 400, bottom: 0 });
+  eq(I.applyLivePreviewCssFloat(blind.host, { float: 'right' }, { svg: blind.svg }), null,
+    'lp-css: 量不到图高 → 不动手');
+  ok(blind.embed.style.height === undefined, 'lp-css: 不动手时一行样式都不写');
 }
+
+/**
+ * 一行高度：候选行里最矮的那一行 → content 的 computed line-height → 27 兜底。
+ * 不能拿被折行撑高的段落当行高，否则 widget 会被钉成两行、三行。
+ */
+function tOneLineHeight() {
+  const mkContent = (lineHeight) => {
+    const c = fakeEl(['cm-content'], 0, { top: 0, left: 0, width: 820, height: 2000, right: 820, bottom: 2000 });
+    c.clientWidth = 820;
+    c.ownerDocument = {
+      defaultView: { getComputedStyle: () => ({ lineHeight: lineHeight == null ? 'normal' : lineHeight }) },
+    };
+    return c;
+  };
+
+  const content = mkContent('31px');
+  eq(I.oneLineHeightOf(content, [cmLine(60), cmLine(84), null]), 60,
+    'lp-lineh: 取最矮的那一行（多行段落不算行高）');
+  eq(I.oneLineHeightOf(content, [cmLine(0), cmLine(140)]), 140,
+    'lp-lineh: 零高行不参与，剩一个就用它');
+  eq(I.oneLineHeightOf(content, []), 31, 'lp-lineh: 量不到行就用 computed line-height');
+  eq(I.oneLineHeightOf(mkContent('normal'), []), I.LP_LINE_FALLBACK,
+    'lp-lineh: line-height 是 normal 时用 27 兜底');
+  eq(I.oneLineHeightOf(null, null), I.LP_LINE_FALLBACK, 'lp-lineh: 什么都没有也不抛错');
+}
+
+/**
+ * 留白规划：必须按「加完 padding 之后量出来的真实高度」累积。
+ * 这里用注入的 measure 模拟真实浏览器：留白一加，长行就折成两行（高度翻倍）。
+ */
+function tPinnedPads() {
+  const lines = [0, 1, 2, 3].map(() => cmLine(26));
+  const ledger = I.createStyleLedger();
+  const plan = I.planPinnedPads(lines, 100, {
+    span: 316,
+    side: 'right',
+    write: (el, prop, v) => { ledger.set(el, prop, v); },
+    measure: (el) => (el.style.paddingRight ? 52 : 26),
+  });
+  eq(plan.pads.length, 2, 'lp-pin: 两行 52 就盖住 100（按折行后的高度累加）');
+  eq(plan.covered, 104, 'lp-pin: 累积高度是量出来的');
+  eq(plan.stopped, true, 'lp-pin: 盖住就停');
+  eq(plan.shortfall, 0, 'lp-pin: 没有缺口');
+  eq(lines[0].style.paddingRight, '316px', 'lp-pin: 第一行写了留白');
+  eq(lines[1].style.paddingRight, '316px', 'lp-pin: 第二行也写了');
+  eq(lines[2].style.paddingRight, undefined, 'lp-pin: 第三行没轮到，一行没写');
+  ledger.reset();
+  ok(lines[0].style.paddingRight === undefined && lines[1].style.paddingRight === undefined,
+    'lp-pin: 账本能把留白一次全收回去');
+
+  /* 高度不够：后面没行可盖，报缺口而不是硬凑 */
+  const few = [cmLine(26), cmLine(26)];
+  const short = I.planPinnedPads(few, 500, {
+    span: 100,
+    side: 'right',
+    write: () => {},
+    measure: () => 26,
+  });
+  eq(short.pads.length, 2, 'lp-pin: 行用完了就结束，不死循环');
+  eq(short.shortfall, 448, 'lp-pin: 缺口如实报出来');
+  eq(short.stopped, false, 'lp-pin: 没盖住，不是自然停止');
+
+  /* 行自带 padding：留白要叠在它自己的基准上 */
+  const themed = [cmLine(26)];
+  const withBase = I.planPinnedPads(themed, 20, {
+    span: 316,
+    side: 'right',
+    write: (el, prop, v) => { el.style[prop] = v; },
+    basePad: () => 10,
+    measure: () => 26,
+  });
+  eq(withBase.pads.length, 1, 'lp-pin: 一行就够高');
+  eq(themed[0].style.paddingRight, '326px', 'lp-pin: 叠加在主题自己的 padding 上');
+
+  /* 守卫 */
+  eq(I.planPinnedPads(lines, 0, { span: 100 }).pads.length, 0, 'lp-pin: 图高 0 → 不规划');
+  eq(I.planPinnedPads(lines, 100, { span: 0 }).pads.length, 0, 'lp-pin: 留白宽 0 → 不规划');
+  eq(I.planPinnedPads(null, 100, { span: 100 }).pads.length, 0, 'lp-pin: 没有行 → 空');
+}
+
 
 /** 控制器：挂上 / 重算 / 卸载还原 */
 function tCssControl() {
@@ -666,27 +772,37 @@ function tCssControl() {
   const tree = cmTreeDirect();
   const ctl = I.attachLivePreviewFloat(tree.host, { float: 'right' }, { svg: tree.svg });
   ok(!!ctl, 'lp-css-ctl: 挂上了');
-  eq(tree.embed.style.float, 'right', 'lp-css-ctl: 挂上即生效');
-  eq(tree.lines[0].style.paddingRight, undefined, 'lp-css-ctl: 一行都没被加 padding');
+  eq(tree.embed.style.height, '60px', 'lp-css-ctl: 挂上即生效（widget 钉成一行）');
+  eq(tree.lines[0].style.paddingRight, '416px', 'lp-css-ctl: 后续行留白落地');
   eq(I.livePreviewManagerCount(), 0, 'lp-css-ctl: 没建 manager / 观察者');
 
   const st = ctl.state();
-  eq(st.kind, 'css-float', 'lp-css-ctl: state 标明是纯 CSS 路径');
+  eq(st.kind, 'css-float', 'lp-css-ctl: state 标明是哪条路径');
   eq(st.mode, 'direct-embed', 'lp-css-ctl: state 带结构分支');
   eq(st.side, 'right', 'lp-css-ctl: state 带浮动方向');
   eq(st.width, 400, 'lp-css-ctl: state 带宽度');
+  eq(st.lineH, 60, 'lp-css-ctl: state 带行高');
+  eq(st.imgH, 106, 'lp-css-ctl: state 带图高');
+  eq(st.pads, 1, 'lp-css-ctl: state 带留白行数');
+  eq(st.covered, 60, 'lp-css-ctl: state 带累积高度');
+  eq(st.overflow, 46, 'lp-css-ctl: state 带需要盖住的高度');
   eq(st.attached, true, 'lp-css-ctl: state 说已挂上');
 
   ctl.update();
   ctl.update();
-  eq(tree.embed.style.float, 'right', 'lp-css-ctl: 反复 update 不叠加');
-  eq(tree.embed.style.margin, '0 0 8px 16px', 'lp-css-ctl: 间距也不叠');
-  eq(tree.embed.style.width, '400px', 'lp-css-ctl: 宽度也不叠');
+  eq(tree.embed.style.height, '60px', 'lp-css-ctl: 反复 update 不叠加');
+  eq(tree.lines[0].style.paddingRight, '416px', 'lp-css-ctl: 留白也不叠宽');
+  eq(tree.lines[1].style.paddingRight, undefined, 'lp-css-ctl: 第二行本来就不该有留白');
 
   ctl.dispose();
-  ok(tree.embed.style.float === undefined, 'lp-css-ctl: 卸载后 float 还回去');
-  ok(tree.embed.style.width === undefined, 'lp-css-ctl: 卸载后 width 还回去');
+  ok(tree.embed.style.height === undefined, 'lp-css-ctl: 卸载后高度还回去');
+  ok(tree.embed.style.maxHeight === undefined, 'lp-css-ctl: 卸载后 max-height 还回去');
+  ok(tree.embed.style.position === undefined, 'lp-css-ctl: 卸载后 position 还回去');
   ok(tree.embed.style.margin === undefined, 'lp-css-ctl: 卸载后 margin 还回去');
+  ok(tree.lines[0].style.paddingRight === undefined, 'lp-css-ctl: 卸载后留白还回去');
+  ok(tree.lines[1].style.paddingRight === undefined, 'lp-css-ctl: 未留白的行一直没被碰');
+  ok(tree.host.style.position === undefined, 'lp-css-ctl: 卸载后宿主的绝对定位还回去');
+  ok(tree.host.style.maxWidth === undefined, 'lp-css-ctl: 卸载后 max-width 还回去');
   ok(tree.host.style.float === undefined, 'lp-css-ctl: 卸载后宿主的 float 还回去');
   ok(tree.host.style.margin === undefined, 'lp-css-ctl: 卸载后宿主的 margin 还回去');
   ok(tree.host.style.display === undefined, 'lp-css-ctl: 卸载后宿主的 display 还回去');
@@ -697,7 +813,8 @@ function tCssControl() {
   t2.host.closest = (sel) => (sel === '.cm-editor' || sel === '.cm-content' ? t2.content : null);
   const c2 = I.attachFloatWrap(t2.host, { float: 'right' }, { svg: t2.svg });
   ok(!!c2, 'lp-css-ctl: attachFloatWrap 对 direct-embed 有返回');
-  eq(t2.embed.style.float, 'right', 'lp-css-ctl: 走的是纯 CSS 路径');
+  eq(t2.embed.style.height, '60px', 'lp-css-ctl: 走的是同一路（widget 钉成一行）');
+  eq(t2.lines[0].style.paddingRight, '416px', 'lp-css-ctl: attachFloatWrap 也加留白');
   eq(I.livePreviewManagerCount(), 0, 'lp-css-ctl: attachFloatWrap 也没建 manager');
   if (c2) c2.dispose();
   I.flushLivePreviewFloats();
@@ -712,8 +829,9 @@ function tCssOriginals() {
   tree.embed.style.margin = '4px';
   tree.host.style.float = 'right';
   const ctl = I.attachLivePreviewFloat(tree.host, { float: 'right' }, { svg: tree.svg });
-  eq(tree.embed.style.float, 'right', 'lp-css-orig: 覆盖主题写在行内的 float');
-  eq(tree.embed.style.margin, '0 0 8px 16px', 'lp-css-orig: 覆盖主题写在行内的 margin');
+  eq(tree.embed.style.float, 'none', 'lp-css-orig: 明确写成 float:none');
+  eq(tree.embed.style.margin, '0', 'lp-css-orig: 覆盖主题写在行内的 margin');
+  eq(tree.embed.style.height, '60px', 'lp-css-orig: 高度钉成一行');
   ctl.dispose();
   eq(tree.embed.style.float, 'none', 'lp-css-orig: 还回主题的 float');
   eq(tree.embed.style.margin, '4px', 'lp-css-orig: 还回主题的 margin');
@@ -728,14 +846,17 @@ function tCssFlushAll() {
   const ca = I.attachLivePreviewFloat(a.host, { float: 'right' }, { svg: a.svg });
   const cb = I.attachLivePreviewFloat(b.host, { float: 'left' }, { svg: b.svg });
   ok(!!ca && !!cb, 'lp-css-flush: 两张图都挂上');
-  eq(a.embed.style.float, 'right', 'lp-css-flush: A 右浮动');
-  eq(b.embed.style.float, 'left', 'lp-css-flush: B 左浮动');
+  eq(a.host.style.right, '0', 'lp-css-flush: A 贴右');
+  eq(b.host.style.left, '0', 'lp-css-flush: B 贴左');
   eq(I.flushLivePreviewFloats(), 2, 'lp-css-flush: 卸载时两个控制器都还原');
-  ok(a.embed.style.float === undefined && b.embed.style.float === undefined, 'lp-css-flush: 两张图的 float 都清掉');
+  ok(a.embed.style.height === undefined && b.embed.style.height === undefined,
+    'lp-css-flush: 两张图的 widget 高度都撤掉');
+  ok(a.lines[0].style.paddingRight === undefined && b.lines[0].style.paddingLeft === undefined,
+    'lp-css-flush: 两张图的留白也都撤了');
   eq(I.flushLivePreviewFloats(), 0, 'lp-css-flush: 再 flush 不重复动手');
 }
 
-/** 新路径的诊断：一条点位记，够下一轮日志判断高度稳不稳 */
+/** 新路径的诊断：一次性记齐「widget 高度 / 图 rect / 每行高 / CM6 账」 */
 function tCssLog() {
   I.flushLivePreviewFloats();
   I.dbgReset();
@@ -743,15 +864,54 @@ function tCssLog() {
   const ctl = I.attachLivePreviewFloat(tree.host, { float: 'right' }, { svg: tree.svg });
   const text = I.dbgText();
   ok(text.indexOf('"p":"lpf.css"') >= 0, 'lp-css-dbg: 记了 lpf.css 点位');
-  ok(text.indexOf('"branch":"css-float"') >= 0, 'lp-css-dbg: 挂载点标了 css-float 分支');
-  ok(text.indexOf('"bottomSlack"') >= 0, 'lp-css-dbg: 带 content 底边与图底边的差值');
+  ok(text.indexOf('"branch":"css-float"') >= 0, 'lp-css-dbg: 挂载点标了分支');
+  ok(text.indexOf('"widget"') >= 0, 'lp-css-dbg: 带 widget 自己的高度口径');
+  ok(text.indexOf('"matchesLine":') >= 0, 'lp-css-dbg: 带「widget 高度 == 行高」的判决位');
+  ok(text.indexOf('"svg":') >= 0, 'lp-css-dbg: 带 SVG 的 rect');
+  ok(text.indexOf('"pads"') >= 0, 'lp-css-dbg: 带每行留白与它的实测高');
+  ok(text.indexOf('"cmHeights"') >= 0, 'lp-css-dbg: 带 CM6 账上的高度对比');
   ok(text.indexOf('"contentH"') >= 0, 'lp-css-dbg: 带 content 高度');
-  ok(text.indexOf('"embedRect"') >= 0, 'lp-css-dbg: 带图 rect');
   ctl.dispose();
   ok(I.dbgText().indexOf('"p":"lpf.css.dispose"') >= 0, 'lp-css-dbg: 还原也记一点');
   I.flushLivePreviewFloats();
 }
 
+
+/**
+ * 行被 CM6 重建（滚出视口再滚回来）后要重算：padding 写在行元素上，行一换就丢。
+ * 用注入的假 MutationObserver + 同步定时器，把这条链拉直了验。
+ */
+function tCssRefresh() {
+  I.flushLivePreviewFloats();
+  const tree = cmTreeDirect();
+  const seen = [];
+  class FakeMO {
+    constructor(cb) { this.cb = cb; seen.push(this); }
+    observe(node, opts) { this.node = node; this.opts = opts; }
+    disconnect() { this.dead = true; }
+  }
+  const ctl = I.attachLivePreviewFloat(tree.host, { float: 'right' }, {
+    svg: tree.svg,
+    MutationObserver: FakeMO,
+    timers: { setTimeout: (fn) => { fn(); return 7; }, clearTimeout: () => {} },
+  });
+  ok(!!ctl, 'lp-css-refresh: 挂上了');
+  const mine = seen.filter((o) => o.node === tree.content && o.opts && o.opts.childList && !o.opts.subtree);
+  eq(mine.length, 1, 'lp-css-refresh: 给 .cm-content 挂了一个只看 childList 的观察者');
+  eq(ctl.state().observer, true, 'lp-css-refresh: state 里能看到观察者');
+
+  /* 模拟 CM6 换掉第一行：新行没有 padding，文字会压到图上 */
+  tree.lines[0].style.paddingRight = undefined;
+  const before = seen.length;
+  mine[0].cb();
+  ok(seen.length === before, 'lp-css-refresh: 重算不会再建观察者');
+  eq(tree.lines[0].style.paddingRight, '416px', 'lp-css-refresh: 行被重建后留白回来了');
+  eq(tree.embed.style.height, '60px', 'lp-css-refresh: widget 高度也重新钉上');
+
+  ctl.dispose();
+  eq(mine[0].dead, true, 'lp-css-refresh: 卸载时断开观察者');
+  I.flushLivePreviewFloats();
+}
 
 /**
  * planWrappedLines：按「加了留白、真的折行之后」的行高规划（老结构用）。
@@ -1189,7 +1349,8 @@ suite('live-float-direct', () => {
   tDirectParts(); tDirectCandidates(); tWrappedPlan();
 });
 suite('live-float-css', () => {
-  tCssApply(); tCssGuards(); tCssControl(); tCssOriginals(); tCssFlushAll(); tCssLog();
+  tOneLineHeight(); tPinnedPads();
+  tCssApply(); tCssGuards(); tCssControl(); tCssRefresh(); tCssOriginals(); tCssFlushAll(); tCssLog();
 });
 suite('live-float-ledger', () => {
   tLedgerDiffWrites(); tLedgerSweep(); tLedgerClaim(); tLedgerPrune(); tPadBaseUnit();

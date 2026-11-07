@@ -55,7 +55,8 @@ let LP_DEBOUNCE, LP_POLL, LP_RETRY, LP_RESET_DELAY, classHas, climbTo, livePrevi
   planLivePreviewLines, planWrappedLines, planLinePads, applyLinePads, createStyleLedger, padBaseOf,
   padReaderOf, applyLivePreviewFloat, findEditorView, attachLivePreviewFloat, flushLivePreviewFloats,
   livePreviewManagerCount;
-let CSS_FLOAT_BOTTOM_GAP, cssFloatMargin, setImportantStyle, applyLivePreviewCssFloat, createCssFloatControl;
+let setImportantStyle, computedLineHeightOf, oneLineHeightOf, planPinnedPads, applyLivePreviewCssFloat,
+  createCssFloatControl, cmHeightInfo, LP_LINE_FALLBACK;
 /* 施加浮动后让 CM6 重测（编辑模式光标错位）；以及编辑模式浮动总开关 */
 let LP_FLOAT, isLpFloatEnabled, setLpFloatEnabled, refreshLivePreviewFloats,
   measureSchedulerCount, createMeasureScheduler, RMEASURE_GAP, RMEASURE_SCROLL_IDLE,
@@ -1751,20 +1752,26 @@ const { createMeasureScheduler, RMEASURE_GAP, RMEASURE_SCROLL_IDLE } = require('
  * 图按 Obsidian 原生的块级 widget 排，光标跟没装插件时一样。
  * 阅读视图的图文混排不受它影响。
  *
- * 默认关闭，原因写在文件里：
- * CM6 用「各行高度累加」算文档坐标，而它测量的是 block widget 自己那个盒子的
- * 高度。浮动只是不再把高度贡献给父容器，盒子自己的 rect 不变，所以 CM6 账上
- * 一直留着「图这么高」的位置，光标就按旧账反推，点第 18 行会落到第 14 行。
- * 实测重测（requestMeasure）无效：重测前后 content 高度差恒为 0。
- * 把盒子高度归零能让账对上，但布局引擎的浮动排除区纵向范围受限于浮动盒高度，
- * 归零后文字不绕了（headless 对照实验：height 0 → 压图 7 行；85px → 3 行；
- * 170px → 0 行）。两者不可兼得，所以默认关掉。
+ * 默认关闭：新方案（一行高度 + 绝对定位图 + 逐行留白）待真机验光标，验过再谈默认开。
  *
- * 用户仍然可以在设置里打开，代价是光标错位。
+ * 前两版死在同一处：CM6 给 .cm-embed-block 这个 block widget 单独记一笔高度
+ * （实测 190px）。
+ *   1) float：widget 在流里占 0，账上还是 190，光标按错账反推（点 18 行落 14 行）
+ *   2) height:0：账对上了，但浮动排除区受盒子高度限制，文字不再绕排
+ * 两版都卡在「widget 高度」这笔账上，而它是插件改不了也骗不过的。
+ *
+ * 现行方案把账做成真的：
+ *   - .cm-embed-block 高度钉死成一行，CM6 量到什么就记什么，DOM 也真的只占这么多
+ *   - 图绝对定位从这一行浮出去，父盒高度已被钉死，溢出不影响父盒
+ *   - 后续 .cm-line 逐行加 padding：行被挤窄 → 折行变多 → 行变高，
+ *     这是真实的 DOM 变化，CM6 会自己重新量
+ * 偏差从「widget 高度」搬到了「行高」，而后者的变化 CM6 认。
+ *
+ * 用户仍然可以在设置里打开（设置 → Brace Map → 「编辑模式浮动」）。
  * 阅读视图不受影响，那边的图文混排是好的。
  *
  * 两个关法：
- *   1. 插件设置 → Brace Map → 「编辑模式浮动」默认就是关的
+ *   1. 插件设置 → Brace Map → 「编辑模式浮动」，默认就是关的
  *   2. 把下面这行的 false 改成 true，再 node build.js（默认值跟着变）
  *
  * 设置页里的值用插件自己的 loadData / saveData 存，这里只是它的默认值。
@@ -2384,8 +2391,8 @@ function attachFloatWrap(host, cfg, opts) {
  * 结构一 direct-embed（Obsidian 1.13.7 实测）
  *     .cm-content > .cm-embed-block > host
  *   .cm-content 是 flex item，自成格式化上下文 → 原生 float 完整可用。
- *   走纯 CSS float：只写 float / width / margin，零 JS 布局、零观察者、零定时器。
- *   见后面「实时预览：纯 CSS float」。
+ *   走「一行高度 + 绝对定位图 + 逐行留白」：widget 钉成一行，图从这一行浮出去。
+ *   见后面「实时预览：一行高度 + 绝对定位图 + 逐行留白」。
  *
  * 结构二 cm-line（旧版 / 部分主题）
  *     .cm-content > .cm-line > .cm-embed-block > host
@@ -2451,7 +2458,7 @@ function climbTo(el, name, limit) {
  *
  * 注意 embed 自身 computed position 是 relative（Obsidian app.css 写死）。
  * 老结构当 line 用时，施加阶段必须把它改掉，否则绝对定位的包含块会被它自己抢走；
- * direct-embed 结构走纯 CSS float，position 不用动（浮动元素带 relative 不影响排版）。
+ * direct-embed 结构走「一行高度」那条，embed 的 position 要改成 relative 当绝对定位的包含块。
  *
  * @returns {{embed:Element, line:Element, content:Element, mode:'cm-line'|'direct-embed'}|null}
  */
@@ -2946,43 +2953,108 @@ function applyLinePads(pads, ledger) {
   return n;
 }
 
-/* --------------------------- 实时预览：纯 CSS float --------------------------- */
+/* --------------------- 实时预览：一行高度 + 绝对定位图 + 逐行留白 --------------------- */
 
 /**
- * direct-embed 结构（.cm-embed-block 直接挂在 .cm-content 下）的浮动：一条 float
- * 声明交给浏览器排版，零 JS 布局。
+ * direct-embed 结构（.cm-embed-block 直接挂在 .cm-content 下）的浮动方案。
  *
- * 这条路能成立，靠的是 Obsidian 自己的布局（app.css 实测）：
- *   .cm-sizer             display: flex; flex-direction: column
- *   .cm-contentContainer  display: flex
- *   .cm-content           一个 flex item（width: 0 + flex-grow）
- * `.cm-content` 是 flex 容器的子项，flex item 天然建立独立的格式化上下文 —— 浮动元素
- * 在这里有正常语义：被容器框住、高度由引擎算进文档流。文档高度稳定，滚动就不抖。
+ * 前两版的死结：CM6 实测到 widget 有 190px，单独记一笔账。
+ *   a) float：widget 在流里占 0，账上还是 190 → 光标按错账反推（点 18 行落 14 行）
+ *   b) height:0：账对上了，但浮动排除区受盒子高度限制，文字不再绕排
+ * 两版都卡在「widget 高度」这笔账上 —— 那是插件改不了也骗不过的量。
  *
- * `float` 指令在阅读视图和编辑模式下都生效。编辑模式靠的就是上面这条链：
- * `.cm-content` 必须是 flex 容器的子项（BFC）；某个主题要是把这层布局改成非 flex
- * 容器，float 就会被规范作废，浮动失效。
+ * 这一版把账做成真的：
+ *   1. .cm-embed-block 高度钉死成一行（27px 量级）。CM6 量到多少就记多少，
+ *      DOM 也真的只占这么多，三方一致，widget 高度上没有偏差
+ *   2. 图本身是宿主的绝对定位子元素，从这一行浮出去，高度不参与父盒计算
+ *   3. 后续 .cm-line 逐行加 padding（右浮动加右、左浮动加左）给图让位。
+ *      行被挤窄 → 折行变多 → 行变高：真实 DOM 变化，CM6 会自己重新量
  *
- * 阅读视图那条路不能这么干：那边的宿主是 flex 容器的直接子项，float 被规范作废，
- * 所以必须继续用「绝对定位 + 给后续兄弟加外边距」。两条路各走各的，互不干扰。
+ * 关键差别：偏差从「widget 高度」搬到了「行高」上，而后者的变化 CM6 认。
+ * 这条假设要在真机上验光标，headless 只能验排版（widget 高度、溢出、行留白）。
  *
- * 这条路上一个 JS 布局都不做：不绝对定位、不算 top、不给 .cm-line 加 padding、
- * 不动 .cm-content 的 position。写下的属性全部记账，卸载 / 图被删时原样还回去。
+ * 写下的属性全部经账本记账，卸载 / 图被删 / 关开关时原样还回去。
  */
 
-/** 浮动图与下方正文的纵向间距（px） */
-const CSS_FLOAT_BOTTOM_GAP = 8;
+/** 拿不到行高时的兜底（px）：Obsidian 默认主题 16px 正文的行高 */
+const LP_LINE_FALLBACK = 27;
+
+/** 元素的 computed line-height（px）；读不到 / 是 normal 时返回 null */
+function computedLineHeightOf(el) {
+  try {
+    const doc = el && el.ownerDocument;
+    const view = doc && doc.defaultView;
+    const cs = view && typeof view.getComputedStyle === 'function' ? view.getComputedStyle(el) : null;
+    const v = parseFloat(cs && cs.lineHeight);
+    return Number.isFinite(v) && v > 0 ? round2(v) : null;
+  } catch (e) {
+    return null;
+  }
+}
 
 /**
- * 浮动图的间距写法：右浮动留左边距、左浮动留右边距（文字在那一边绕上来），
- * 下边给一点，免得图下面紧跟的文字顶着图底。
+ * 「一行有多高」：优先量候选行里最矮的那一行（多行段落会被折行撑高，不能拿它当行高），
+ * 其次取 content 的 computed line-height，最后用 27 兜底。
  */
-function cssFloatMargin(side, gap) {
-  const g = round2(Number(gap) > 0 ? Number(gap) : FLOAT_GAP);
-  const b = CSS_FLOAT_BOTTOM_GAP;
-  return side === 'left'
-    ? '0 ' + g + 'px ' + b + 'px 0'
-    : '0 0 ' + b + 'px ' + g + 'px';
+function oneLineHeightOf(content, lines) {
+  const list = Array.isArray(lines) ? lines : [];
+  let min = Infinity;
+  for (let i = 0; i < list.length && i < 12; i++) {
+    const h = elHeight(list[i]);
+    if (Number.isFinite(h) && h > 0 && h < min) min = h;
+  }
+  if (Number.isFinite(min)) return round2(min);
+  const lh = computedLineHeightOf(content);
+  return lh == null ? LP_LINE_FALLBACK : lh;
+}
+
+/**
+ * 逐行留白：从 widget 后面第一行开始，一行一行试写 padding、量真实高度、累积，
+ * 累积高度盖住图高就停。
+ *
+ * 为什么必须量真实的：行被挤窄之后折行变多、行变高，按「加 padding 之前」的高度
+ * 累加会多算几行（图下面白出一截）。所以这里没有纯算术，写一行量一行。
+ *
+ * @param {Element[]} lines      候选正文行（已有的 collectLineSiblings 结果）
+ * @param {number}    imgHeight  图要盖住的纵向高度
+ * @param {object}    opts       span / side / limit / write(el,prop,val) /
+ *                               measure(el)->px / basePad(el,prop)->px
+ * @returns {{pads:Array, covered:number, shortfall:number, stopped:boolean, tried:number}}
+ */
+function planPinnedPads(lines, imgHeight, opts) {
+  const o = opts || {};
+  const out = { pads: [], covered: 0, shortfall: 0, stopped: false, tried: 0 };
+  const height = Number(imgHeight);
+  const span = Number(o.span);
+  if (!Array.isArray(lines) || !(height > 0) || !(span > 0)) return out;
+
+  const side = o.side === 'left' ? 'left' : 'right';
+  const prop = side === 'left' ? 'paddingLeft' : 'paddingRight';
+  const limit = Number(o.limit) > 0 ? Number(o.limit) : WRAP_LIMIT;
+  const write = typeof o.write === 'function'
+    ? o.write
+    : (el, p, v) => { setInlineStyle(el, p, v); };
+  const measure = typeof o.measure === 'function' ? o.measure : elHeight;
+  const basePad = typeof o.basePad === 'function' ? o.basePad : null;
+
+  let covered = 0;
+  for (let i = 0; i < lines.length && out.pads.length < limit; i++) {
+    const el = lines[i];
+    if (!el) continue;
+    out.tried++;
+    const base = basePad ? Number(basePad(el, prop)) || 0 : (prop === 'paddingLeft'
+      ? num(paddingOf(el).left) : num(paddingOf(el).right));
+    const value = round2(base + span) + 'px';
+    write(el, prop, value);
+    const h = Number(measure(el));
+    const lineH = Number.isFinite(h) && h > 0 ? round2(h) : 0;
+    covered = round2(covered + lineH);
+    out.pads.push({ el, prop, value, base, height: lineH, covered });
+    if (covered >= height) { out.stopped = true; break; }
+  }
+  out.covered = covered;
+  out.shortfall = round2(Math.max(0, height - covered));
+  return out;
 }
 
 /**
@@ -3007,17 +3079,21 @@ function setImportantStyle(el, prop, value) {
 }
 
 /**
- * 给一张浮动图写纯 CSS float。只认 direct-embed 结构；老结构（embed 在 .cm-line 里）
- * 返回 null，交给原来的绝对定位实现。
+ * 给一张浮动图施加「一行高度 + 绝对定位图 + 逐行留白」。只认 direct-embed 结构；
+ * 老结构（embed 在 .cm-line 里）返回 null，交给绝对定位那条。
  *
  * 写的属性（都记原值、可还原）：
- *   embed  float / width / margin(!important)
- *   host   float:none / margin:0 / display:flow-root
- * host 必须一起收拾：applyFloatLayout 已经把它设成 float:right + margin，留着的话
- * 图会先被自己的 margin 往里推，贴不到正文列边界，留的间距也被这层 margin 吃掉。
- * flow-root 让它自成一块，内部 .brace-map-block 的上下 margin 不外溢。
+ *   embed  height / min-height / max-height 一行 / overflow:visible / float:none /
+ *          width:auto / position:relative / margin:0(!important)
+ *   host   position:absolute + top:0 + 贴边 / width / max-width:none / float:none /
+ *          clear:none / margin:0 / display:flow-root
+ *   .cm-line  逐行 padding（经账本，可复位）
  *
- * @returns {{mode,side,width,margin,host,embed,content,styles}|null}
+ * host 必须一起收拾：applyFloatLayout 已经把它设成 float:right + margin + width +
+ * max-width:100%，留着的话图会被自己的 margin 往里推，max-width 还会二次收窄。
+ * flow-root 让内部 .brace-map-block 的上下 margin 不外溢，图顶才能稳稳贴住 top:0。
+ *
+ * @returns {{mode,side,width,imgH,overflow,lineH,span,host,embed,content,pads,covered,shortfall,styles}|null}
  */
 function applyLivePreviewCssFloat(host, cfg, opts) {
   const o = opts || {};
@@ -3031,10 +3107,15 @@ function applyLivePreviewCssFloat(host, cfg, opts) {
   const content = parts.content;
   if (!embed || !embed.style || !content) return null;
 
+  const gap = Number(o.gap) > 0 ? Number(o.gap) : FLOAT_GAP;
+  const ledger = (o.ledger && typeof o.ledger.set === 'function') ? o.ledger : null;
+
   /* 图宽：配置优先，没写就用 SVG 实际渲染宽；超了正文列宽就收到列宽 */
   const svgRect = o.svg ? rectOf(o.svg) : null;
+  const hostRect = rectOf(host);
   const eRect = rectOf(embed);
-  const natural = svgRect && svgRect.width > 0 ? svgRect.width : (eRect && eRect.width > 0 ? eRect.width : 0);
+  const natural = svgRect && svgRect.width > 0 ? svgRect.width
+    : (hostRect && hostRect.width > 0 ? hostRect.width : 0);
   const want = Number(cfg.width) > 0 ? Number(cfg.width) : natural;
   const cRect = rectOf(content);
   const boxW = Number(content.clientWidth) > 0
@@ -3045,7 +3126,31 @@ function applyLivePreviewCssFloat(host, cfg, opts) {
   if (boxW > 0 && width > boxW) width = boxW;
   width = round2(Math.max(1, width));
 
-  const margin = cssFloatMargin(side, o.gap);
+  /* 图高：钉住 widget 之前先量，这是图绝对定位后要往下占的纵向空间 */
+  const imgH = round2(Math.max(
+    svgRect && svgRect.height > 0 ? svgRect.height : 0,
+    hostRect && hostRect.height > 0 ? hostRect.height : 0,
+  ));
+  if (!(imgH > 0)) return null;          // 量不到图高：不动手，否则图会盖住正文
+
+  const candidates = collectLineSiblings(embed.nextElementSibling, o.maxLines, embed);
+  const lineH = oneLineHeightOf(content, candidates);   // 必须在加 padding 之前量
+  const span = round2(width + gap);
+
+  /*
+   * 需要下行留白盖住的高度 = 图底到 widget 底的距离（widget 只有一行高）。
+   * 取 SVG 的底，不取宿主的底：宿主自己的上下 margin（.brace-map-block 的 0.9em）
+   * 和内层 padding 都是空白，把它们算进来会在图下面多压一行正文。
+   * 量不到几何才退回「图高 - 行高」的估值。
+   */
+  let overflow = 0;
+  const bottomOf = svgRect && Number.isFinite(svgRect.bottom) ? svgRect.bottom
+    : (hostRect && Number.isFinite(hostRect.bottom) ? hostRect.bottom : NaN);
+  if (Number.isFinite(bottomOf) && eRect && Number.isFinite(eRect.top)) {
+    overflow = round2(bottomOf - eRect.top - lineH);
+  }
+  if (!(overflow > 0)) overflow = round2(Math.max(0, imgH - lineH));
+
   const before = cssFloatHeights(embed, content);     // 读 rect 会强制布局，先取一轮基线
   const styles = [];
   const put = (el, prop, value, important) => {
@@ -3054,26 +3159,58 @@ function applyLivePreviewCssFloat(host, cfg, opts) {
     if (s) styles.push(s);
   };
 
-  put(embed, 'float', side);
-  put(embed, 'width', width + 'px');
-  put(embed, 'margin', margin, true);
+  /* widget 只占一行：CSS 高度 / DOM 高度 / CM6 记账三方对齐，不留偏差 */
+  put(embed, 'height', lineH + 'px');
+  put(embed, 'minHeight', '0');
+  put(embed, 'maxHeight', lineH + 'px');
+  put(embed, 'overflow', 'visible');
+  put(embed, 'float', 'none');
+  put(embed, 'width', 'auto');
+  put(embed, 'position', 'relative');          // 内部绝对定位的包含块
+  put(embed, 'margin', '0', true);             // app.css 给 .cm-content > * 写了 margin:0 !important
+
+  /* 图从这一行浮出去：绝对定位贴正文列边界，父盒高度已被钉死，溢出到下方行上 */
+  put(host, 'position', 'absolute');
+  put(host, 'top', '0');
+  put(host, side === 'left' ? 'left' : 'right', '0');
+  put(host, side === 'left' ? 'right' : 'left', 'auto');
+  put(host, 'width', width + 'px');
+  put(host, 'maxWidth', 'none');
   put(host, 'float', 'none');
+  put(host, 'clear', 'none');
   put(host, 'margin', '0');
   put(host, 'display', 'flow-root');
 
-  /* 写完再读一次：读 rect 本身会强制一次同步布局，所以这里拿到的是「浮动之后」的真值 */
+  /* 后续行留白：写一行量一行，盖住溢出部分就停 */
+  const plan = planPinnedPads(candidates, overflow, {
+    span,
+    side,
+    limit: o.maxLines,
+    write: ledger
+      ? (el, prop, v) => { ledger.set(el, prop, v); }
+      : null,
+    basePad: ledger ? (el, prop) => padBaseOf(el, ledger, prop) : null,
+    measure: o.measure,
+  });
+
+  /* 写完再读一次：读 rect 本身会强制一次同步布局，所以这里拿到的是「施加之后」的真值 */
   const after = cssFloatHeights(embed, content);
 
-  return { mode: parts.mode, side, width, margin, host, embed, content, styles, diag: { before, after } };
+  return {
+    mode: parts.mode, side, width, imgH, overflow, lineH, span, gap,
+    host, embed, content, svg: o.svg || null,
+    pads: plan.pads, covered: plan.covered, shortfall: plan.shortfall, stopped: plan.stopped,
+    styles, diag: { before, after },
+  };
 }
 
 /**
  * 诊断：一个盒子的四种高度口径 + 行内样式全文。
  * 光标错位追的是「CM6 账上的高度」与「DOM 真实高度」的差，所以四个都要：
- *   rect      布局盒（浮动后仍然保留自己的高度，只是不再贡献给父容器）
+ *   rect      布局盒（钉成一行之后应该就在 27px 量级）
  *   offsetH   元素自身布局高
  *   clientH   扣除边框滚动条
- *   cssText   我们写进去的 float / width / margin 原文
+ *   cssText   我们写进去的 height / overflow / position 原文
  */
 function cssFloatHeights(embed, content) {
   const e = rectOf(embed);
@@ -3088,32 +3225,87 @@ function cssFloatHeights(embed, content) {
   };
 }
 
-/** 诊断：新路径的点位记录（结构分支 / 写了哪些样式 / 图 rect / content 高度） */
-function cssFloatInfo(rec, applies) {
+/**
+ * 诊断：CM6 账上的文档高度 vs DOM 实际高度。
+ *
+ * 这是这一版方案最关键的一条数据：
+ *   api   CM6 自己算的 contentHeight（拿不到就是 null）
+ *   dom   .cm-content 的 rect 高
+ *   delta 两者之差。方案要是成立，这个差应该稳定且不随 widget 数增长；
+ *         以前 widget 高 190px、账上不改，差就恒等于「widget 高度」。
+ */
+function cmHeightInfo(content, opts) {
+  const o = opts || {};
+  const domH = content ? round2(elHeight(content)) : null;
+  let view = null;
+  try {
+    if (o.cm && o.cm.dom) view = o.cm;
+    else if (typeof o.getCM === 'function' && content) view = o.getCM(content);
+  } catch (e) { view = null; }
+  let api = null;
+  try {
+    const v = view ? Number(view.contentHeight) : NaN;
+    if (Number.isFinite(v)) api = round2(v);
+  } catch (e) { api = null; }
+  return {
+    cmFound: !!view,
+    api,
+    dom: domH,
+    delta: (api != null && domH != null) ? round2(api - domH) : null,
+  };
+}
+
+/**
+ * 诊断：新路径的点位记录。
+ *   widget   钉成一行之后的高度（rect / offset / client）——目标 ~27，不是 190
+ *   svg      图层自己的 rect——要溢出去、位置正确、宽度对
+ *   pads     每个被加 padding 的行的 rect 高度（确认折行后真的变高了）
+ *   content  总高 + CM6 账上的高度（cmHeights）
+ */
+function cssFloatInfo(rec, applies, opts) {
   const e = rectOf(rec.embed);
   const c = rec.content ? rectOf(rec.content) : null;
   const eBottom = e ? round2(e.top + e.height) : null;
   const cBottom = c ? round2(c.top + c.height) : null;
   let scrollH = null;
   try { scrollH = Number(rec.content.scrollHeight) || 0; } catch (err) { scrollH = null; }
+  const pads = Array.isArray(rec.pads) ? rec.pads.map((p) => ({
+    pad: p.value,
+    h: p.height,
+    covered: p.covered,
+  })) : [];
   return {
     mode: rec.mode,
     side: rec.side,
     width: rec.width,
-    margin: rec.margin,
+    lineH: rec.lineH,
+    imgH: rec.imgH,
+    overflow: rec.overflow,
+    span: rec.span,
     applies,
-    /* 实际写下去的样式（值取自元素，避免和记账对不上） */
+    /* 实际写下去的关键样式（用标签而不是值，避免和元素上的记账对不上） */
     styles: {
-      embed: ['float:' + rec.side, 'width:' + rec.width + 'px', 'margin:' + rec.margin + '!important'],
-      host: ['float:none', 'margin:0', 'display:flow-root'],
+      embed: ['height:' + rec.lineH + 'px', 'max-height:' + rec.lineH + 'px',
+        'min-height:0', 'overflow:visible', 'float:none', 'width:auto', 'position:relative',
+        'margin:0!important'],
+      host: ['position:absolute', 'top:0', (rec.side === 'left' ? 'left:0' : 'right:0'),
+        'width:' + rec.width + 'px', 'max-width:none', 'float:none', 'clear:none',
+        'margin:0', 'display:flow-root'],
       count: rec.styles.length,
     },
-    embed: dbgEl(rec.embed),
-    embedRect: dbgRect(rec.embed),
-    embedOffsetH: rec.embed ? num(rec.embed.offsetHeight) : null,
-    embedClientH: rec.embed ? num(rec.embed.clientHeight) : null,
-    embedCss: dbgInlineAll(rec.embed),
-    /* 施加前后的对照：这两组数差多少，就是 CM6 需要重新记账的量 */
+    /* 最关键的一条：widget 真的被压到一行了吗 */
+    widget: {
+      rect: dbgRect(rec.embed),
+      rectH: e ? round2(e.height) : null,
+      offsetH: rec.embed ? num(rec.embed.offsetHeight) : null,
+      clientH: rec.embed ? num(rec.embed.clientHeight) : null,
+      matchesLine: (e && rec.lineH) ? round2(e.height) === round2(rec.lineH) : null,
+      cssText: dbgInlineAll(rec.embed),
+    },
+    svg: rec.svg ? dbgRect(rec.svg) : null,
+    host: dbgEl(rec.host),
+    hostRect: rec.host ? dbgRect(rec.host) : null,
+    /* 施加前后的对照：差多少，就是 CM6 需要重新记账的量 */
     before: rec.diag ? rec.diag.before : null,
     after: rec.diag ? rec.diag.after : null,
     embedBottom: eBottom,
@@ -3122,7 +3314,14 @@ function cssFloatInfo(rec, applies) {
     contentH: c ? round2(c.height) : null,
     contentBottom: cBottom,
     contentScrollH: scrollH,
-    /* ≥0 表示容器把浮动元素框住了（高度含图高）；<0 就是图漏出了容器底边 */
+    pads,
+    padCount: pads.length,
+    covered: rec.covered,
+    shortfall: rec.shortfall,
+    stopped: rec.stopped,
+    /* CM6 账上 vs DOM 实际 */
+    cmHeights: cmHeightInfo(rec.content, opts),
+    /* ≥0 表示容器框住了 widget；<0 是 widget 漏出容器底边 */
     bottomSlack: (cBottom != null && eBottom != null) ? round2(cBottom - eBottom) : null,
   };
 }
@@ -3202,16 +3401,20 @@ function measureSchedulerCount() {
 /**
  * direct-embed 的浮动控制器，形状与其他路径一致（host / update / dispose / state）。
  *
- * 没有定时器、没有账本、没有延迟复位 —— CSS 是声明式的，
- * 这里只剩两件真事：谁在什么时候把样式还回去；以及什么时候让 CM6 重新量一次。
+ * 没有定时器、没有巡检、没有延迟复位 —— 样式是当场写完的，
+ * 这里只剩三件真事：谁在什么时候把样式还回去；行被 CM6 重建后重算一次；
+ * 以及什么时候让 CM6 重新量一次。
  * update 先还原再写，重复调用不会把上一轮的值当成「原值」。
  *
- * 为什么需要重测：浮动把 block widget 从流里摘出去了，它自己的 rect 高度还在，
- * 但父容器已经不为它留位置。CM6 给 block widget 单独记一条高度，不重新量就
- * 停在旧值上，光标映射跟着错（点第 18 行落到第 14 行）。
+ * 留白行的 padding 走控制器自己的账本：逐行试写 → 量高度 → 不够就再写一行。
+ * 写下去的值必须能一次全部还回去，否则下一次 update 会在旧值上再叠一层。
+ *
+ * 为什么要重测：widget 高度从「图的整高」变成了一行，行高也因为留白变了，
+ * 这两件都是真实 DOM 变化，CM6 会在下一次 measure cycle 里量到 —— 只是得有人叫它一声。
  */
 function createCssFloatControl(host, cfg, opts) {
   const o = opts || {};
+  const ledger = createStyleLedger();
   let record = null;
   let disposed = false;
   let applies = 0;
@@ -3229,21 +3432,76 @@ function createCssFloatControl(host, cfg, opts) {
   };
 
   const clear = () => {
-    if (!record) return 0;
-    const n = restoreStyles(record.styles);
+    let n = ledger.reset();              // 行留白先回位（按写入逆序）
+    if (!record) return n;
+    n += restoreStyles(record.styles);
     record = null;
     return n;
+  };
+
+  /* 账本交给施加函数：留白是「写一行量一行」的，只能经账本写才能一次复位 */
+  const applyOpts = Object.assign({}, o, { ledger });
+
+  /*
+   * CM6 会把滚出视口的行整批销毁重建，而我们的 padding 写在行元素上：
+   * 行一换就丢，文字会直接压到图上。所以盯住 .cm-content 的 childList，
+   * 攒一下（LP_DEBOUNCE）再整体重算一次。
+   * 只观察 childList、不观察 style：自己的写入不会反过来触发自己。
+   */
+  let observer = null;
+  let queued = false;
+  let handle = null;
+  const delay = Number(o.refreshDelay) >= 0 ? Number(o.refreshDelay) : LP_DEBOUNCE;
+  const setT = (o.timers && typeof o.timers.setTimeout === 'function') ? o.timers.setTimeout : setTimeout;
+  const clearT = (o.timers && typeof o.timers.clearTimeout === 'function') ? o.timers.clearTimeout : clearTimeout;
+
+  const dropQueued = () => {
+    if (queued && handle != null) { try { clearT(handle); } catch (e) { /* ignore */ } }
+    queued = false;
+    handle = null;
+  };
+
+  const scheduleRefresh = () => {
+    if (disposed || queued) return false;
+    queued = true;
+    try {
+      handle = setT(() => {
+        queued = false;
+        handle = null;
+        if (!disposed) apply();
+      }, delay);
+    } catch (e) {
+      queued = false;
+      handle = null;
+      return false;
+    }
+    return true;
+  };
+
+  const observeContent = (node) => {
+    if (disposed || observer) return false;
+    const MO = o.MutationObserver || (typeof MutationObserver !== 'undefined' ? MutationObserver : null);
+    if (typeof MO !== 'function' || !node || typeof node.nodeType !== 'number') return false;
+    try {
+      observer = new MO(scheduleRefresh);
+      observer.observe(node, { childList: true });
+      return true;
+    } catch (e) {
+      observer = null;
+      return false;
+    }
   };
 
   const apply = () => {
     if (disposed) return null;
     clear();                            // 先还原再写：update 不会把我们的值记成原值
     let next = null;
-    try { next = applyLivePreviewCssFloat(host, cfg, o); } catch (e) { next = null; }
+    try { next = applyLivePreviewCssFloat(host, cfg, applyOpts); } catch (e) { next = null; }
     record = next;
     applies++;
     if (next) {
-      dbg('lpf.css', () => cssFloatInfo(next, applies));
+      dbg('lpf.css', () => cssFloatInfo(next, applies, o));
+      observeContent(next.content);
       /*
        * 样式写完 → 下一帧让 CM6 重测一次。同步调没用：浏览器还没布局。
        * 调度器按 .cm-content 共享，所以连着 update 不会重建它 —— 重建就意味着
@@ -3278,6 +3536,9 @@ function createCssFloatControl(host, cfg, opts) {
     dispose() {
       if (disposed) return false;
       disposed = true;
+      dropQueued();
+      if (observer) { try { observer.disconnect(); } catch (e) { /* ignore */ } }
+      observer = null;
       const restored = clear();
       dropMeasure();
       lpCssLive.delete(api);
@@ -3291,7 +3552,14 @@ function createCssFloatControl(host, cfg, opts) {
         mode: record ? record.mode : null,
         side: record ? record.side : null,
         width: record ? record.width : 0,
+        lineH: record ? record.lineH : 0,
+        imgH: record ? record.imgH : 0,
+        overflow: record ? record.overflow : 0,
+        pads: record ? record.pads.length : 0,
+        covered: record ? record.covered : 0,
+        shortfall: record ? record.shortfall : 0,
         styles: record ? record.styles.length : 0,
+        observer: !!observer,
         applies,
         measure: measure ? measure.state() : null,
       };
@@ -3325,7 +3593,7 @@ function applyLivePreviewFloat(host, cfg, opts) {
   const parts = livePreviewParts(host);
   dbg('apply.parts', () => lpPartsInfo(host, parts));
   if (!parts) { dbgNull('apply.null', 'apply.parts'); return null; }
-  /* direct-embed 结构不走这里：它归纯 CSS float（applyLivePreviewCssFloat）。
+  /* direct-embed 结构不走这里：它归「一行高度 + 逐行留白」（applyLivePreviewCssFloat）。
    * 「绝对定位 + 逐行留白」只服务 embed 在 .cm-line 里的老结构。 */
   if (parts.mode !== 'cm-line') { dbgNull('apply.null', 'apply.direct-embed'); return null; }
   const embed = parts.embed;
@@ -3868,7 +4136,7 @@ function attachLivePreviewFloat(host, cfg, opts) {
 
   const widget = { host, cfg, svg: o.svg, gap: o.gap, opts: o };
   let manager = null;
-  let control = null;          // direct-embed：纯 CSS float 的控制器（不建 manager）
+  let control = null;          // direct-embed：一行高度 + 逐行留白的控制器（不建 manager）
   let disposed = false;
   let attempt = 0;
   let retry = 0;
@@ -3908,7 +4176,7 @@ function attachLivePreviewFloat(host, cfg, opts) {
       return;                              // 还没插进文档，稍后再试
     }
     dbg('lpf.parts', () => lpPartsInfo(host, parts));
-    /* direct-embed：纯 CSS float。不建 manager、不观察、不定时、不给任何行加 padding */
+    /* direct-embed：widget 钉成一行，图绝对定位浮出去，后续行留白 */
     if (parts.mode === 'direct-embed') {
       control = createCssFloatControl(host, cfg, o);
       dbg('lpf.attach.done', () => ({ attempt, branch: 'css-float', state: control.state() }));
@@ -4087,12 +4355,15 @@ module.exports = {
   isLpFloatEnabled,
   setLpFloatEnabled,
   planWrappedLines,
-  // 实时预览（CM6）：direct-embed 走纯 CSS float
-  CSS_FLOAT_BOTTOM_GAP,
-  cssFloatMargin,
+  // 实时预览（CM6）：direct-embed 走「一行高度 + 绝对定位图 + 逐行留白」
+  LP_LINE_FALLBACK,
   setImportantStyle,
+  computedLineHeightOf,
+  oneLineHeightOf,
+  planPinnedPads,
   applyLivePreviewCssFloat,
   createCssFloatControl,
+  cmHeightInfo,
   /* 施加浮动后让 CM6 重测（direct-embed 路径） */
   measureSchedulerCount,
   createMeasureScheduler,
@@ -7052,8 +7323,8 @@ function loadModules() {
      createStyleLedger, padBaseOf, padReaderOf, applyLivePreviewFloat, findEditorView,
      attachLivePreviewFloat, flushLivePreviewFloats,
      livePreviewManagerCount,
-     CSS_FLOAT_BOTTOM_GAP, cssFloatMargin, setImportantStyle, applyLivePreviewCssFloat,
-     createCssFloatControl,
+     setImportantStyle, computedLineHeightOf, oneLineHeightOf, planPinnedPads,
+     applyLivePreviewCssFloat, createCssFloatControl, cmHeightInfo, LP_LINE_FALLBACK,
      LP_FLOAT, isLpFloatEnabled, setLpFloatEnabled, refreshLivePreviewFloats,
      measureSchedulerCount, createMeasureScheduler, RMEASURE_GAP, RMEASURE_SCROLL_IDLE,
      resetFloatLayout, clearLivePreviewFloatLayout } = req('src/float.js'));
@@ -7336,7 +7607,7 @@ function mathLineFor(meta) {
 
 /** 设置默认值。存哪不管：走 Obsidian 的 loadData / saveData，不自己造存储。 */
 const DEFAULT_SETTINGS = {
-  livePreviewFloat: true,     // 编辑模式（实时预览）里允许括号图浮动
+  livePreviewFloat: false,     // 编辑模式（实时预览）里允许括号图浮动
 };
 
 class BraceMapPlugin extends Plugin {
@@ -7697,12 +7968,15 @@ function buildInternals() {
   padBaseOf,
   padReaderOf,
   planWrappedLines,
-  // 实时预览（CM6）：新结构（direct-embed）走纯 CSS float
-  CSS_FLOAT_BOTTOM_GAP,
-  cssFloatMargin,
+  // 实时预览（CM6）：新结构（direct-embed）走「一行高度 + 绝对定位图 + 逐行留白」
+  LP_LINE_FALLBACK,
   setImportantStyle,
+  computedLineHeightOf,
+  oneLineHeightOf,
+  planPinnedPads,
   applyLivePreviewCssFloat,
   createCssFloatControl,
+  cmHeightInfo,
   findEditorViewOf,
   // 施加浮动后让 CM6 重测（光标错位的假设验证）
   LP_FLOAT,
