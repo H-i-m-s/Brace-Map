@@ -19,9 +19,43 @@
  *   - 宿主身份用 WeakMap 记，不在宿主对象上留任何字段
  *   - 每个出口都 try/catch：轨迹自身炸了也绝不影响布局，不抛错
  *   - 单次运行最多 MAX_ROWS 条，超出从头截断（留最新的）
+ *   - 默认关（见下面的「电源开关」），关着时 record* 一条都不记
  *
  * 依赖：无。这个模块不 require 任何东西，也就不可能和应用里其它模块成环。
  * ============================================================ */
+
+/* ------------------------------ 电源开关 ------------------------------ */
+
+/*
+ * 为什么要有开关：常开是有代价的。每记一条都要把当时现场的十几个几何量
+ * 重新量一遍（valignProbe 那一套：两次 elHeight、pickSvg、行高、标题中心、
+ * 根节点数、rect、closest…），而每个出口都记一条 —— 功能修好后这就只是纯负担，
+ * 而且每次布局都在多做一遍无用的测量。
+ *
+ * 默认关。需要时点命令「开始记录 valign 轨迹」，复现完再点「输出 valign 调用轨迹」
+ * 导出（导出后自动关）。关着的时候记录函数第一行就返回，调用方（float.js 那三个
+ * vt 包装）也在函数第一行返回，连参数里的测量都不会发生。
+ */
+let enabled = false;
+/* 本次运行里有没有开过：导出命令用它决定要不要提醒「记录没开」 */
+let everEnabled = false;
+
+/** 现在在不在记录 */
+function isOn() {
+  return enabled === true;
+}
+
+/** 开 / 关记录。返回开完之后的真实状态 */
+function setOn(v) {
+  enabled = !!v;
+  if (enabled) everEnabled = true;
+  return enabled;
+}
+
+/** 本次运行里开过记录吗（与当前状态无关） */
+function wasEverOn() {
+  return everEnabled === true;
+}
 
 /** 缓冲上限：单次运行最多 400 条，超出从头截断 */
 const MAX_ROWS = 400;
@@ -132,6 +166,7 @@ function keyOf(host) {
  * @returns {object|null} 记下来的那条（测试用）
  */
 function record(entry) {
+  if (!enabled) return null;            // 关着：一条都不记（调用方本来也不该进来）
   try {
     const src = entry && entry.src ? String(entry.src) : 'other';
     const host = entry ? entry.host : null;
@@ -200,6 +235,7 @@ let floatT0 = 0;
  *   wrote  有没有真的写 top
  */
 function recordFloat(entry) {
+  if (!enabled) return null;
   try {
     const host = entry ? entry.host : null;
     floatSeq += 1;
@@ -287,6 +323,7 @@ const ATTACH_EXIT_DOC = [
 ];
 
 function recordAttach(entry) {
+  if (!enabled) return null;
   try {
     const host = entry ? entry.host : null;
     attachSeq += 1;
@@ -811,6 +848,9 @@ function formatDoc(items, floatItems) {
 
 module.exports = {
   MAX_ROWS,
+  isOn,
+  setOn,
+  wasEverOn,
   MAX_FLOAT_ROWS,
   MAX_ATTACH_ROWS,
   EXIT_DOC,

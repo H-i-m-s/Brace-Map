@@ -2248,6 +2248,8 @@ function floatify(el, cfg, opts) {
  * 不靠在每个 return 前面插一行（那样漏一个就少一条）。
  */
 function vtFloat(el, cfg, st, exit) {
+  // 开关关着时立刻返回：连 st 里那几个值的获取路径都不会走到
+  if (!vt.isOn()) return null;
   try {
     const s = st || {};
     vt.recordFloat({
@@ -2445,6 +2447,7 @@ function resetFloat(record) {
  * 绝不影响浮动。
  */
 function vtAttach(host, exit, extra) {
+  if (!vt.isOn()) return;
   try {
     const e = extra || {};
     vt.recordAttach({
@@ -2476,6 +2479,21 @@ function attachEnv(host, side) {
     cmContent: closestOf('.cm-content'),
     cmEditor: closestOf('.cm-editor'),
   };
+}
+
+/**
+ * 轨迹要的入口现场 + 额外字段；**关着的时候连 attachEnv 都不调**。
+ *
+ * attachEnv 里有两次 closest 和一次 isLivePreview，属于实打实的 DOM 查询。
+ * 只靠 vtAttach 内部短路不够——参数在进函数之前就求值了，那几次查已经跑完了。
+ * 所以所有 `{ ...attachEnv(host, side), … }` 的调用点都改走这里。
+ */
+function vtEnv(host, side, extra) {
+  if (!vt.isOn()) return null;
+  const env = attachEnv(host, side);
+  if (!extra) return env;
+  for (const k of Object.keys(extra)) env[k] = extra[k];
+  return env;
 }
 
 /**
@@ -2522,7 +2540,7 @@ function floatReadiness(el, cfg) {
 function attachFloatWrap(host, cfg, opts) {
   const o = opts || {};
   const side = cfg && cfg.float;
-  const env = attachEnv(host, side);
+  const env = vt.isOn() ? attachEnv(host, side) : null;
   vtAttach(host, 'enter', env);
   // 诊断：直接回答「isLivePreview(host) 是不是 false，于是走了阅读视图那条路」
   dbg('attach.enter', () => ({
@@ -2607,7 +2625,7 @@ function attachFloatWrap(host, cfg, opts) {
        * —— 真机轨迹里「floatify 调用 0 次」就是这么来的。
        * 现在只跳过这一拍，并挂一个「连上就立即重排」的一次性观察器。
        */
-      vtAttach(host, '!connected', { ...attachEnv(host, side), applies });
+      vtAttach(host, '!connected', vtEnv(host, side, { applies }));
       watchConnect();
       return;
     }
@@ -2621,12 +2639,12 @@ function attachFloatWrap(host, cfg, opts) {
      * —— 与编辑模式那个「测量失败却把结果撤掉」的坑是同一个。
      */
     if (record && !floatReadiness(host, cfg)) {
-      vtAttach(host, 'keep', { ...attachEnv(host, side), applies });
+      vtAttach(host, 'keep', vtEnv(host, side, { applies }));
       return;
     }
     resetFloat(record);                 // 先复位，避免上一轮的改动叠上来
     record = null;
-    vtAttach(host, 'floatify', { ...attachEnv(host, side), applies });
+    vtAttach(host, 'floatify', vtEnv(host, side, { applies }));
     let next = null;
     try {
       next = floatify(host, cfg, { svg: o.svg, gap: o.gap, reader: o.reader });
@@ -2724,7 +2742,7 @@ function attachFloatWrap(host, cfg, opts) {
     if (disposed) return;
     disposed = true;
     stopConnectWatch();
-    vtAttach(host, 'dispose', { ...attachEnv(host, side), applies, why: why || 'api' });
+    vtAttach(host, 'dispose', vtEnv(host, side, { applies, why: why || 'api' }));
     if (pending) {
       const p = pending;
       pending = null;
@@ -3531,8 +3549,11 @@ function valignProbe(host) {
 /**
  * 记一条轨迹。任何异常都在这里面吃掉：轨迹是取证层，不许影响布局。
  * 量的时机 = 即将返回的那一刻（write 那一趟取于写完 margin-top 之后）。
+ *
+ * 开关关着时第一行就返回：valignProbe 那几次只读测量一下也不跑。
  */
 function vtTrace(host, cfg, src, exit, extra) {
+  if (!vt.isOn()) return;
   try {
     vt.record({
       src,
@@ -7318,9 +7339,43 @@ __mods["src/valtrace.js"] = function (module, exports, require) {
  *   - 宿主身份用 WeakMap 记，不在宿主对象上留任何字段
  *   - 每个出口都 try/catch：轨迹自身炸了也绝不影响布局，不抛错
  *   - 单次运行最多 MAX_ROWS 条，超出从头截断（留最新的）
+ *   - 默认关（见下面的「电源开关」），关着时 record* 一条都不记
  *
  * 依赖：无。这个模块不 require 任何东西，也就不可能和应用里其它模块成环。
  * ============================================================ */
+
+/* ------------------------------ 电源开关 ------------------------------ */
+
+/*
+ * 为什么要有开关：常开是有代价的。每记一条都要把当时现场的十几个几何量
+ * 重新量一遍（valignProbe 那一套：两次 elHeight、pickSvg、行高、标题中心、
+ * 根节点数、rect、closest…），而每个出口都记一条 —— 功能修好后这就只是纯负担，
+ * 而且每次布局都在多做一遍无用的测量。
+ *
+ * 默认关。需要时点命令「开始记录 valign 轨迹」，复现完再点「输出 valign 调用轨迹」
+ * 导出（导出后自动关）。关着的时候记录函数第一行就返回，调用方（float.js 那三个
+ * vt 包装）也在函数第一行返回，连参数里的测量都不会发生。
+ */
+let enabled = false;
+/* 本次运行里有没有开过：导出命令用它决定要不要提醒「记录没开」 */
+let everEnabled = false;
+
+/** 现在在不在记录 */
+function isOn() {
+  return enabled === true;
+}
+
+/** 开 / 关记录。返回开完之后的真实状态 */
+function setOn(v) {
+  enabled = !!v;
+  if (enabled) everEnabled = true;
+  return enabled;
+}
+
+/** 本次运行里开过记录吗（与当前状态无关） */
+function wasEverOn() {
+  return everEnabled === true;
+}
 
 /** 缓冲上限：单次运行最多 400 条，超出从头截断 */
 const MAX_ROWS = 400;
@@ -7431,6 +7486,7 @@ function keyOf(host) {
  * @returns {object|null} 记下来的那条（测试用）
  */
 function record(entry) {
+  if (!enabled) return null;            // 关着：一条都不记（调用方本来也不该进来）
   try {
     const src = entry && entry.src ? String(entry.src) : 'other';
     const host = entry ? entry.host : null;
@@ -7499,6 +7555,7 @@ let floatT0 = 0;
  *   wrote  有没有真的写 top
  */
 function recordFloat(entry) {
+  if (!enabled) return null;
   try {
     const host = entry ? entry.host : null;
     floatSeq += 1;
@@ -7586,6 +7643,7 @@ const ATTACH_EXIT_DOC = [
 ];
 
 function recordAttach(entry) {
+  if (!enabled) return null;
   try {
     const host = entry ? entry.host : null;
     attachSeq += 1;
@@ -8110,6 +8168,9 @@ function formatDoc(items, floatItems) {
 
 module.exports = {
   MAX_ROWS,
+  isOn,
+  setOn,
+  wasEverOn,
   MAX_FLOAT_ROWS,
   MAX_ATTACH_ROWS,
   EXIT_DOC,
@@ -8879,12 +8940,22 @@ class BraceMapPlugin extends Plugin {
       callback: () => this.toggleLpDebug(),
     });
 
+    // valign 调用轨迹：**默认关**。常开就是每次布局都多做一遍无用的几何测量
+    // （每个出口十来次只读探测），平时不应该付这笔钱。
+    // 流程：开始记录 → 复现 → 输出（导出即停）。
+    this.addCommand({
+      id: 'brace-map-valign-trace-start',
+      name: 'Brace Map: 开始记录 valign 轨迹',
+      callback: () => { try { this.startValignTrace(); } catch (e) { /* ignore */ } },
+    });
+
     // valign 调用轨迹：applyValignLayout 每一次调用的完整轨迹 + 现场快照。
     // 写到 vault 根目录的 brace-map-valign-trace.md，只读，不动布局。
+    // 导出完成后自动停止记录（一段采集到此结束）。
     this.addCommand({
       id: 'brace-map-valign-trace',
       name: 'Brace Map: 输出 valign 调用轨迹',
-      callback: () => { try { this.writeValignTrace(); } catch (e) { /* ignore */ } },
+      callback: () => { try { this.exportValignTrace(); } catch (e) { /* ignore */ } },
     });
 
     // valign 对齐标记：把「现在在哪」和「该在哪」直接画在屏幕上，手动开关。
@@ -9379,6 +9450,63 @@ class BraceMapPlugin extends Plugin {
       }
     } catch (e) { /* 链量不出来不影响主文档 */ }
     return out;
+  }
+
+  /**
+   * 开始记录 valign 调用轨迹（命令入口）。
+   *
+   * 轨迹默认关着（见 src/valtrace.js 的「电源开关」）：关着时渲染路径上一个
+   * 多余测量都不做。这里先把环形缓冲清空再开——一段就是一段，导出时看到的
+   * 就是这次复现的全过程，不会混进上一次的。
+   *
+   * 状态必须让人看得见：控制台一行 + Notice，否则用户不知道自己在哪个状态。
+   *
+   * @returns {boolean} 开完之后的真实状态
+   */
+  startValignTrace() {
+    try { vtReset(); } catch (e) { /* 清不掉也不影响开记录 */ }
+    let on = false;
+    try {
+      on = !!(valtrace && typeof valtrace.setOn === 'function' && valtrace.setOn(true));
+    } catch (e) { on = false; }
+    const msg = on
+      ? 'Brace Map：已开始记录 valign 轨迹（缓冲已清空）。复现后执行「Brace Map: 输出 valign 调用轨迹」导出，导出后会自动停止记录。'
+      : 'Brace Map：轨迹模块没装配上，无法开始记录';
+    try { console.log('[brace-map] ' + msg); } catch (e) { /* ignore */ }
+    try { new Notice(msg); } catch (e) { /* 没有 Notice 就只留控制台那一行 */ }
+    return on;
+  }
+
+  /**
+   * 导出并停止记录（命令入口）。
+   *
+   * writeValignTrace 本身不管开关（诊断命令与自测会直接调它），关开关这件事
+   * 只在命令入口做：点一次导出 = 这段采集结束，下一次要看重新开。
+   *
+   * 如果整段一次都没开过记录，导出出来的只有现场快照（与轨迹无关，照常量），
+   * 所以额外提醒一句「怎么才能拿到调用轨迹」。
+   */
+  async exportValignTrace() {
+    let wasOn = false;
+    try { wasOn = !!(valtrace && typeof valtrace.isOn === 'function' && valtrace.isOn()); } catch (e) { wasOn = false; }
+    let empty = true;
+    try { empty = (vtCount() + vtFloatCount() + vtAttachCount()) === 0; } catch (e) { empty = true; }
+
+    let text = '';
+    try {
+      text = await this.writeValignTrace();
+    } finally {
+      try { if (valtrace && typeof valtrace.setOn === 'function') valtrace.setOn(false); } catch (e) { /* ignore */ }
+    }
+
+    try {
+      const msg = (!wasOn && empty)
+        ? 'Brace Map：记录没开，本次只导出了现场快照。先跑「Brace Map: 开始记录 valign 轨迹」→ 复现 → 再导出，才有调用轨迹。'
+        : 'Brace Map：valign 轨迹已导出，记录已停止。';
+      console.log('[brace-map] ' + msg);
+      new Notice(msg);
+    } catch (e) { /* ignore */ }
+    return text;
   }
 
   /**

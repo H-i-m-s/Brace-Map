@@ -39,6 +39,7 @@ require('./wrapdiag.test');
 require('./debug.test');
 require('./closing.test');
 require('./closinglabel.test');
+require('./valtracegate.test');
 
 runAll().then(() => {
   // 路径样例，便于人工比对形状

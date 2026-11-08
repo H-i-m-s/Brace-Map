@@ -22,6 +22,13 @@ const I = Plugin && Plugin.__internals;
 /* 诊断层正式运行时是关的（DEBUG_LP = false），自测要验它本体，所以这里显式打开 */
 if (I && typeof I.dbgSetEnabled === 'function') I.dbgSetEnabled(true);
 
+/*
+ * valign 轨迹的电源开关在正式运行时也是关的（关着时渲染路径上一个多余测量都不做）。
+ * 自测要验轨迹本体，所以这里统一开着；开关自己的行为由 valtracegate 那组用例
+ * 临时关掉再恢复。
+ */
+if (I && I.valtrace && typeof I.valtrace.setOn === 'function') I.valtrace.setOn(true);
+
 /* ------------------------------ 断言 ------------------------------ */
 
 let passed = 0;

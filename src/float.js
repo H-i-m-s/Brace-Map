@@ -505,6 +505,8 @@ function floatify(el, cfg, opts) {
  * 不靠在每个 return 前面插一行（那样漏一个就少一条）。
  */
 function vtFloat(el, cfg, st, exit) {
+  // 开关关着时立刻返回：连 st 里那几个值的获取路径都不会走到
+  if (!vt.isOn()) return null;
   try {
     const s = st || {};
     vt.recordFloat({
@@ -702,6 +704,7 @@ function resetFloat(record) {
  * 绝不影响浮动。
  */
 function vtAttach(host, exit, extra) {
+  if (!vt.isOn()) return;
   try {
     const e = extra || {};
     vt.recordAttach({
@@ -733,6 +736,21 @@ function attachEnv(host, side) {
     cmContent: closestOf('.cm-content'),
     cmEditor: closestOf('.cm-editor'),
   };
+}
+
+/**
+ * 轨迹要的入口现场 + 额外字段；**关着的时候连 attachEnv 都不调**。
+ *
+ * attachEnv 里有两次 closest 和一次 isLivePreview，属于实打实的 DOM 查询。
+ * 只靠 vtAttach 内部短路不够——参数在进函数之前就求值了，那几次查已经跑完了。
+ * 所以所有 `{ ...attachEnv(host, side), … }` 的调用点都改走这里。
+ */
+function vtEnv(host, side, extra) {
+  if (!vt.isOn()) return null;
+  const env = attachEnv(host, side);
+  if (!extra) return env;
+  for (const k of Object.keys(extra)) env[k] = extra[k];
+  return env;
 }
 
 /**
@@ -779,7 +797,7 @@ function floatReadiness(el, cfg) {
 function attachFloatWrap(host, cfg, opts) {
   const o = opts || {};
   const side = cfg && cfg.float;
-  const env = attachEnv(host, side);
+  const env = vt.isOn() ? attachEnv(host, side) : null;
   vtAttach(host, 'enter', env);
   // 诊断：直接回答「isLivePreview(host) 是不是 false，于是走了阅读视图那条路」
   dbg('attach.enter', () => ({
@@ -864,7 +882,7 @@ function attachFloatWrap(host, cfg, opts) {
        * —— 真机轨迹里「floatify 调用 0 次」就是这么来的。
        * 现在只跳过这一拍，并挂一个「连上就立即重排」的一次性观察器。
        */
-      vtAttach(host, '!connected', { ...attachEnv(host, side), applies });
+      vtAttach(host, '!connected', vtEnv(host, side, { applies }));
       watchConnect();
       return;
     }
@@ -878,12 +896,12 @@ function attachFloatWrap(host, cfg, opts) {
      * —— 与编辑模式那个「测量失败却把结果撤掉」的坑是同一个。
      */
     if (record && !floatReadiness(host, cfg)) {
-      vtAttach(host, 'keep', { ...attachEnv(host, side), applies });
+      vtAttach(host, 'keep', vtEnv(host, side, { applies }));
       return;
     }
     resetFloat(record);                 // 先复位，避免上一轮的改动叠上来
     record = null;
-    vtAttach(host, 'floatify', { ...attachEnv(host, side), applies });
+    vtAttach(host, 'floatify', vtEnv(host, side, { applies }));
     let next = null;
     try {
       next = floatify(host, cfg, { svg: o.svg, gap: o.gap, reader: o.reader });
@@ -981,7 +999,7 @@ function attachFloatWrap(host, cfg, opts) {
     if (disposed) return;
     disposed = true;
     stopConnectWatch();
-    vtAttach(host, 'dispose', { ...attachEnv(host, side), applies, why: why || 'api' });
+    vtAttach(host, 'dispose', vtEnv(host, side, { applies, why: why || 'api' }));
     if (pending) {
       const p = pending;
       pending = null;
@@ -1788,8 +1806,11 @@ function valignProbe(host) {
 /**
  * 记一条轨迹。任何异常都在这里面吃掉：轨迹是取证层，不许影响布局。
  * 量的时机 = 即将返回的那一刻（write 那一趟取于写完 margin-top 之后）。
+ *
+ * 开关关着时第一行就返回：valignProbe 那几次只读测量一下也不跑。
  */
 function vtTrace(host, cfg, src, exit, extra) {
+  if (!vt.isOn()) return;
   try {
     vt.record({
       src,
