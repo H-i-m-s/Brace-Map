@@ -7,6 +7,9 @@ node_modules/
 # 临时诊断页（diag*.html 是排查时一次性的现场复现，不进版本库）
 diag*.html
 
+# 打包产物（release.ps1 生成，每个版本重建）
+dist/
+
 # 编辑器 / 系统
 .DS_Store
 Thumbs.db
