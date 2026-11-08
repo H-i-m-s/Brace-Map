@@ -319,6 +319,195 @@ function tMultipleLabels() {
   }
 }
 
+/* --------------------- 列间距：标签只推右边的列 --------------------- */
+
+/*
+ * 四种组合。列间距（= 相邻两列 mainBody 之差）：
+ *   内列无标签 → braceWidth + colGap = 26（与改动前一致）
+ *   内列有标签 → braceWidth + colGap + labelMainSpan + colGap
+ *                标签「组甲」两字 20px → 10 + 16 + 20 + 16 = 62
+ */
+const STEP_PLAIN = I.OPT.braceWidth + I.OPT.colGap;   // 26
+
+const COMBOS = {
+  'both-plain': {
+    src: ['closing: 甲, 乙', 'closing: true'],
+    cols: [{ body: 94, tip: 104 }, { body: 120, tip: 130 }],
+    W: 146,
+  },
+  'inner-label': {
+    src: ['closing: 组甲 = 甲, 乙', 'closing: true'],
+    cols: [{ body: 94, tip: 104 }, { body: 156, tip: 166 }],
+    W: 182,
+  },
+  'outer-label': {
+    src: ['closing: 甲, 乙', 'closing: 全部 = true'],
+    cols: [{ body: 94, tip: 104 }, { body: 120, tip: 130 }],
+    W: 182,
+  },
+  'both-label': {
+    src: ['closing: 组甲 = 甲, 乙', 'closing: 全部 = true'],
+    cols: [{ body: 94, tip: 104 }, { body: 156, tip: 166 }],
+    W: 218,
+  },
+};
+
+function combo(name) {
+  const lines = COMBOS[name].src.concat(['- 父', '  - 甲', '  - 乙']);
+  const r = I.parseSource(lines.join('\n'));
+  const L = I.layoutTree(r.roots, Object.assign({}, LAYOUT_OPTS, {
+    dir: 'lr', closing: r.closing, closingGroups: r.closingGroups,
+  }));
+  return { r, L, cs: closings(L) };
+}
+
+function tColumnPush() {
+  // 1) 都没标签：列间距 = braceWidth + colGap，全图像素与加标签之前一致
+  {
+    const { L, cs } = combo('both-plain');
+    eq(cs.length, 2, 'col-push[both-plain]: 两条括号');
+    eq(cs[0].mainBody, COMBOS['both-plain'].cols[0].body, 'col-push[both-plain]: 内列 body 不变');
+    eq(cs[1].mainBody, COMBOS['both-plain'].cols[1].body, 'col-push[both-plain]: 外列 body 不变');
+    eq(cs[1].mainBody - cs[0].mainBody, STEP_PLAIN, 'col-push[both-plain]: 列间距 = braceWidth + colGap');
+    eq(L.width, COMBOS['both-plain'].W, 'col-push[both-plain]: 画布宽与加标签之前一致');
+  }
+
+  // 2) 内列有标签、外列没有：多退标签宽 + 一道 colGap
+  {
+    const { L, cs } = combo('inner-label');
+    const inner = cs[0];
+    const outer = cs[1];
+    eq(inner.mainBody, 94, 'col-push[inner-label]: 内列 body 不变（只有 canvas 该变）');
+    eq(inner.mainTip, 104, 'col-push[inner-label]: 内列 tip 不变');
+    eq(inner.labelW, 20, 'col-push[inner-label]: 内列标签宽');
+    eq(outer.mainBody - inner.mainBody,
+      I.OPT.braceWidth + I.OPT.colGap + inner.labelW + I.OPT.colGap,
+      'col-push[inner-label]: 列间距 = braceWidth + colGap + labelW + colGap');
+    eq(outer.mainBody - inner.mainBody, 62, 'col-push[inner-label]: 具体值 62');
+    // 两条括号在 main 上不重叠，且标签右缘与下一个 body 之间还剩一道 colGap
+    ok(outer.mainBody >= inner.mainTip, 'col-push[inner-label]: 括号不重叠');
+    ok(inner.labelX + inner.labelW <= outer.mainBody, 'col-push[inner-label]: 标签右缘在下一个 body 之前',
+      (inner.labelX + inner.labelW) + ' vs ' + outer.mainBody);
+    eq(outer.mainBody - (inner.labelX + inner.labelW), I.OPT.colGap,
+      'col-push[inner-label]: 标签右缘到外列 body 恰好一道 colGap');
+    eq(outer.labelW, 0, 'col-push[inner-label]: 外列确实没标签');
+    eq(L.width, 182, 'col-push[inner-label]: 画布 = 外列 tip + pad');
+  }
+
+  // 3) 内列没标签、外列有：列间距一点都不变，只有画布因外列标签而扩
+  {
+    const { L, cs } = combo('outer-label');
+    const plain = combo('both-plain');
+    eq(cs[1].mainBody - cs[0].mainBody, STEP_PLAIN, 'col-push[outer-label]: 列间距不变');
+    eq(cs[1].mainBody, plain.cs[1].mainBody, 'col-push[outer-label]: 外列 body 与无标签时相同');
+    eq(cs[1].labelW, 20, 'col-push[outer-label]: 外列标签宽');
+    eq(L.width - plain.L.width, cs[1].labelW + I.OPT.colGap,
+      'col-push[outer-label]: 画布多出来的 = 外列标签宽 + colGap');
+    eq(cs[1].labelX + cs[1].labelW + PAD, L.width, 'col-push[outer-label]: 右边界 = 外列标签右缘 + pad');
+  }
+
+  // 4) 两条都有标签
+  {
+    const { L, cs } = combo('both-label');
+    eq(cs[1].mainBody - cs[0].mainBody, 62, 'col-push[both-label]: 列间距 = 62');
+    ok(cs[0].labelX + cs[0].labelW < cs[1].mainBody, 'col-push[both-label]: 内列标签没压到外列括号');
+    eq(cs[1].mainBody - (cs[0].labelX + cs[0].labelW), I.OPT.colGap, 'col-push[both-label]: 中间一道 colGap');
+    eq(cs[1].labelX + cs[1].labelW + PAD, L.width, 'col-push[both-label]: 画布装下最外列标签');
+    eq(L.width, 218, 'col-push[both-label]: 具体值 218');
+  }
+}
+
+function tColumnPushSharedColumn() {
+  /*
+   * 同一列里可以住好几条括号（上下不重叠就复用）。列的标签占宽取这列的最大值，
+   * 且与声明顺序无关：先写不带标签的、后写带标签的，这一列同样要把右边推开。
+   */
+  const linesFor = (first, second) => [first, second, 'closing: 全部 = true']
+    .concat(['- 父', '  - 甲', '  - 乙']);
+
+  for (const [name, first, second] of [
+    ['label-first', 'closing: 组甲 = 甲', 'closing: 乙'],
+    ['label-second', 'closing: 乙', 'closing: 组甲 = 甲'],
+  ]) {
+    const r = I.parseSource(linesFor(first, second).join('\n'));
+    const L = I.layoutTree(r.roots, Object.assign({}, LAYOUT_OPTS, {
+      dir: 'lr', closing: r.closing, closingGroups: r.closingGroups,
+    }));
+    const cs = closings(L);
+    eq(cs.length, 3, 'col-share[' + name + ']: 三条括号');
+    // 前两条（甲 / 乙 上下不撞）共住第 0 列
+    eq(cs[0].mainBody, cs[1].mainBody, 'col-share[' + name + ']: 前两条共住一列');
+    eq(cs[0].mainBody, 94, 'col-share[' + name + ']: 第 0 列还是老基线');
+    // 第 0 列里有标签（不管它是第几条声明），第 1 列就得后退 labelW + colGap
+    eq(cs[2].mainBody - cs[0].mainBody, 62, 'col-share[' + name + ']: 标签那一列把右边推开了');
+    const lab = cs.find((c) => c.label === '组甲');
+    ok(lab.labelX + lab.labelW <= cs[2].mainBody, 'col-share[' + name + ']: 标签不压外列括号');
+    ok(cs[2].labelX + cs[2].labelW + PAD === L.width, 'col-share[' + name + ']: 画布装下最外标签');
+  }
+}
+
+function tColumnPushVertical() {
+  // 竖方向：标签横写，沿 main 占一个「字高」，推开的量是 colGap + fontSize + colGap
+  for (const dir of ['tb', 'bt']) {
+    const r = I.parseSource(['closing: 组甲 = 甲, 乙', 'closing: true']
+      .concat(['- 父', '  - 甲', '  - 乙']).join('\n'));
+    const L = I.layoutTree(r.roots, Object.assign({}, LAYOUT_OPTS, {
+      dir, closing: r.closing, closingGroups: r.closingGroups,
+    }));
+    const cs = closings(L);
+    eq(cs[1].mainBody - cs[0].mainBody,
+      I.OPT.braceWidth + I.OPT.colGap + FONT + I.OPT.colGap,
+      'col-push[' + dir + ']: 竖方向推开的量按字高算');
+    ok(cs[0].labelY + FONT / 2 <= cs[1].mainBody, 'col-push[' + dir + ']: 标签沿 main 也没压到外列');
+  }
+}
+
+function tFalseBothWays() {
+  const base = ['- 父', '  - 甲', '  - 乙'];
+
+  // 不带 `=`
+  const plain = I.parseSource(['closing: false'].concat(base).join('\n'));
+  eq(plain.closingGroups, [], 'label-false: `closing: false` 没有任何声明');
+  eq('label' in (plain.closingGroups[0] || {}), false, 'label-false: 也不产生 label 字段');
+  eq(plain.closing, false, 'label-false: closing 布尔为假');
+  eq((I.buildSvg(plain, LAYOUT_OPTS).markup.match(/bm-closing-label/g) || []).length, 0,
+    'label-false: 不出标签元素');
+
+  // 带 `=` 与标签
+  const tagged = I.parseSource(['closing: 全组 = false'].concat(base).join('\n'));
+  eq(tagged.closingGroups, [], 'label-false: `全组 = false` 也没有任何声明');
+  eq(tagged.closing, false, 'label-false: `全组 = false` 时 closing 布尔为假');
+  eq((I.buildSvg(tagged, LAYOUT_OPTS).markup.match(/bm-closing-label/g) || []).length, 0,
+    'label-false: 带标签的 false 也不出标签');
+  const lay = I.layoutTree(tagged.roots, Object.assign({}, LAYOUT_OPTS, {
+    dir: 'lr', closing: tagged.closing, closingGroups: tagged.closingGroups,
+  }));
+  eq(closings(lay).length, 0, 'label-false: 一条括号都不画');
+}
+
+function tLabelMarkupSafe() {
+  // 标签不解析行内标记：`**` / `<font>` 原样当字画，宽度也把它们算进去
+  const bold = layout(['closing: **动力组** = 甲, 乙', '- 父', '  - 甲', '  - 乙'].join('\n'));
+  const cb = closings(bold.L)[0];
+  eq(cb.label, '**动力组**', 'label-markup: 星号原样保留');
+  eq(cb.labelW, 70, 'label-markup: 宽度把星号也量进去（7 字 × 10px）');
+  const mb = I.buildSvg(bold.r, LAYOUT_OPTS).markup;
+  ok(mb.indexOf('>**动力组**</text>') > 0, 'label-markup: 星号没被当成粗体语法');
+  eq((mb.match(/<tspan/g) || []).length, 0, 'label-markup: 标签不吃 run，不产生 tspan');
+
+  // 尖括号/引号/& 一律转义，标签里写标签也不会真长出一个元素
+  const inj = layout(['closing: <font color="red">x</font> = 甲', '- 父', '  - 甲'].join('\n'));
+  const ci = closings(inj.L)[0];
+  eq(ci.label, '<font color="red">x</font>', 'label-markup: 标签原文留着');
+  const mi = I.buildSvg(inj.r, LAYOUT_OPTS).markup;
+  eq((mi.match(/<font /g) || []).length, 0, 'label-markup: 没长出真的 <font> 元素');
+  ok(mi.indexOf('&lt;font color=&quot;red&quot;&gt;x&lt;/font&gt;') > 0, 'label-markup: 整段被转义');
+  ok(clean(mi), 'label-markup: markup 干净');
+  // 标签元素本身仍然只有一个、且属性完整
+  const tags = mi.match(/<text class="bm-closing-label"[^>]*>[^<]*<\/text>/g) || [];
+  eq(tags.length, 1, 'label-markup: 只出一个标签元素');
+}
+
 /* ------------------------------ 边界情况 ------------------------------ */
 
 function tEdge() {
@@ -351,3 +540,8 @@ suite('closing-label-place-mirror', tPlaceMirrored);
 suite('closing-label-width', tCanvasWidth);
 suite('closing-label-multi', tMultipleLabels);
 suite('closing-label-edge', tEdge);
+suite('closing-label-column-push', tColumnPush);
+suite('closing-label-column-share', tColumnPushSharedColumn);
+suite('closing-label-column-vertical', tColumnPushVertical);
+suite('closing-label-false', tFalseBothWays);
+suite('closing-label-markup-safe', tLabelMarkupSafe);

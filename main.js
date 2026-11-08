@@ -4310,12 +4310,14 @@ function layoutTree(roots, opts) {
   // 4) 末端总括号（closing）：尖端在外侧、开口（首末点）贴内容。
   //    同样居中：内容末端 → 画布内边距之间的空间里，两侧留白相等。
   //
-  //    一条声明 = 一个括号，按书写顺序从内往外排：第一条贴着内容，第 k 条
-  //    往右 k*(braceWidth + colGap)。每条自己决定括谁——all 括全部叶子，
-  //    names 按节点文字点名（可跨层：括号就是一条长括号穿过去，中间的行不参与）。
+  //    一条声明 = 一个括号，按书写顺序从内往外排：第一条贴着内容，第 k 条往外一列。
+  //    每条自己决定括谁——all 括全部叶子，names 按节点文字点名（可跨层：括号就是
+  //    一条长括号穿过去，中间的行不参与）。
   //
-  //    带标签的组在括号尖端外侧再写一行字（见下方 labelMainEnd / 第 6 步的映射），
-  //    标签只往外扩包围盒，不参与列位分配。
+  //    带标签的组在括号尖端外侧再写一行字（见下方 labelMainEnd / 第 6 步的映射）。
+  //    两遍扫描：第一遍只定列号（判据只看 cross 范围，不看标签），同时记下每列
+  //    标签的占宽；第二遍才按「左边那列有没有标签」算每列的横坐标。这样没标签的
+  //    列间距与以前完全一样，有标签的列才把右边的列推开。
   const leaves = nodes.filter((n) => !n.children.length);
   if (closingGroups.length) {
     // 所有 closing 共用同一条基线：内容末端（含全部节点，不只叶子）到画布内边距线
@@ -4327,6 +4329,8 @@ function layoutTree(roots, opts) {
     const base = mEnd + (avail - braceWidth) / 2;
     let col = 0;                      // 实际画出来的列号：没命中的那条不留空列
     const placed = [];                // 每列已经画了哪些括号（拿来判断能不能复用这列）
+    const colLabelSpan = [];          // 每列标签在 main 上的最大占宽（没标签的列不记 = 0）
+    const pending = [];               // 第一遍的成果：列号定了、x 还没定的括号
     for (const [i, group] of closingGroups.entries()) {
       const all = !!(group && group.all);
       const names = group && Array.isArray(group.names) ? group.names : [];
@@ -4357,22 +4361,11 @@ function layoutTree(roots, opts) {
         c2 = Math.max(c2, t.cross + t.selfCross / 2);
       }
       /*
-       * 横向位置：优先占「不会和已有括号撞车」的那一列。
+       * 第一遍：定列号。判据只看 cross 范围，与改动前完全一致 —— 两个在垂直方向
+       * 根本不重叠的括号可以并排共用一列，重叠的才往外排。标签不参与这个判据。
        *
-       * 以前是每画一组就无条佯往右推一列，结果两个在垂直方向根本不重叠、
-       * 完全可以并排的括号也被拉到很远。现在先看已有括号：只要新组的 cross
-       * 范围和某一列里的所有括号都错开，就复用那一列。
-       *
-       * 第一列仍然沿用全局基线，旧版单组 / 三组逐位一致。
-       *
-       * 已知限制（本次不处理）：判据只看 cross 范围，不看标签。而标签的起点
-       * `mainTip + colGap` 恰好等于**下一列的 mainBody**（列步长 = braceWidth + colGap，
-       * 尖端又比 body 外 braceWidth，两个 braceWidth 一消：base+26k+10+16 = base+26(k+1)），
-       * 所以只要图里真的排到两列，左边那列的标签就一定从右边那列的括号线上起步、
-       * 横着压过去（不是「标签特别长才会碰上」，而是短到只有两个字也会碰上）。
-       * 本次不改：一旦把标签宽度纳进列步长，现有的列间距和多组画布宽度全变，
-       * 超出「列位分配不动」的范围。要彻底解决，得在算 mBody 的步长里加上
-       * 「右侧还有列时预留 labelW + colGap」，或把标签改成缩进到两列之间的缝里。
+       * 标签的横向伸出去多长，等到第二遍算列坐标时才起作用（见下面的 colBody）：
+       * 左边那列有标签，它右边的列就多退 labelMainSpan + colGap。
        */
       let slot = 0;
       for (let k = 0; k < placed.length; k++) {
@@ -4380,7 +4373,6 @@ function layoutTree(roots, opts) {
         if (!hit) { slot = k; break; }
         slot = k + 1;
       }
-      const mBody = base + slot * (braceWidth + colGap);
       while (placed.length <= slot) placed.push([]);
       placed[slot].push({ cross1: c1, cross2: c2 });
       col++;
@@ -4394,6 +4386,10 @@ function layoutTree(roots, opts) {
        * 沿 main 方向占多少：横着生长的图里标签是横着写的，占 labelW；
        * 竖着生长的图里标签仍横着写（不转 90°），它在 main 上占的是字高 fontSize，
        * 在 cross 上占 labelW。两侧各取各的，别混。
+       *
+       * 竖方向横写是**已知代价**：标签越宽（字数越多），画布在 cross（x）方向就被
+       * 撑得越宽，整张图看起来向右偏、留白不对称；而转 90° 竖排能把这部分宽度
+       * 换成沿 main 的进深，是以后的可选改法（本次不做，不改现有排版）。
        */
       const label = group && typeof group.label === 'string' ? group.label.trim() : '';
       let labelW = 0;
@@ -4403,21 +4399,47 @@ function layoutTree(roots, opts) {
       }
       const labelMainSpan = label ? (vertical ? fontSize : labelW) : 0;
       const labelCrossSpan = label ? (vertical ? labelW : fontSize) : 0;
-      const mTip = mBody + braceWidth;
 
+      // 同一列里可能有好几条括号（上下不重叠），这一列的标签占宽取最大值：
+      // 只要有一条带标签，右边那些列就得给它让出位置。
+      if (labelMainSpan > 0) {
+        colLabelSpan[slot] = Math.max(colLabelSpan[slot] || 0, labelMainSpan);
+      }
+
+      pending.push({ i, targets, c1, c2, slot, label, labelW, labelMainSpan, labelCrossSpan });
+    }
+
+    /*
+     * 第二遍：算每列的 mainBody。
+     *   第 0 列还是老基线 base —— 单列、无标签、以及「只有最内列有标签」的图里，
+     *   这条括号的位置与改动前一模一样，不会因为标签而挪动。
+     *   第 k 列 = 第 k-1 列的尖端 + colGap（上一列没标签，老间距）+ 标签占宽 + colGap。
+     * 于是内列的标签右边缘离外列的 body 恒有一道 colGap，再也不会压在括号线上。
+     */
+    const colBody = [];
+    for (let k = 0; k < placed.length; k++) {
+      if (k === 0) { colBody[0] = base; continue; }
+      const prevLabelSpan = colLabelSpan[k - 1] || 0;
+      colBody[k] = colBody[k - 1] + braceWidth + colGap
+        + (prevLabelSpan > 0 ? prevLabelSpan + colGap : 0);
+    }
+
+    for (const p of pending) {
+      const mBody = colBody[p.slot];
+      const mTip = mBody + braceWidth;
       braces.push({
         kind: 'closing',
-        group: i,                     // 第几条声明（从 0 数，诊断/自测用）
-        targets,                      // 这一条括住的节点（诊断/自测用）
+        group: p.i,                   // 第几条声明（从 0 数，诊断/自测用）
+        targets: p.targets,           // 这一条括住的节点（诊断/自测用）
         mainTip: mTip,                // 尖端在外侧
         mainBody: mBody,              // 端点贴内容
-        cross1: c1,
-        cross2: c2,
+        cross1: p.c1,
+        cross2: p.c2,
         // 标签：label 为空时下面四个都是 0 / 空串，绘制层直接跳过
-        label,
-        labelW,
-        labelCrossSpan,               // 标签在 cross 上的占宽（居中放）
-        labelMainEnd: label ? mTip + colGap + labelMainSpan : 0,  // 标签在 main 上的外边缘
+        label: p.label,
+        labelW: p.labelW,
+        labelCrossSpan: p.labelCrossSpan,   // 标签在 cross 上的占宽（居中放）
+        labelMainEnd: p.label ? mTip + colGap + p.labelMainSpan : 0,  // 标签在 main 上的外边缘
       });
     }
   }
