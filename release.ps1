@@ -48,12 +48,10 @@ foreach ($f in $files) {
   Copy-Item $src (Join-Path $stage $f)
 }
 
-# vendor/ 必须随包发。main.js 用 resolveResource('vendor/tex-svg.js') 加载 MathJax，
-# 内联那份在函数作用域里启动不起来，只能当备胎。少了它公式会降级成原文。
-$vendorSrc = Join-Path $root 'vendor'
-if (-not (Test-Path $vendorSrc)) { throw "缺目录：vendor（MathJax 依赖，必须随包发）" }
-if (-not (Test-Path (Join-Path $vendorSrc 'tex-svg.js'))) { throw "缺文件：vendor/tex-svg.js" }
-Copy-Item $vendorSrc (Join-Path $stage 'vendor') -Recurse
+# vendor/ 不用单独带。
+# build.js 已经把 vendor/tex-svg.js 整个内联进 main.js（__mods["vendor/tex-svg.js"]），
+# 运行时 resolveResource 找不到外部文件会自动退回内联模块，公式照常工作。
+# 早期版本此处曾把 vendor/ 单独拷进 zip，那是多余的一倍体积。
 
 # LICENSE 有就一起带上（有些分发渠道会看）
 $lic = Join-Path $root 'LICENSE'
