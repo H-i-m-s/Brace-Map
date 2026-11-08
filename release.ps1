@@ -1,4 +1,4 @@
-# Brace Map 打包脚本
+﻿# Brace Map 打包脚本
 #
 #   pwsh -File release.ps1            # 打包当前版本
 #

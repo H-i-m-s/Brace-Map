@@ -96,8 +96,15 @@ closing: 全部 = true
 ```bash
 node build.js        # 把 src/ 内联成 main.js
 node test/run.js     # 2311 项自测
-pwsh -File release.ps1   # 打包 dist/ 与 release 附件
 ```
+
+打包（双击 `release.cmd` 也行）：
+
+```bash
+pwsh -File release.ps1
+```
+
+产出在 `dist/`：`brace-map-<version>.zip`（解压即用）与 `main.js` / `manifest.json` / `styles.css` 三个散文件（给 BRAT 和 Release 附件）。
 
 **注意 `main.js` 必须提交。** 它是构建产物，但移动端 Obsidian 没有文件系统的 `require`，插件只能靠这份自包含的文件运行。改了 `src/` 之后要跑 `build.js` 并一起提交。
 
