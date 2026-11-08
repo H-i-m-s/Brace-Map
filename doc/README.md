@@ -379,13 +379,20 @@ Node 测试 20 个套件，约 1633 条断言
 
 ## 调试
 
-命令面板里有三条：
+命令面板里的诊断命令：
 
 | 命令 | 作用 |
 |---|---|
 | `诊断当前页的括号图` | 输出每张图的尺寸、字号、可见性判决、各层祖先的裁剪情况 |
 | `Brace Map: 输出折行诊断` | 输出折行计算的中间数据 |
-| `Brace Map: 切换实时预览布局诊断日志` | 开关编辑模式浮动日志（`float.state`：宿主 cssText、embed 高度、绕排判定），写到 vault 根目录 |
+| `Brace Map: 切换实时预览布局诊断日志` | 开关编辑模式浮动日志（`float.state`：宿主 cssText、embed 高度、绕排判定） |
+| `Brace Map: 显示 valign 对齐标记` | 在浮动图旁画出「现在在哪」和「该在哪」两条线，肉眼对比偏差 |
+| `Brace Map: 开始记录 valign 轨迹` | 打开轨迹记录（默认关闭） |
+| `Brace Map: 输出 valign 调用轨迹` | 导出轨迹到 `brace-map-valign-trace.md`，并自动停止记录 |
+
+输出都在 vault 根目录。
+
+**轨迹默认是关的。**关着的时候，`vtTrace` / `vtFloat` / `vtAttach` 第一行就返回，不做任何几何测量——一次 `applyValignLayout` 比开着时少 9 次 DOM 查询（`valignProbe` 的成本），早退分支更是 0 次。需要时：开始记录 → 复现 → 输出。
 
 **headless 浏览器回归**：
 
@@ -466,6 +473,7 @@ msedge --headless=new --disable-gpu --no-sandbox --user-data-dir=<tmp> \
 
 | 版本 | 变更 |
 |---|---|
+| `0.15.1` | valign 轨迹默认关闭：关着时包装函数第一行就返回，渲染路径上不做几何测量 |
 | `0.15.0` | `closing` 支持分组标签（`closing: 动力组 = 甲, 乙`），标签写在括号尖端外侧；列间距按列标签让位，避免标签压到右列括号 |
 | `0.14.0` | `closing` 从全局布尔升级成声明列表：可点名指定框哪些节点（跨层时是一条长括号穿过去），允许写多条并存、从内往外依次排开；`false` / `off` / `no` / `0` / `none` 显式关闭 |
 | `0.13.0` | 阅读视图 `valign` 修好：根因是宿主未连入 DOM 时被提前 dispose，以及 `pickContext` 把高 0 的壳当成块；`valign` 量不到时不再撤销已生效的结果 |
