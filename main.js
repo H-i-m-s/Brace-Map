@@ -4313,6 +4313,9 @@ function layoutTree(roots, opts) {
   //    一条声明 = 一个括号，按书写顺序从内往外排：第一条贴着内容，第 k 条
   //    往右 k*(braceWidth + colGap)。每条自己决定括谁——all 括全部叶子，
   //    names 按节点文字点名（可跨层：括号就是一条长括号穿过去，中间的行不参与）。
+  //
+  //    带标签的组在括号尖端外侧再写一行字（见下方 labelMainEnd / 第 6 步的映射），
+  //    标签只往外扩包围盒，不参与列位分配。
   const leaves = nodes.filter((n) => !n.children.length);
   if (closingGroups.length) {
     // 所有 closing 共用同一条基线：内容末端（含全部节点，不只叶子）到画布内边距线
@@ -4361,6 +4364,15 @@ function layoutTree(roots, opts) {
        * 范围和某一列里的所有括号都错开，就复用那一列。
        *
        * 第一列仍然沿用全局基线，旧版单组 / 三组逐位一致。
+       *
+       * 已知限制（本次不处理）：判据只看 cross 范围，不看标签。而标签的起点
+       * `mainTip + colGap` 恰好等于**下一列的 mainBody**（列步长 = braceWidth + colGap，
+       * 尖端又比 body 外 braceWidth，两个 braceWidth 一消：base+26k+10+16 = base+26(k+1)），
+       * 所以只要图里真的排到两列，左边那列的标签就一定从右边那列的括号线上起步、
+       * 横着压过去（不是「标签特别长才会碰上」，而是短到只有两个字也会碰上）。
+       * 本次不改：一旦把标签宽度纳进列步长，现有的列间距和多组画布宽度全变，
+       * 超出「列位分配不动」的范围。要彻底解决，得在算 mBody 的步长里加上
+       * 「右侧还有列时预留 labelW + colGap」，或把标签改成缩进到两列之间的缝里。
        */
       let slot = 0;
       for (let k = 0; k < placed.length; k++) {
@@ -4372,14 +4384,40 @@ function layoutTree(roots, opts) {
       while (placed.length <= slot) placed.push([]);
       placed[slot].push({ cross1: c1, cross2: c2 });
       col++;
+
+      /*
+       * 标签：这一组叫什么，写在尖端外侧。
+       *
+       * 宽度用节点文字同一把尺子量（measureRaw 不传 seq，不往自校准的
+       * estWidths 里记账）；量不出来就当 0，只有右边界会因此偏窄，不会画出坏路径。
+       *
+       * 沿 main 方向占多少：横着生长的图里标签是横着写的，占 labelW；
+       * 竖着生长的图里标签仍横着写（不转 90°），它在 main 上占的是字高 fontSize，
+       * 在 cross 上占 labelW。两侧各取各的，别混。
+       */
+      const label = group && typeof group.label === 'string' ? group.label.trim() : '';
+      let labelW = 0;
+      if (label) {
+        const lw = measureRaw(label);
+        labelW = Number.isFinite(lw) && lw > 0 ? lw : 0;
+      }
+      const labelMainSpan = label ? (vertical ? fontSize : labelW) : 0;
+      const labelCrossSpan = label ? (vertical ? labelW : fontSize) : 0;
+      const mTip = mBody + braceWidth;
+
       braces.push({
         kind: 'closing',
         group: i,                     // 第几条声明（从 0 数，诊断/自测用）
         targets,                      // 这一条括住的节点（诊断/自测用）
-        mainTip: mBody + braceWidth,  // 尖端在外侧
+        mainTip: mTip,                // 尖端在外侧
         mainBody: mBody,              // 端点贴内容
         cross1: c1,
         cross2: c2,
+        // 标签：label 为空时下面四个都是 0 / 空串，绘制层直接跳过
+        label,
+        labelW,
+        labelCrossSpan,               // 标签在 cross 上的占宽（居中放）
+        labelMainEnd: label ? mTip + colGap + labelMainSpan : 0,  // 标签在 main 上的外边缘
       });
     }
   }
@@ -4402,6 +4440,18 @@ function layoutTree(roots, opts) {
     mainMax = Math.max(mainMax, b.mainTip, b.mainBody);
     crossMin = Math.min(crossMin, b.cross1);
     crossMax = Math.max(crossMax, b.cross2);
+    /*
+     * 标签也占地方，不能只算括号本体：
+     *   main 方向伸到 labelMainEnd（尖端 + colGap + 标签占宽），不扩就被裁一半；
+     *   cross 方向按中点居中，括号本身太窄（只括一个矮节点）时标签会顶出上下沿。
+     * 多组各算各的，取最大值。
+     */
+    if (b.label) {
+      mainMax = Math.max(mainMax, b.labelMainEnd);
+      const cMid = (b.cross1 + b.cross2) / 2;
+      crossMin = Math.min(crossMin, cMid - b.labelCrossSpan / 2);
+      crossMax = Math.max(crossMax, cMid + b.labelCrossSpan / 2);
+    }
   }
 
   // 极值归一：保证左/上边距就是 pad
@@ -4419,6 +4469,7 @@ function layoutTree(roots, opts) {
       b.mainBody += dMain;
       b.cross1 += dCross;
       b.cross2 += dCross;
+      if (b.label) b.labelMainEnd += dMain;
     }
     mainMax += dMain;
     crossMax += dCross;
@@ -4450,6 +4501,29 @@ function layoutTree(roots, opts) {
       const xTip = mainToX(b.mainTip);
       const xBody = mainToX(b.mainBody);
       b.d = geomToD(braceGeom(style, xTip, xBody, b.cross1, b.cross2), false);
+    }
+
+    /*
+     * 标签锚点：尖端外侧、cross 方向居中对齐这条括号。
+     *
+     * 沿 main 的进深取「尖端 + colGap」：
+     *   横向图（lr/rl）这个点就是文字的起始边，x 交给 mainToX（rl 会镜像到左侧），
+     *   text-anchor 跟着反过来用 end，文字才是「从尖端往外长」而不是压回括号上；
+     *   竖向图（tb/bt）标签仍横着写，沿 main 占一个字高，所以取它的中心
+     *   （尖端 + colGap + fontSize/2）交给 mainToY，再配 middle 锚点 + 居中基线。
+     * 另一轴一律取 (cross1 + cross2) / 2，与括号的 cross 中心重合。
+     */
+    if (b.label) {
+      const cMid = (b.cross1 + b.cross2) / 2;
+      if (vertical) {
+        b.labelX = cMid;
+        b.labelY = mainToY(b.mainTip + colGap + fontSize / 2);
+        b.labelAnchor = 'middle';
+      } else {
+        b.labelX = mainToX(b.mainTip + colGap);
+        b.labelY = cMid;
+        b.labelAnchor = dir === 'rl' ? 'end' : 'start';
+      }
     }
   }
 
@@ -5534,18 +5608,68 @@ const SOFT_BREAK = '\n';
  *
  * 空值为什么当 all：`closing:` 这一行本来就表达了「要 closing」，只是没写名字，
  * 当成「所有叶子」比默默什么都不画更接近写的人的本意。
+ *
+ * 标签（可选）：值里 `=` 之前的部分是「这一组叫什么」，`=` 之后照上面那套规则
+ * 解析。标签画在括号尖端外侧，见 layout.js。
+ *
+ *   closing: 动力组 = 电动机, 内燃机  → { names: ['电动机','内燃机'], label: '动力组' }
+ *   closing: 全部 = true             → { all: true, label: '全部' }
+ *   closing: = 甲, 乙                → { names: ['甲','乙'] }   左边空 = 没标签，不报错
+ *   closing: A=B = 甲                → { names: ['甲'], label: 'A=B' }
+ *   closing: 组合 = 甲 = 乙            → { names: ['甲 = 乙'], label: '组合' }
+ *
+ * 切哪个 `=`（只在出现不止一个时才有得选）：
+ *   1) 优先取**第一个两边带空白的 `=`** —— 它是写得最像分隔符的那一个；
+ *   2) 一个带空白的都没有（写成 `组=甲`）才退回第一个 `=`。
+ * 两种回退都要，因为两条需求同时存在：标签自己可以含 `=`（`A=B = 甲`），
+ * 名字自己也可以含 `=`（`组合 = 甲 = 乙` 的第二个 `=` 归名字）。只按「第一个 `=`
+ * 切」会把前一种弄坏（label 变成 `A`），只按「最后一个 `=` 切」会把后一种弄坏
+ * （label 变成 `组合 = 甲`）。带空格的那个 `=` 恰好是作者写字时的真实分隔位。
+ *
+ * 不支持的：`=` 不能转义。两边都无空且多个 `=` 时（`A=B=C`）按第一个切，
+ * 剩下的归名字 —— 这种写法本来就有两种读法，只能选一种。
+ *
+ * label 为空时**不写这个字段**：老形状 { all: true } / { names: [...] } 原样保留，
+ * 下游一律按 `group.label || ''` 取，省得每个调用方都为「空标签」写分支。
  */
-function parseClosingGroup(v) {
-  const raw = String(v == null ? '' : v).trim();
-  if (/^(false|no|0|off|none)$/i.test(raw)) return null;
-  if (!raw || /^(true|yes|1|on)$/i.test(raw)) return { all: true };
-  const names = [];
-  for (const part of raw.split(/[,，]/)) {
-    const s = part.trim();
-    if (s) names.push(s);
+function closingLabelSep(s) {
+  let first = -1;
+  for (let i = 0; i < s.length; i++) {
+    if (s.charAt(i) !== '=') continue;
+    if (first < 0) first = i;
+    const before = i > 0 ? s.charAt(i - 1) : ' ';
+    const after = i + 1 < s.length ? s.charAt(i + 1) : ' ';
+    if (/\s/.test(before) || /\s/.test(after)) return i;
   }
-  if (!names.length) return { all: true };
-  return { names };
+  return first;
+}
+
+function parseClosingGroup(v) {
+  const whole = String(v == null ? '' : v);
+  let label = '';
+  let body = whole;
+  const eq = closingLabelSep(whole);
+  if (eq >= 0) {
+    label = whole.slice(0, eq).trim();
+    body = whole.slice(eq + 1);
+  }
+
+  const raw = body.trim();
+  if (/^(false|no|0|off|none)$/i.test(raw)) return null;
+
+  let group;
+  if (!raw || /^(true|yes|1|on)$/i.test(raw)) {
+    group = { all: true };
+  } else {
+    const names = [];
+    for (const part of raw.split(/[,，]/)) {
+      const s = part.trim();
+      if (s) names.push(s);
+    }
+    group = names.length ? { names } : { all: true };
+  }
+  if (label) group.label = label;
+  return group;
 }
 
 function parseBox(v) {
@@ -5926,6 +6050,18 @@ function svgMarkup(m) {
 
   for (const b of m.layout.braces) {
     out.push(`<path class="bm-brace" fill="none" d="${b.d}"/>`);
+  }
+  /*
+   * closing 的分组标签：位置、锚点已经在布局里算好（尖端外侧 + cross 居中），
+   * 这里只管出字。字号/字体族/填充色跟节点文字一致，全部靠 .brace-map-svg text
+   * 那条 CSS 继承下来，不单独写属性；基线也用 central，和节点文字同一套口径。
+   */
+  for (const b of m.layout.braces) {
+    if (b.kind !== 'closing' || !b.label) continue;
+    out.push(
+      `<text class="bm-closing-label" x="${num(b.labelX)}" y="${num(b.labelY)}"`
+      + ` text-anchor="${b.labelAnchor}" dominant-baseline="central">${esc(b.label)}</text>`
+    );
   }
   for (const n of m.layout.nodes) {
     if (n.boxed) {

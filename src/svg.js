@@ -131,6 +131,18 @@ function svgMarkup(m) {
   for (const b of m.layout.braces) {
     out.push(`<path class="bm-brace" fill="none" d="${b.d}"/>`);
   }
+  /*
+   * closing 的分组标签：位置、锚点已经在布局里算好（尖端外侧 + cross 居中），
+   * 这里只管出字。字号/字体族/填充色跟节点文字一致，全部靠 .brace-map-svg text
+   * 那条 CSS 继承下来，不单独写属性；基线也用 central，和节点文字同一套口径。
+   */
+  for (const b of m.layout.braces) {
+    if (b.kind !== 'closing' || !b.label) continue;
+    out.push(
+      `<text class="bm-closing-label" x="${num(b.labelX)}" y="${num(b.labelY)}"`
+      + ` text-anchor="${b.labelAnchor}" dominant-baseline="central">${esc(b.label)}</text>`
+    );
+  }
   for (const n of m.layout.nodes) {
     if (n.boxed) {
       out.push(

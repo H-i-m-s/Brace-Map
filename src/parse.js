@@ -38,18 +38,68 @@ const SOFT_BREAK = '\n';
  *
  * 空值为什么当 all：`closing:` 这一行本来就表达了「要 closing」，只是没写名字，
  * 当成「所有叶子」比默默什么都不画更接近写的人的本意。
+ *
+ * 标签（可选）：值里 `=` 之前的部分是「这一组叫什么」，`=` 之后照上面那套规则
+ * 解析。标签画在括号尖端外侧，见 layout.js。
+ *
+ *   closing: 动力组 = 电动机, 内燃机  → { names: ['电动机','内燃机'], label: '动力组' }
+ *   closing: 全部 = true             → { all: true, label: '全部' }
+ *   closing: = 甲, 乙                → { names: ['甲','乙'] }   左边空 = 没标签，不报错
+ *   closing: A=B = 甲                → { names: ['甲'], label: 'A=B' }
+ *   closing: 组合 = 甲 = 乙            → { names: ['甲 = 乙'], label: '组合' }
+ *
+ * 切哪个 `=`（只在出现不止一个时才有得选）：
+ *   1) 优先取**第一个两边带空白的 `=`** —— 它是写得最像分隔符的那一个；
+ *   2) 一个带空白的都没有（写成 `组=甲`）才退回第一个 `=`。
+ * 两种回退都要，因为两条需求同时存在：标签自己可以含 `=`（`A=B = 甲`），
+ * 名字自己也可以含 `=`（`组合 = 甲 = 乙` 的第二个 `=` 归名字）。只按「第一个 `=`
+ * 切」会把前一种弄坏（label 变成 `A`），只按「最后一个 `=` 切」会把后一种弄坏
+ * （label 变成 `组合 = 甲`）。带空格的那个 `=` 恰好是作者写字时的真实分隔位。
+ *
+ * 不支持的：`=` 不能转义。两边都无空且多个 `=` 时（`A=B=C`）按第一个切，
+ * 剩下的归名字 —— 这种写法本来就有两种读法，只能选一种。
+ *
+ * label 为空时**不写这个字段**：老形状 { all: true } / { names: [...] } 原样保留，
+ * 下游一律按 `group.label || ''` 取，省得每个调用方都为「空标签」写分支。
  */
-function parseClosingGroup(v) {
-  const raw = String(v == null ? '' : v).trim();
-  if (/^(false|no|0|off|none)$/i.test(raw)) return null;
-  if (!raw || /^(true|yes|1|on)$/i.test(raw)) return { all: true };
-  const names = [];
-  for (const part of raw.split(/[,，]/)) {
-    const s = part.trim();
-    if (s) names.push(s);
+function closingLabelSep(s) {
+  let first = -1;
+  for (let i = 0; i < s.length; i++) {
+    if (s.charAt(i) !== '=') continue;
+    if (first < 0) first = i;
+    const before = i > 0 ? s.charAt(i - 1) : ' ';
+    const after = i + 1 < s.length ? s.charAt(i + 1) : ' ';
+    if (/\s/.test(before) || /\s/.test(after)) return i;
   }
-  if (!names.length) return { all: true };
-  return { names };
+  return first;
+}
+
+function parseClosingGroup(v) {
+  const whole = String(v == null ? '' : v);
+  let label = '';
+  let body = whole;
+  const eq = closingLabelSep(whole);
+  if (eq >= 0) {
+    label = whole.slice(0, eq).trim();
+    body = whole.slice(eq + 1);
+  }
+
+  const raw = body.trim();
+  if (/^(false|no|0|off|none)$/i.test(raw)) return null;
+
+  let group;
+  if (!raw || /^(true|yes|1|on)$/i.test(raw)) {
+    group = { all: true };
+  } else {
+    const names = [];
+    for (const part of raw.split(/[,，]/)) {
+      const s = part.trim();
+      if (s) names.push(s);
+    }
+    group = names.length ? { names } : { all: true };
+  }
+  if (label) group.label = label;
+  return group;
 }
 
 function parseBox(v) {
